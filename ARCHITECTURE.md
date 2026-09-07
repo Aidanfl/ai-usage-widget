@@ -13,7 +13,8 @@ Reference material (read-only):
 
 - Electron `^41.10.7` (CommonJS main process; `require`), `electron-store@^8` (v11 is ESM-only — do NOT upgrade),
   `chart.js@4` UMD + `chartjs-adapter-date-fns` + `date-fns` (loaded via `<script src="../../node_modules/...">`),
-  `electron-builder@26` (nsis + portable). Node 24 on the dev machine.
+  `qrcode@^1.5` (main process only; pairing QR for phone sync, §14), `electron-builder@26` (nsis + portable).
+  Node 24 on the dev machine.
 - No bundler. Renderer is vanilla HTML/CSS/JS with `contextIsolation: true`, `nodeIntegration: false`, strict CSP
   (`default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:; connect-src 'none'`).
   All network I/O happens in the main process with Node `fetch` (no BrowserWindow tricks except the optional claude.ai web source).
@@ -34,6 +35,7 @@ src/main/history.js              usage history append/prune/read (see §7)
 src/main/scheduler.js            refresh loop: fetch all enabled providers → snapshot → history → tray → alerts → renderer
 src/main/tray.js                 tray badges (bitmap font port from original), tooltips, context menu
 src/main/alerts.js               threshold/blocked/available notification state machine (pure; Electron Notification injected)
+src/main/sync.js                 PURE-ish: phone sync — key derivation, AES-GCM envelope, PhonePayload, push policy, relay client (§14)
 src/main/providers/claude.js     Claude provider via Claude Code credentials (~/.claude/.credentials.json) → api.anthropic.com
 src/main/providers/claude-web.js Claude provider via claude.ai browser login (sessionKey cookie) — port of original; optional
 src/main/providers/codex.js      Codex provider via ~/.codex/auth.json → chatgpt.com/backend-api/wham/usage
@@ -45,9 +47,11 @@ src/renderer/styles.css
 src/renderer/app.js              state, rendering, timers, settings UI, chart
 src/renderer/format.js           PURE formatting helpers (durations, reset times, currency) — also unit-tested
 tests/*.test.js
+docs/PHONE-SYNC.md               phone sync protocol (derivations, envelope, relay HTTP API, PhonePayload, push policy)
+relay/                           Cloudflare Worker relay (src/worker.js, wrangler.toml, README.md) — no dependencies, tested under Node
 ```
 
-Pure modules (`normalize.js`, `tokens.js`, `alerts.js`, `format.js`, `history.js` logic) must not `require('electron')`.
+Pure modules (`normalize.js`, `tokens.js`, `alerts.js`, `format.js`, `history.js` logic, `sync.js`) must not `require('electron')`.
 
 ## 3. Data model — `Snapshot`
 
@@ -223,6 +227,8 @@ CodexCredits = {
 | `trayStats` | 'off' | 'off' \| 'claude' \| 'codex' \| 'both' |
 | `windowPosition` | null | `{x,y}` |
 | `claudeOrganizationId` | null | claude_web only |
+| `phoneSyncEnabled` | false | phone sync (§14): turning it on without a pair key generates one (`phonePairKey`, safeStorage-encrypted, NOT a setting) and triggers the first push |
+| `phoneRelayUrl` | '' | relay base URL, stored normalized by `sync.validateRelayUrl` (https only, http for localhost/127.0.0.1, no query/fragment/credentials, trailing slash stripped, ≤ 512 chars) or `''` when invalid; a change resets the push state and fills the new relay |
 
 `saveSettings(patch)` merges, persists, applies side effects, and broadcasts `settings-updated` to the renderer.
 
@@ -330,6 +336,12 @@ invoke  claude-web-login                     → { success, error? }          (c
 invoke  claude-web-logout                    → true
 invoke  claude-web-orgs                      → [{id,name,isTeam}]
 invoke  claude-web-select-org {id}           → true
+invoke  phone-sync-status                    → { enabled, relayUrl, paired, keyPersisted, lastPushAt, lastError, nextRetryAt, slotId }
+invoke  phone-sync-pairing                   → { pairString, qrDataUrl, slotId, error }   (creates K when absent; never rotates)
+invoke  phone-sync-repair                    → same shape with a NEW K (old slot deleted best-effort)
+invoke  phone-sync-unpair                    → true   (DELETE slot best-effort, forget K, phoneSyncEnabled → false)
+invoke  phone-sync-test {relayUrl}           → { ok, status?, latencyMs?, error? }   (GET /v1/health on the given or saved URL)
+invoke  phone-sync-push-now                  → { ok, error? }
 send    minimize-window | close-window
 send    resize-window {height}
 send    set-compact-mode {compact}           (main resizes width/height; renderer then reports height)
@@ -338,6 +350,7 @@ on      usage-updated (snapshot)
 on      settings-updated (settings)
 on      refresh-requested ()                 (tray menu → renderer shows spinner; main runs tick itself)
 on      claude-web-session-expired ()
+on      phone-sync-updated (status)          (same shape as phone-sync-status; after every push attempt / pairing change)
 ```
 
 ## 9. Renderer behaviour (parity list — details in spec-renderer.md)
@@ -473,3 +486,45 @@ module.exports = { id, name, fetchSnapshot({ settings, fetch, now, log, lastGood
   Codex windows: classify by `limit_window_seconds` (±5 %): 18000 → "5-Hour Limit"; 86400 → "Daily Limit";
   604800 → "Weekly Limit"; 2592000 → "Monthly Limit"; else "<N>-Hour Limit". Never invent a missing window.
   Also surface `rate_limit_reset_credits.available_count` (>0) in `credits` as `resetCreditsAvailable`.
+
+## 14. Phone sync (`src/main/sync.js`, `relay/`)
+
+Protocol, wire formats and the desktop push policy are specified in **`docs/PHONE-SYNC.md`** (binding). Summary:
+the desktop derives `slotId` / `writeToken` / `readToken` / `encKey` from a 32-byte pair key `K` (SHA-256 over
+`label ‖ K`), encrypts a `PhonePayload` (the §3 Snapshot minus every `raw`, the three colour settings, and a
+downsampled 7-day history) with AES-256-GCM (AAD = `slotId`) and PUTs the envelope to `<relay>/v1/slots/<slotId>`
+at most every 60 s and normally every 5 min or on a change. `K` is persisted by main.js under the top-level store key
+`phonePairKey` exactly like the claude.ai session (`safeStorage.encryptString(base64(K))` → base64); it never
+reaches the renderer — the renderer only sees the `aiusage://pair?...` string and its QR data URL. The relay
+(`relay/src/worker.js`, Cloudflare Worker + KV, zero dependencies) stores ciphertext plus token hashes only and is
+driven directly by `tests/relay.test.js` under Node with an in-memory KV.
+
+```js
+// src/main/sync.js (pure-ish: no electron; fetch / clock / log / key persistence / QR renderer injected)
+createPhoneSync({ getSettings, loadKey, saveKey, clearKey, fetch, now, log, appVersion, platform, hostname, qr, random, requestTimeoutMs }) → {
+  load(),                                  // restore the persisted K (needs safeStorage → call after app ready); emits status
+  onSnapshot(snapshot, history | () => history),   // scheduler hook; applies the push policy (history read lazily, only when pushing)
+  settingsChanged(prev, next),             // phoneSyncEnabled / phoneRelayUrl side effects: generate K on enable, reset + refill on relay change
+  getStatus() → { enabled, relayUrl, paired, keyPersisted, lastPushAt, lastError, nextRetryAt, slotId },
+  getPairing() → Promise<{ pairString, qrDataUrl, slotId, error }>,   // creates K when absent, never rotates
+  repair() → same shape with a NEW K (old slot DELETEd best-effort, first fill of the new slot),
+  unpair() → Promise<true>,                // DELETE best-effort + forget K (main.js turns the setting off)
+  test(relayUrl?) → Promise<{ ok, status?, latencyMs?, error? }>,     // GET /v1/health
+  pushNow() → Promise<{ ok, error? }>,     // honours the 60 s floor
+  onStatus(cb) → unsubscribe,              // main.js forwards to the `phone-sync-updated` broadcast
+  pending() → Promise<void>                // resolves when the push in flight (if any) finished — tests
+}
+// pure helpers (all exported): deriveSlot(K) → { slotId, writeToken, readToken, encKey }, buildPairString(relayUrl, K),
+// parsePairString(str) → { relayUrl, key } | null, encryptPayload(encKey, slotId, payload, { iv?, ts? }) → envelope,
+// decryptEnvelope(encKey, slotId, envelope) → payload (Node reference of the phone's decrypt), isValidEnvelope(env),
+// buildPhonePayload({ snapshot, history, settings, appVersion, platform, hostname, now }), downsampleHistory(samples),
+// validateRelayUrl(str) → normalized | null (also used by store.js), shouldPush(prev, next, now, state) → false | reason,
+// fingerprint(snapshot), plus the tunables PUSH_INTERVAL_MS, PUSH_FLOOR_MS, BACKOFF_MIN_MS, BACKOFF_MAX_MS, …
+
+// relay/src/worker.js (ES module, Cloudflare Worker; KV binding SLOTS)
+export default { fetch(request, env) }   // GET /v1/health · PUT/GET/DELETE /v1/slots/{slotId} per docs/PHONE-SYNC.md
+```
+
+Wiring in main.js: `phoneSync.load()` in `whenReady` (after `loadWebSession()`), `phoneSync.onSnapshot(snapshot,
+() => history.get(7, snapshot))` from the scheduler's `onSnapshot`, `phoneSync.settingsChanged(prev, next)` in the
+settings side-effects block, the six `phone-sync-*` invoke channels (§8) and `phone-sync-updated` via `onStatus`.

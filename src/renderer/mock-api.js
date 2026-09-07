@@ -21,6 +21,10 @@
  *   spinning    simulate a tray refresh (spinner) portable   portable build (autostart disabled)
  *   sparse      hourly history (default is a 2-minute cadence, like the real 60–120 s scheduler)
  *   titles      log every tooltip (dot / updated / row labels / compact labels / credits) to the console for the harness
+ *   phone       phone sync paired + on, relay set, "Last pushed 2m ago"     (default: not paired, off, no relay)
+ *   phonepairing  phone + the pairing panel (QR + code) opened after settings   phonewaiting  paired, no push yet
+ *   phonefail   paired, last push failed (HTTP 401, retrying at hh:mm)        phonememkey   key kept in memory only
+ *   phoneconfirm  phone + the inline Unpair confirmation shown
  *
  * The Fable row always carries `note` (as normalize.js produces it); every other row has `note: null`.
  */
@@ -69,7 +73,70 @@
     trayStats: 'off',
     windowPosition: null,
     claudeOrganizationId: null,
+    phoneSyncEnabled: false,
+    phoneRelayUrl: '',
   };
+
+  // ---- Phone sync fixtures (docs/PHONE-SYNC.md) ----
+  const PHONE_STATES = ['phone', 'phonepairing', 'phonewaiting', 'phonefail', 'phonememkey', 'phoneconfirm'];
+  const phone = {
+    paired: PHONE_STATES.some(has),
+    keyPersisted: !has('phonememkey'),
+    lastPushAt: (has('phonefail') || has('phonewaiting')) ? null : now - 2 * MIN,
+    lastError: has('phonefail') ? 'HTTP 401 — slot owned by another key (re-pair)' : null,
+    nextRetryAt: has('phonefail') ? now + 4 * MIN : null,
+  };
+  if (phone.paired) {
+    settings.phoneSyncEnabled = true;
+    settings.phoneRelayUrl = 'https://aiusage-relay.aidan.workers.dev';
+  }
+  // Same vectors as tests/sync.test.js (K = bytes 0x00..0x1f).
+  const PHONE_SLOT = 'c99b38a1696fd53885c484414e63a948';
+  const PHONE_PAIR_STRING = 'aiusage://pair?v=1&r=https%3A%2F%2Faiusage-relay.aidan.workers.dev&k=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8';
+
+  function phoneStatus() {
+    return {
+      enabled: !!settings.phoneSyncEnabled,
+      relayUrl: settings.phoneRelayUrl || '',
+      paired: phone.paired,
+      keyPersisted: phone.paired && phone.keyPersisted,
+      lastPushAt: phone.paired ? phone.lastPushAt : null,
+      lastError: phone.paired ? phone.lastError : null,
+      nextRetryAt: phone.paired ? phone.nextRetryAt : null,
+      slotId: phone.paired ? PHONE_SLOT : null,
+    };
+  }
+
+  function emitPhone() {
+    const s = phoneStatus();
+    setTimeout(() => listeners.phone.forEach((cb) => cb(s)), 0);
+  }
+
+  // QR-looking PNG (finder patterns + seeded noise) — the real one comes from the `qrcode` package in main.
+  function fakeQrDataUrl(seed) {
+    const N = 33; const cell = 6; const margin = cell; const size = N * cell + 2 * margin;
+    const c = document.createElement('canvas');
+    c.width = size; c.height = size;
+    const ctx = c.getContext('2d');
+    ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, size, size);
+    ctx.fillStyle = '#000';
+    const rnd = mulberry32(seed);
+    for (let y = 0; y < N; y++) {
+      for (let x = 0; x < N; x++) {
+        const inFinder = (x < 8 && y < 8) || (x >= N - 8 && y < 8) || (x < 8 && y >= N - 8);
+        if (!inFinder && rnd() < 0.45) ctx.fillRect(margin + x * cell, margin + y * cell, cell, cell);
+      }
+    }
+    const finder = (x0, y0) => {
+      for (let y = 0; y < 7; y++) for (let x = 0; x < 7; x++) {
+        const ring = x === 0 || y === 0 || x === 6 || y === 6;
+        const core = x >= 2 && x <= 4 && y >= 2 && y <= 4;
+        if (ring || core) ctx.fillRect(margin + (x0 + x) * cell, margin + (y0 + y) * cell, cell, cell);
+      }
+    };
+    finder(0, 0); finder(N - 7, 0); finder(0, N - 7);
+    return c.toDataURL('image/png');
+  }
 
   function claudeExtra() {
     const base = {
@@ -234,7 +301,7 @@
   }
 
   const history = buildHistory();
-  const listeners = { usage: [], settings: [], refresh: [], expired: [] };
+  const listeners = { usage: [], settings: [], refresh: [], expired: [], phone: [] };
 
   window.api = {
     getSettings: async () => JSON.parse(JSON.stringify(settings)),
@@ -244,6 +311,9 @@
         else settings[k] = patch[k];
       });
       console.log('[saveSettings] ' + JSON.stringify(patch));
+      // Mirrors main.js: enabling phone sync without a key generates one; both phone keys re-broadcast the status.
+      if (patch && patch.phoneSyncEnabled === true && !phone.paired) { phone.paired = true; phone.lastPushAt = null; }
+      if (patch && ('phoneSyncEnabled' in patch || 'phoneRelayUrl' in patch)) emitPhone();
       const copy = JSON.parse(JSON.stringify(settings));
       setTimeout(() => listeners.settings.forEach((cb) => cb(copy)), 0);
       return copy;
@@ -267,6 +337,43 @@
     claudeWebLogout: async () => true,
     claudeWebOrgs: async () => [{ id: 'org_1', name: 'Aidan', isTeam: false }, { id: 'org_2', name: 'Acme Corp', isTeam: true }],
     claudeWebSelectOrg: async () => true,
+    // Phone sync (same shapes as main.js / sync.js)
+    phoneSyncStatus: async () => phoneStatus(),
+    phoneSyncPairing: async () => {
+      await delay(150);
+      if (!phone.paired) { phone.paired = true; phone.lastPushAt = null; emitPhone(); }
+      if (!settings.phoneRelayUrl) return { pairString: null, qrDataUrl: null, slotId: PHONE_SLOT, error: 'Set a relay URL first' };
+      return { pairString: PHONE_PAIR_STRING, qrDataUrl: fakeQrDataUrl(7), slotId: PHONE_SLOT, error: null };
+    },
+    phoneSyncRepair: async () => {
+      await delay(300);
+      phone.paired = true; phone.lastPushAt = null; phone.lastError = null; phone.nextRetryAt = null;
+      emitPhone();
+      const pairString = PHONE_PAIR_STRING.replace(/k=.*/, 'k=' + 'Hx8eHRwbGhkYFxYVFBMSERAPDg0MCwoJCAcGBQQDAgEA');
+      return { pairString, qrDataUrl: fakeQrDataUrl(11), slotId: 'f00d' + PHONE_SLOT.slice(4), error: null };
+    },
+    phoneSyncUnpair: async () => {
+      await delay(200);
+      phone.paired = false; phone.lastPushAt = null; phone.lastError = null; phone.nextRetryAt = null;
+      settings.phoneSyncEnabled = false;
+      emitPhone();
+      const copy = JSON.parse(JSON.stringify(settings));
+      setTimeout(() => listeners.settings.forEach((cb) => cb(copy)), 0);
+      return true;
+    },
+    phoneSyncTest: async (url) => {
+      await delay(500);
+      console.log('[phoneSyncTest] ' + url);
+      if (/bad|fail/.test(String(url))) return { ok: false, status: 404, latencyMs: 210, error: 'HTTP 404 — not a relay URL' };
+      return { ok: true, status: 200, latencyMs: 123 };
+    },
+    phoneSyncPushNow: async () => {
+      await delay(400);
+      if (phone.lastError) return { ok: false, error: phone.lastError };
+      phone.lastPushAt = Date.now();
+      emitPhone();
+      return { ok: true };
+    },
     minimizeWindow: () => console.log('[minimize]'),
     closeWindow: () => console.log('[close]'),
     resizeWindow: (height) => console.log('[resize] ' + height),
@@ -284,11 +391,14 @@
     onSettingsUpdated: (cb) => listeners.settings.push(cb),
     onRefreshRequested: (cb) => listeners.refresh.push(cb),
     onClaudeWebSessionExpired: (cb) => listeners.expired.push(cb),
+    onPhoneSyncUpdated: (cb) => listeners.phone.push(cb),
   };
 
   // Harness hooks: open settings after load; simulate a tray refresh spinner; report chart point counts.
   window.addEventListener('load', () => {
     if (has('settings')) setTimeout(() => document.getElementById('settingsBtn').click(), 200);
+    if (has('phonepairing')) setTimeout(() => document.getElementById('phonePairBtn').click(), 500);
+    if (has('phoneconfirm')) setTimeout(() => document.getElementById('phoneUnpairBtn').click(), 500);
     if (has('spinning')) setTimeout(() => listeners.refresh.forEach((cb) => cb()), 200);
     if (has('graph')) {
       setTimeout(() => {

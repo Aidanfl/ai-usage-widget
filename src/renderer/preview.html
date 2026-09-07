@@ -218,6 +218,60 @@
           </div>
         </div>
 
+        <!-- ================= Phone sync (docs/PHONE-SYNC.md) ================= -->
+        <div class="ssection" aria-hidden="true"><span>Phone</span></div>
+
+        <div class="srow full">
+          <div class="scol wide">
+            <span class="slabel">Sync to phone</span>
+            <div class="scontrol">
+              <label class="toggle"><input type="checkbox" id="phoneSyncToggle" aria-label="Sync to phone"><span class="slider"></span></label>
+              <span class="phone-status" id="phoneStatusLine" aria-live="polite">Not paired</span>
+            </div>
+            <span class="shint">Pushes an encrypted snapshot to your relay every few minutes for the iPhone app and widget</span>
+          </div>
+        </div>
+
+        <div class="srow full">
+          <div class="scol wide">
+            <span class="slabel">Relay URL</span>
+            <div class="scontrol">
+              <input type="url" class="sinput" id="phoneRelayUrl" placeholder="https://aiusage-relay.your-name.workers.dev" spellcheck="false" autocomplete="off" aria-label="Relay URL">
+              <button class="small-btn" id="phoneTestBtn" type="button">Test</button>
+            </div>
+            <span class="shint" id="phoneRelayHint" hidden></span>
+          </div>
+        </div>
+
+        <div class="srow full">
+          <div class="scol wide">
+            <span class="slabel">Pairing</span>
+            <div class="scontrol">
+              <button class="small-btn" id="phonePairBtn" type="button" aria-expanded="false" aria-controls="phonePairing">Show pairing code</button>
+              <button class="small-btn" id="phoneRepairBtn" type="button" hidden>Re-pair</button>
+              <button class="small-btn danger" id="phoneUnpairBtn" type="button" hidden>Unpair</button>
+              <button class="small-btn" id="phonePushBtn" type="button" hidden>Push now</button>
+            </div>
+            <div class="confirm-row" id="phoneUnpairConfirm" role="alertdialog" aria-label="Confirm unpair" hidden>
+              <span class="confirm-text">Unpair this phone? The relay slot is deleted and sync turns off.</span>
+              <button class="small-btn danger" id="phoneUnpairYesBtn" type="button">Unpair</button>
+              <button class="small-btn" id="phoneUnpairNoBtn" type="button">Cancel</button>
+            </div>
+            <div class="pairing" id="phonePairing" hidden>
+              <div class="qr-card"><img class="qr" id="phoneQr" alt="Pairing QR code" width="220" height="220"></div>
+              <div class="pairing-side">
+                <span class="pairing-help">Scan with the AI Usage iPhone app, or copy the code and paste it there.</span>
+                <div class="pairing-code-row">
+                  <input class="sinput code" id="phonePairString" readonly spellcheck="false" aria-label="Pairing code">
+                  <button class="small-btn" id="phoneCopyBtn" type="button">Copy</button>
+                </div>
+                <span class="shint">The code contains the encryption key — share it only with your own phone.</span>
+              </div>
+            </div>
+            <span class="shint" id="phonePairHint" hidden></span>
+          </div>
+        </div>
+
       </div>
       <div class="settings-footer">
         <span class="version-label" id="versionLabel">AI Usage Widget</span>

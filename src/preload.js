@@ -37,6 +37,13 @@ contextBridge.exposeInMainWorld('api', {
   claudeWebLogout: () => ipcRenderer.invoke('claude-web-logout'),
   claudeWebOrgs: () => ipcRenderer.invoke('claude-web-orgs'),
   claudeWebSelectOrg: (id) => ipcRenderer.invoke('claude-web-select-org', { id }),
+  // Phone sync (docs/PHONE-SYNC.md). The pair key never crosses the bridge — only the pairing string/QR.
+  phoneSyncStatus: () => ipcRenderer.invoke('phone-sync-status'),
+  phoneSyncPairing: () => ipcRenderer.invoke('phone-sync-pairing'),
+  phoneSyncRepair: () => ipcRenderer.invoke('phone-sync-repair'),
+  phoneSyncUnpair: () => ipcRenderer.invoke('phone-sync-unpair'),
+  phoneSyncTest: (relayUrl) => ipcRenderer.invoke('phone-sync-test', { relayUrl: relayUrl == null ? '' : String(relayUrl) }),
+  phoneSyncPushNow: () => ipcRenderer.invoke('phone-sync-push-now'),
 
   // send
   minimizeWindow: () => ipcRenderer.send('minimize-window'),
@@ -56,4 +63,5 @@ contextBridge.exposeInMainWorld('api', {
   onSettingsUpdated: (callback) => subscribe('settings-updated', callback),
   onRefreshRequested: (callback) => subscribe('refresh-requested', callback),
   onClaudeWebSessionExpired: (callback) => subscribe('claude-web-session-expired', callback),
+  onPhoneSyncUpdated: (callback) => subscribe('phone-sync-updated', callback),
 });

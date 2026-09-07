@@ -656,6 +656,63 @@ body.theme-light .small-btn.danger { color: #dc2626; }
 .web-status { color: var(--text-dim); }   /* rendered as a .shint line under the Claude source controls */
 .web-status.err { color: var(--danger-text); }
 
+/* ---------- Phone sync section (docs/PHONE-SYNC.md) ----------
+   Everything reuses the settings tokens (inputs, hints, small buttons), so it follows the dark / light
+   palettes and the Clear Acrylic (forced light) mode without extra rules. */
+.ssection { display: flex; align-items: center; gap: 8px; margin: 3px 4px -3px; }
+.ssection::before, .ssection::after { content: ''; flex: 1; height: 1px; background: var(--divider); }
+.ssection span {
+  font-size: 9px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.6px;
+  color: var(--text-dim); white-space: nowrap;
+}
+
+/* Text input in the style of .sselect */
+.sinput {
+  flex: 1 1 auto; min-width: 0; height: 22px;
+  background: var(--input-bg); border: 1px solid var(--input-border); border-radius: 6px;
+  color: var(--input-fg); font-size: 11px; padding: 2px 7px; text-shadow: none;
+  -webkit-user-select: text; user-select: text;
+}
+.sinput::placeholder { color: var(--text-faint); }
+.sinput:hover { border-color: var(--input-border-hover); }
+.sinput.invalid { border-color: #ef4444; box-shadow: 0 0 0 1px rgba(239, 68, 68, 0.35); }
+.sinput.code { font-family: Consolas, 'Cascadia Mono', 'Courier New', monospace; font-size: 10px; letter-spacing: 0.1px; }
+.sinput[readonly] { cursor: text; }
+
+/* Status line next to the toggle: "Not paired" / "Waiting for first push" / "Last pushed 2m ago" / "Failed: …" */
+.phone-status {
+  flex: 1; min-width: 0; font-size: 10px; color: var(--text-dim);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums;
+}
+.phone-status.ok { color: #34d399; }
+.phone-status.warn { color: #fbbf24; }
+.phone-status.err { color: var(--danger-text); }
+body.theme-light .phone-status.ok { color: #059669; }
+body.theme-light .phone-status.warn { color: #b45309; }
+.shint.ok { color: #34d399; }
+body.theme-light .shint.ok { color: #059669; }
+
+/* Inline confirmation for Unpair (no modal dialogs in the widget) */
+.confirm-row {
+  grid-column: 1 / -1; display: flex; align-items: center; gap: 8px; margin-top: 2px;
+  padding: 5px 8px; border-radius: 6px; font-size: 10px; color: var(--text-muted); line-height: 1.3;
+  background: rgba(239, 68, 68, 0.10); border: 1px solid rgba(239, 68, 68, 0.30);
+  text-shadow: none;
+}
+.confirm-row .confirm-text { flex: 1; min-width: 0; }
+
+/* Pairing panel: QR (white card — scanners need dark-on-light) + the aiusage://pair string */
+.pairing {
+  grid-column: 1 / -1; display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 12px; align-items: start;
+  margin-top: 4px; padding: 8px; border-radius: 8px; background: var(--well-bg);
+}
+.qr-card { background: #fff; padding: 6px; border-radius: 8px; box-shadow: 0 1px 4px rgba(0, 0, 0, 0.25); line-height: 0; }
+.qr { display: block; width: 220px; height: 220px; image-rendering: pixelated; }
+.pairing-side { display: flex; flex-direction: column; gap: 6px; min-width: 0; padding-top: 2px; }
+.pairing-help { font-size: 10px; color: var(--text-muted); line-height: 1.35; }
+.pairing-code-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.pairing-side .shint { white-space: normal; }
+
 .settings-footer {
   display: flex; align-items: center; gap: 8px; padding: 7px 14px;
   border-top: 1px solid var(--divider);

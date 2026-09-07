@@ -4,6 +4,7 @@
 // merges, validates and persists so it stays predictable and easy to reason about.
 
 const Store = require('electron-store');
+const { validateRelayUrl } = require('./sync'); // pure; the single source of truth for relay URL rules
 
 const SETTINGS_DEFAULTS = Object.freeze({
   autoStart: false,
@@ -26,6 +27,10 @@ const SETTINGS_DEFAULTS = Object.freeze({
   trayStats: 'off',
   windowPosition: null,
   claudeOrganizationId: null,
+  // Phone sync (docs/PHONE-SYNC.md). The pair key is NOT a setting: main.js keeps it safeStorage-encrypted
+  // under the top-level `phonePairKey` store key so it never travels to the renderer.
+  phoneSyncEnabled: false,
+  phoneRelayUrl: '',
 });
 
 const ENUMS = {
@@ -40,7 +45,7 @@ const ENUMS = {
   refreshInterval: ['15', '30', '60', '120', '300'],
 };
 
-const BOOLEAN_KEYS = ['autoStart', 'hideFromTaskbar', 'alwaysOnTop', 'usageAlerts', 'compactMode', 'graphVisible', 'tokenAutoRefresh'];
+const BOOLEAN_KEYS = ['autoStart', 'hideFromTaskbar', 'alwaysOnTop', 'usageAlerts', 'compactMode', 'graphVisible', 'tokenAutoRefresh', 'phoneSyncEnabled'];
 // Nested { claude: bool, codex: bool } maps — patches merge into them instead of replacing them.
 const NESTED_BOOLEAN_KEYS = ['expandedOpen', 'providers'];
 
@@ -126,6 +131,10 @@ function sanitizeSettings(input, previous = SETTINGS_DEFAULTS) {
   out.claudeOrganizationId = typeof out.claudeOrganizationId === 'string' && out.claudeOrganizationId
     ? out.claudeOrganizationId
     : null;
+
+  // Stored normalized (https only, http for localhost, trailing slash stripped, ≤ 512 chars) or '' when
+  // invalid — the renderer validates before saving, so '' here means "cleared", never a silent fallback.
+  out.phoneRelayUrl = typeof out.phoneRelayUrl === 'string' ? (validateRelayUrl(out.phoneRelayUrl) || '') : '';
 
   return stripUndefined(out);
 }

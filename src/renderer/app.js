@@ -7,8 +7,9 @@
  * Expected preload surface (window.api, see ARCHITECTURE.md §8):
  *   getSettings() saveSettings(patch) getSnapshot() refreshNow() getHistory(days) getAppInfo()
  *   claudeWebLogin() claudeWebLogout() claudeWebOrgs() claudeWebSelectOrg(id)
+ *   phoneSyncStatus() phoneSyncPairing() phoneSyncRepair() phoneSyncUnpair() phoneSyncTest(relayUrl) phoneSyncPushNow()
  *   minimizeWindow() closeWindow() resizeWindow(height) setCompactMode(bool) openExternal(url)
- *   onUsageUpdated(cb) onSettingsUpdated(cb) onRefreshRequested(cb) onClaudeWebSessionExpired(cb)
+ *   onUsageUpdated(cb) onSettingsUpdated(cb) onRefreshRequested(cb) onClaudeWebSessionExpired(cb) onPhoneSyncUpdated(cb)
  */
 (function () {
   'use strict';
@@ -53,7 +54,10 @@
     compactMode: false, refreshInterval: '120', graphVisible: false, expandedOpen: { claude: false, codex: false },
     providers: { claude: true, codex: true }, claudeSource: 'claude_code', tokenAutoRefresh: true,
     trayStats: 'off', windowPosition: null, claudeOrganizationId: null,
+    phoneSyncEnabled: false, phoneRelayUrl: '',
   };
+  const LOCAL_RELAY_HOSTS = ['localhost', '127.0.0.1', '[::1]'];
+  const COPIED_FEEDBACK_MS = 1500;
 
   const ICONS = {
     claude: '<svg viewBox="0 0 24 24" aria-hidden="true"><g stroke="#d97757" stroke-width="2.6" stroke-linecap="round" style="filter: drop-shadow(0 0 3px rgba(217,119,87,0.55))">'
@@ -88,6 +92,20 @@
     orgs: [],
     webStatus: '',
     webBusy: false,
+    // Phone sync (docs/PHONE-SYNC.md). `status` mirrors phone-sync-status; the rest is transient UI state.
+    phone: {
+      status: null,        // { enabled, relayUrl, paired, keyPersisted, lastPushAt, lastError, nextRetryAt, slotId }
+      pairing: null,       // { pairString, qrDataUrl, slotId } while revealed
+      showPairing: false,
+      confirmUnpair: false,
+      busy: false,         // false | 'pairing' | 'repair' | 'unpair' | 'push'
+      testBusy: false,
+      testResult: null,    // { ok, text } under the relay URL field
+      relayDraft: null,    // invalid text left in the relay field after a commit attempt (kept on screen with its hint)
+      pairHint: '',
+      pairHintCls: '',
+      copied: null,        // 'Copied' | 'Copy failed' feedback on the Copy button
+    },
   };
 
   const els = {};
@@ -104,6 +122,7 @@
   let resetRefetchTimer = null;
   let historyRequestId = 0;
   let systemThemeMq = null;
+  let copiedTimer = null;
 
   // ---------------------------------------------------------------------------
   // Small DOM helpers
@@ -1117,15 +1136,23 @@
     });
 
     // Smoky Acrylic, Clear Acrylic and Mica all need the DWM material → the three are disabled together.
+    // macOS has vibrancy instead: same two glass looks under different names, and no Mica.
     const acrylicOk = info.acrylicSupported !== false;
+    const mac = info.platform === 'darwin';
+    const MAC_LABELS = { acrylic: 'Smoky Glass', acrylic_clear: 'Clear Glass' };
     els.backgroundSeg.querySelectorAll('.seg-btn').forEach((b) => {
       const unsupported = !acrylicOk && b.dataset.bg !== 'solid';
       b.disabled = unsupported;
       b.title = unsupported ? 'Not supported on this Windows version' : '';
-      setClass(b, 'active', b.dataset.bg === s.background);
-      b.setAttribute('aria-pressed', b.dataset.bg === s.background ? 'true' : 'false');
+      b.hidden = mac && b.dataset.bg === 'mica';
+      if (mac && MAC_LABELS[b.dataset.bg]) b.textContent = MAC_LABELS[b.dataset.bg];
+      // On macOS a stored 'mica' is rendered as Smoky (window.js folds it), so highlight that button.
+      const current = mac && s.background === 'mica' ? 'acrylic' : s.background;
+      setClass(b, 'active', b.dataset.bg === current);
+      b.setAttribute('aria-pressed', b.dataset.bg === current ? 'true' : 'false');
     });
     els.backgroundHint.hidden = acrylicOk;
+    els.backgroundClearHint.textContent = mac ? 'Clear Glass uses dark text' : 'Clear Acrylic uses dark text';
     els.backgroundClearHint.hidden = s.background !== 'acrylic_clear';
 
     setChecked(els.providerClaudeToggle, s.providers.claude !== false);
@@ -1168,7 +1195,247 @@
     setValue(els.dateFormatSelect, s.dateFormat || 'date');
     setValue(els.refreshIntervalSelect, String(s.refreshInterval || '60'));
 
+    renderPhoneSettings();
+
     els.versionLabel.textContent = 'AI Usage Widget' + (info.version ? ' v' + info.version : '');
+  }
+
+  // ---------------------------------------------------------------------------
+  // Settings — Phone sync (docs/PHONE-SYNC.md)
+  // ---------------------------------------------------------------------------
+  /** Mirror of main's validateRelayUrl so the field validates before saving (main re-validates anyway). */
+  function normalizeRelayUrl(text) {
+    const s = String(text || '').trim();
+    if (!s || s.length > 512) return null;
+    let u;
+    try { u = new URL(s); } catch (e) { return null; }
+    if (u.username || u.password || u.search || u.hash || !u.hostname) return null;
+    if (u.protocol === 'http:') { if (!LOCAL_RELAY_HOSTS.includes(u.hostname)) return null; }
+    else if (u.protocol !== 'https:') return null;
+    return u.origin + u.pathname.replace(/\/+$/, '');
+  }
+
+  /** Status line text + tone from the phone-sync-status shape. */
+  function phoneStatusInfo(st) {
+    if (!st) return { text: 'Checking…', cls: '' };
+    if (!st.paired) return { text: 'Not paired', cls: '' };
+    const memNote = st.keyPersisted ? '' : ' · key kept for this session only (safeStorage unavailable)';
+    if (!st.enabled) return { text: 'Paired · sync is off' + memNote, cls: '' };
+    if (!st.relayUrl) return { text: 'Set a relay URL' + memNote, cls: 'warn' };
+    if (st.lastError) {
+      const retry = st.nextRetryAt ? ', retrying at ' + F.formatTime(st.nextRetryAt, state.settings.timeFormat) : '';
+      return { text: 'Failed: ' + st.lastError + retry, cls: 'err' };
+    }
+    if (!st.lastPushAt) return { text: 'Waiting for first push' + memNote, cls: '' };
+    return { text: 'Last pushed ' + F.relativeAgo(st.lastPushAt, Date.now()) + memNote, cls: 'ok' };
+  }
+
+  function renderPhoneSettings() {
+    const s = state.settings;
+    const ph = state.phone;
+    const st = ph.status;
+    const paired = !!(st && st.paired);
+    const relay = normalizeRelayUrl(s.phoneRelayUrl);
+
+    setChecked(els.phoneSyncToggle, !!s.phoneSyncEnabled);
+    els.phoneSyncToggle.disabled = !!ph.busy;
+
+    const info = phoneStatusInfo(st);
+    els.phoneStatusLine.textContent = info.text;
+    els.phoneStatusLine.title = info.text;
+    els.phoneStatusLine.className = 'phone-status' + (info.cls ? ' ' + info.cls : '');
+
+    // Relay URL field: an invalid draft stays on screen with its hint instead of snapping back to the stored value.
+    if (document.activeElement !== els.phoneRelayUrl && ph.relayDraft === null) els.phoneRelayUrl.value = s.phoneRelayUrl || '';
+    setClass(els.phoneRelayUrl, 'invalid', ph.relayDraft !== null);
+    els.phoneTestBtn.disabled = ph.testBusy || !normalizeRelayUrl(els.phoneRelayUrl.value);
+    els.phoneTestBtn.textContent = ph.testBusy ? 'Testing…' : 'Test';
+    const invalid = ph.relayDraft !== null;
+    const relayHint = invalid ? 'Use an https:// URL (http:// only for localhost)' : (ph.testResult ? ph.testResult.text : '');
+    els.phoneRelayHint.hidden = !relayHint;
+    els.phoneRelayHint.textContent = relayHint;
+    els.phoneRelayHint.title = relayHint;
+    els.phoneRelayHint.className = 'shint' + (invalid || (ph.testResult && !ph.testResult.ok) ? ' error' : (ph.testResult && ph.testResult.ok ? ' ok' : ''));
+
+    els.phonePairBtn.disabled = !!ph.busy || !relay;
+    els.phonePairBtn.title = relay ? '' : 'Set a relay URL first';
+    els.phonePairBtn.textContent = ph.busy === 'pairing' ? 'Preparing…' : (ph.showPairing ? 'Hide pairing code' : 'Show pairing code');
+    els.phonePairBtn.setAttribute('aria-expanded', ph.showPairing ? 'true' : 'false');
+    els.phoneRepairBtn.hidden = !paired;
+    els.phoneRepairBtn.disabled = !!ph.busy || !relay;
+    els.phoneRepairBtn.textContent = ph.busy === 'repair' ? 'Re-pairing…' : 'Re-pair';
+    els.phoneUnpairBtn.hidden = !paired || ph.confirmUnpair;
+    els.phoneUnpairBtn.disabled = !!ph.busy;
+    els.phonePushBtn.hidden = !paired;
+    els.phonePushBtn.disabled = !!ph.busy || !s.phoneSyncEnabled || !relay;
+    els.phonePushBtn.textContent = ph.busy === 'push' ? 'Pushing…' : 'Push now';
+    els.phonePushBtn.title = !s.phoneSyncEnabled ? 'Turn on "Sync to phone" first' : '';
+
+    els.phoneUnpairConfirm.hidden = !ph.confirmUnpair;
+    els.phoneUnpairYesBtn.disabled = !!ph.busy;
+    els.phoneUnpairYesBtn.textContent = ph.busy === 'unpair' ? 'Unpairing…' : 'Unpair';
+
+    const pairing = ph.showPairing && ph.pairing && ph.pairing.pairString ? ph.pairing : null;
+    els.phonePairing.hidden = !pairing;
+    if (pairing) {
+      // Only touch `src` when it changes: reassigning reloads the image and flickers.
+      if (els.phoneQr.getAttribute('src') !== (pairing.qrDataUrl || '')) els.phoneQr.src = pairing.qrDataUrl || '';
+      if (document.activeElement !== els.phonePairString) els.phonePairString.value = pairing.pairString;
+      els.phoneCopyBtn.textContent = ph.copied || 'Copy';
+    }
+    const pairHint = ph.pairHint || '';
+    els.phonePairHint.hidden = !pairHint;
+    els.phonePairHint.textContent = pairHint;
+    els.phonePairHint.title = pairHint;
+    els.phonePairHint.className = 'shint' + (ph.pairHintCls ? ' ' + ph.pairHintCls : '');
+  }
+
+  async function loadPhoneStatus() {
+    const st = await safeInvoke('phoneSyncStatus');
+    if (st && typeof st === 'object') state.phone.status = st;
+    if (state.settingsOpen) render();
+  }
+
+  function setPairHint(text, cls) {
+    state.phone.pairHint = text || '';
+    state.phone.pairHintCls = cls || '';
+  }
+
+  /** Relay URL field commit (change / blur / Enter): save when valid or cleared, otherwise keep the draft + hint. */
+  function commitRelayUrl() {
+    const raw = els.phoneRelayUrl.value;
+    if (!String(raw).trim()) {
+      state.phone.relayDraft = null;
+      state.phone.testResult = null;
+      if (state.settings.phoneRelayUrl) saveSettings({ phoneRelayUrl: '' });
+      else render();
+      return;
+    }
+    const normalized = normalizeRelayUrl(raw);
+    if (!normalized) {
+      state.phone.relayDraft = String(raw);
+      render();
+      return;
+    }
+    state.phone.relayDraft = null;
+    if (document.activeElement !== els.phoneRelayUrl) els.phoneRelayUrl.value = normalized;
+    if (normalized !== state.settings.phoneRelayUrl) {
+      state.phone.testResult = null;
+      saveSettings({ phoneRelayUrl: normalized }).then(loadPhoneStatus);
+    } else {
+      render();
+    }
+  }
+
+  async function phoneTest() {
+    if (state.phone.testBusy) return;
+    const url = normalizeRelayUrl(els.phoneRelayUrl.value);
+    if (!url) return;
+    state.phone.testBusy = true;
+    state.phone.testResult = null;
+    render();
+    const r = await safeInvoke('phoneSyncTest', url);
+    state.phone.testBusy = false;
+    state.phone.testResult = r && r.ok
+      ? { ok: true, text: 'Relay OK · ' + Math.round(r.latencyMs || 0) + ' ms' }
+      : { ok: false, text: 'Test failed: ' + ((r && r.error) || 'no response') };
+    render();
+  }
+
+  /** Show/hide the QR + pairing string. Revealing asks main for the pairing (which creates K when absent). */
+  async function togglePairing() {
+    const ph = state.phone;
+    if (ph.showPairing) {
+      ph.showPairing = false;
+      render();
+      return;
+    }
+    if (ph.busy) return;
+    ph.busy = 'pairing';
+    setPairHint('');
+    render();
+    const p = await safeInvoke('phoneSyncPairing');
+    ph.busy = false;
+    if (p && p.pairString) {
+      ph.pairing = p;
+      ph.showPairing = true;
+    } else {
+      setPairHint((p && p.error) || 'Could not create the pairing code', 'error');
+    }
+    await loadPhoneStatus(); // renders (the QR <img> load also re-measures the window height)
+  }
+
+  async function phoneRepair() {
+    const ph = state.phone;
+    if (ph.busy) return;
+    ph.busy = 'repair';
+    ph.confirmUnpair = false;
+    setPairHint('');
+    render();
+    const p = await safeInvoke('phoneSyncRepair');
+    ph.busy = false;
+    if (p && p.pairString) {
+      ph.pairing = p;
+      ph.showPairing = true;
+      setPairHint('New key generated — scan the new code on the phone; the old pairing no longer works.', '');
+    } else {
+      setPairHint((p && p.error) || 'Re-pairing failed', 'error');
+    }
+    await loadPhoneStatus();
+  }
+
+  async function phoneUnpair() {
+    const ph = state.phone;
+    if (ph.busy) return;
+    ph.busy = 'unpair';
+    render();
+    await safeInvoke('phoneSyncUnpair'); // main also turns phoneSyncEnabled off and broadcasts settings-updated
+    ph.busy = false;
+    ph.confirmUnpair = false;
+    ph.showPairing = false;
+    ph.pairing = null;
+    setPairHint('Unpaired — the relay slot was deleted and sync is off.', '');
+    await loadPhoneStatus();
+  }
+
+  async function phonePushNow() {
+    const ph = state.phone;
+    if (ph.busy) return;
+    ph.busy = 'push';
+    setPairHint('');
+    render();
+    const r = await safeInvoke('phoneSyncPushNow');
+    ph.busy = false;
+    if (r && r.ok) setPairHint('Pushed to the relay.', 'ok');
+    else setPairHint('Push failed: ' + ((r && r.error) || 'unknown error'), 'error');
+    await loadPhoneStatus();
+  }
+
+  async function copyPairString() {
+    const text = state.phone.pairing && state.phone.pairing.pairString;
+    if (!text) return;
+    let ok = false;
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text);
+        ok = true;
+      }
+    } catch (e) { ok = false; }
+    if (!ok) {
+      // Fallback: select the readonly field and use the legacy command.
+      try {
+        els.phonePairString.focus();
+        els.phonePairString.select();
+        ok = document.execCommand('copy');
+      } catch (e) { ok = false; }
+    }
+    state.phone.copied = ok ? 'Copied' : 'Copy failed';
+    render();
+    clearTimeout(copiedTimer);
+    copiedTimer = setTimeout(() => {
+      state.phone.copied = null;
+      if (state.settingsOpen) render();
+    }, COPIED_FEEDBACK_MS);
   }
 
   function readThresholds() {
@@ -1319,6 +1586,7 @@
     state.compactPending = state.compact;
     if (state.compact) safeCall('setCompactMode', false);
     if (state.settings.claudeSource === 'claude_web') loadOrgs();
+    loadPhoneStatus();
     render(true);
     els.doneBtn.focus({ preventScroll: true });
   }
@@ -1326,6 +1594,12 @@
   function closeSettings() {
     if (!state.settingsOpen) return;
     state.settingsOpen = false;
+    // The pairing code carries the encryption key: never leave it revealed for the next visit.
+    state.phone.showPairing = false;
+    state.phone.pairing = null;
+    state.phone.confirmUnpair = false;
+    state.phone.testResult = null;
+    setPairHint('');
     const wantCompact = !!state.compactPending;
     if (wantCompact !== state.compact) {
       state.compact = wantCompact;
@@ -1383,7 +1657,12 @@
     els.expandBtn.addEventListener('click', () => setCompact(false));
 
     document.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape' && state.settingsOpen) { e.preventDefault(); closeSettings(); }
+      if (e.key !== 'Escape' || !state.settingsOpen) return;
+      e.preventDefault();
+      // Escape backs out of the inline Unpair confirmation / pairing reveal before it closes the view.
+      if (state.phone.confirmUnpair) { state.phone.confirmUnpair = false; render(); return; }
+      if (state.phone.showPairing) { state.phone.showPairing = false; render(); return; }
+      closeSettings();
     });
 
     // External links anywhere in the page go through the allow-listed bridge.
@@ -1446,6 +1725,35 @@
     els.dateFormatSelect.addEventListener('change', (e) => saveSettings({ dateFormat: e.target.value }));
     els.refreshIntervalSelect.addEventListener('change', (e) => saveSettings({ refreshInterval: String(e.target.value) }));
 
+    // Phone sync. Main generates the pair key when the toggle turns on without one; its status broadcast
+    // (phone-sync-updated) keeps the status line current, loadPhoneStatus() covers the first paint.
+    els.phoneSyncToggle.addEventListener('change', (e) => saveSettings({ phoneSyncEnabled: e.target.checked }).then(loadPhoneStatus));
+    els.phoneRelayUrl.addEventListener('input', () => {
+      state.phone.relayDraft = null;
+      state.phone.testResult = null;
+      render(); // hint/Test button follow the text live; the field itself is never overwritten while focused
+    });
+    els.phoneRelayUrl.addEventListener('change', commitRelayUrl);
+    els.phoneRelayUrl.addEventListener('blur', commitRelayUrl);
+    els.phoneRelayUrl.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); commitRelayUrl(); els.phoneRelayUrl.blur(); }
+    });
+    els.phoneTestBtn.addEventListener('click', phoneTest);
+    els.phonePairBtn.addEventListener('click', togglePairing);
+    els.phoneRepairBtn.addEventListener('click', phoneRepair);
+    els.phoneUnpairBtn.addEventListener('click', () => {
+      state.phone.confirmUnpair = true;
+      render();
+      els.phoneUnpairNoBtn.focus({ preventScroll: true }); // safe default under the keyboard
+    });
+    els.phoneUnpairYesBtn.addEventListener('click', phoneUnpair);
+    els.phoneUnpairNoBtn.addEventListener('click', () => { state.phone.confirmUnpair = false; render(); });
+    els.phonePushBtn.addEventListener('click', phonePushNow);
+    els.phoneCopyBtn.addEventListener('click', copyPairString);
+    els.phonePairString.addEventListener('focus', () => els.phonePairString.select());
+    // The QR is a data URL that decodes after the panel is shown — the window height must follow it.
+    els.phoneQr.addEventListener('load', () => measureAndResize());
+
     // Re-measure when fonts swap in or anything else nudges the layout.
     if (typeof ResizeObserver !== 'undefined') {
       new ResizeObserver(() => measureAndResize()).observe(els.container);
@@ -1473,6 +1781,11 @@
       state.webStatus = 'claude.ai session expired — log in again';
       doRefresh();
     });
+    safeCall('onPhoneSyncUpdated', (st) => {
+      if (!st || typeof st !== 'object') return;
+      state.phone.status = st;
+      if (state.settingsOpen) render();
+    });
   }
 
   function startTicker() {
@@ -1494,7 +1807,10 @@
       'themeSeg', 'backgroundSeg', 'backgroundHint', 'backgroundClearHint', 'providerClaudeToggle', 'providerCodexToggle',
       'claudeSourceSelect', 'claudeWebLoginBtn', 'claudeWebLogoutBtn', 'claudeOrgSelect', 'claudeWebStatus',
       'tokenAutoRefreshToggle', 'trayStatsSelect', 'warnThreshold', 'dangerThreshold', 'thresholdHint',
-      'timeFormatSelect', 'dateFormatSelect', 'refreshIntervalSelect', 'versionLabel'];
+      'timeFormatSelect', 'dateFormatSelect', 'refreshIntervalSelect', 'versionLabel',
+      'phoneSyncToggle', 'phoneStatusLine', 'phoneRelayUrl', 'phoneTestBtn', 'phoneRelayHint', 'phonePairBtn',
+      'phoneRepairBtn', 'phoneUnpairBtn', 'phonePushBtn', 'phoneUnpairConfirm', 'phoneUnpairYesBtn', 'phoneUnpairNoBtn',
+      'phonePairing', 'phoneQr', 'phonePairString', 'phoneCopyBtn', 'phonePairHint'];
     ids.forEach((id) => { els[id] = document.getElementById(id); });
     els.container = els.widgetContainer;
     els.chartCanvas = els.usageChart;

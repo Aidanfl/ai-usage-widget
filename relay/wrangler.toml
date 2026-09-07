@@ -1,0 +1,15 @@
+# aiusage-relay — Cloudflare Worker + KV for the AI Usage widget phone sync (see README.md).
+name = "aiusage-relay"
+main = "src/worker.js"
+compatibility_date = "2026-06-01"
+
+# The worker keeps one small encrypted record per paired phone in this KV namespace.
+# Create it once and paste the id it prints:
+#   npx wrangler kv namespace create SLOTS
+# → prints something like  { binding = "SLOTS", id = "0123456789abcdef0123456789abcdef" }
+[[kv_namespaces]]
+binding = "SLOTS"
+id = "REPLACE_WITH_THE_ID_FROM_wrangler_kv_namespace_create"
+
+# Nothing else is required. The default *.workers.dev URL that `wrangler deploy` prints is the relay URL
+# you paste into the widget's Settings → Phone → Relay URL field.

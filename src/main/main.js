@@ -3,6 +3,7 @@
 // IPC surface, and owns the lifecycle flags (single instance, before-quit, window recreate).
 
 const path = require('path');
+const os = require('os');
 const { app, BrowserWindow, ipcMain, shell, Notification, powerMonitor, session, safeStorage } = require('electron');
 
 // Must match package.json build.appId so dev (`npm start`) and packaged builds share one taskbar /
@@ -41,6 +42,7 @@ function bootstrap() {
   const { createAlertEngine } = require('./alerts');
   const { createScheduler } = require('./scheduler');
   const { createTray } = require('./tray');
+  const { createPhoneSync } = require('./sync');
 
   const IS_PORTABLE = process.platform === 'win32' && !!process.env.PORTABLE_EXECUTABLE_FILE;
   const EXTERNAL_HOSTS = ['claude.ai', 'anthropic.com', 'chatgpt.com', 'openai.com', 'github.com'];
@@ -48,6 +50,9 @@ function bootstrap() {
   // Top-level key in config.json (next to `settings`) holding the safeStorage-encrypted claude.ai
   // sessionKey as base64. Kept out of `settings` so it never travels to the renderer.
   const WEB_SESSION_STORE_KEY = 'claudeWebSession';
+  // Same pattern for the phone-sync pair key K (docs/PHONE-SYNC.md): base64 of
+  // safeStorage.encryptString(base64(K)). Without safeStorage the key lives in memory for this run only.
+  const PHONE_PAIR_KEY_STORE_KEY = 'phonePairKey';
 
   let mainWindow = null;
   let isQuitting = false;        // set on 'before-quit': lets the close handler tell quit from "hide to tray"
@@ -127,6 +132,7 @@ function bootstrap() {
   const alerts = createAlertEngine({ notify: showNotification, now: Date.now });
 
   const tray = createTray({
+    platform: process.platform,
     getSettings,
     onShow: () => showMainWindowSmart(),
     onRefresh: () => {
@@ -136,6 +142,22 @@ function bootstrap() {
     onExit: () => app.quit(),
     onClick: () => toggleWindow(),
   });
+
+  // Phone sync: pushes an encrypted copy of every snapshot to the relay per the push policy in
+  // docs/PHONE-SYNC.md. Pure module — persistence of K, fetch and the clock are injected here.
+  const phoneSync = createPhoneSync({
+    getSettings,
+    loadKey: readStoredPairKey,
+    saveKey: persistPairKey,
+    clearKey: () => persistPairKey(null),
+    fetch: (...args) => globalThis.fetch(...args),
+    now: Date.now,
+    log: createLogger('phone-sync'),
+    appVersion: app.getVersion(),
+    platform: process.platform,
+    hostname: safeHostname(),
+  });
+  phoneSync.onStatus((status) => broadcast('phone-sync-updated', status));
 
   const scheduler = createScheduler({
     providers: resolveProviders,
@@ -148,6 +170,12 @@ function bootstrap() {
     onSnapshot: (snapshot) => {
       broadcast('usage-updated', snapshot);
       detectWebSessionExpiry(snapshot);
+      // The 7-day history is read lazily (only when a push actually goes out) — it comes from disk.
+      try {
+        phoneSync.onSnapshot(snapshot, () => history.get(7, snapshot));
+      } catch (err) {
+        log.error('phone sync onSnapshot failed:', err && err.message);
+      }
     },
   });
 
@@ -156,6 +184,23 @@ function bootstrap() {
   // ---------------------------------------------------------------------------------------------
   function liveWindow() {
     return mainWindow && !mainWindow.isDestroyed() ? mainWindow : null;
+  }
+
+  // "Hide from taskbar" is a taskbar button on Windows and the Dock icon on macOS (setSkipTaskbar is a
+  // no-op there). Both only while a tray / menu-bar item exists to bring the window back.
+  function applyHideFromTaskbar(win, hide) {
+    const effective = !!hide && tray.hasIcon();
+    if (process.platform === 'darwin') {
+      if (!app.dock) return;
+      try {
+        if (effective) app.dock.hide();
+        else if (!app.dock.isVisible()) app.dock.show();
+      } catch (err) {
+        log.error('dock toggle failed:', err && err.message);
+      }
+      return;
+    }
+    if (win && !win.isDestroyed()) win.setSkipTaskbar(effective);
   }
 
   function broadcast(channel, payload) {
@@ -226,7 +271,7 @@ function bootstrap() {
     // Only hide from the taskbar while a tray icon exists to bring the window back (see the
     // minimize-window handler, which drops the flag when the tray is gone).
     win.on('restore', () => {
-      if (!win.isDestroyed()) win.setSkipTaskbar(!!getSettings().hideFromTaskbar && tray.hasIcon());
+      applyHideFromTaskbar(win, getSettings().hideFromTaskbar);
     });
     mainWindow = win;
     return win;
@@ -239,7 +284,7 @@ function bootstrap() {
       return;
     }
     windowing.showMainWindowSmart(win, { onMove: persistPosition });
-    win.setSkipTaskbar(!!getSettings().hideFromTaskbar && tray.hasIcon());
+    applyHideFromTaskbar(win, getSettings().hideFromTaskbar);
   }
 
   function toggleWindow() {
@@ -337,7 +382,10 @@ function bootstrap() {
     const win = liveWindow();
 
     if (changed('autoStart')) applyLoginItem(next.autoStart);
-    if (win && changed('hideFromTaskbar')) win.setSkipTaskbar(!!next.hideFromTaskbar);
+    if (changed('hideFromTaskbar')) applyHideFromTaskbar(win, next.hideFromTaskbar);
+    if (win && changed('alwaysOnTop') && process.platform === 'darwin' && typeof win.setVisibleOnAllWorkspaces === 'function') {
+      try { win.setVisibleOnAllWorkspaces(!!next.alwaysOnTop, { visibleOnFullScreen: true, skipTransformProcessType: true }); } catch (err) { log.error('setVisibleOnAllWorkspaces failed:', err && err.message); }
+    }
     if (win && changed('alwaysOnTop')) win.setAlwaysOnTop(!!next.alwaysOnTop, 'floating');
     if (changed('refreshInterval')) scheduler.applyInterval(parseInt(next.refreshInterval, 10));
 
@@ -366,6 +414,12 @@ function bootstrap() {
     // recreates too, while a no-op (unsupported → still solid) leaves the window alone.
     if (changed('background') && win && windowing.getAppliedBackground(win) !== windowing.resolveBackground(next.background)) {
       recreateWindow();
+    }
+
+    // Phone sync: enabling with no key generates one; a relay URL change resets the push state and
+    // fills the new relay right away (both subject to the 60 s floor). The module broadcasts its status.
+    if (changed('phoneSyncEnabled') || changed('phoneRelayUrl')) {
+      phoneSync.settingsChanged(prev, next);
     }
   }
 
@@ -527,6 +581,68 @@ function bootstrap() {
   }
 
   // ---------------------------------------------------------------------------------------------
+  // Phone sync pair key (docs/PHONE-SYNC.md). Same persistence pattern as the claude.ai session:
+  // safeStorage-encrypted under a top-level store key, decrypted only in this process. Never logged.
+  // ---------------------------------------------------------------------------------------------
+  function safeHostname() {
+    try {
+      return os.hostname();
+    } catch (err) {
+      return '';
+    }
+  }
+
+  // → Buffer (32 bytes) | null. Requires a ready app (safeStorage); sync.load() is called from whenReady.
+  function readStoredPairKey() {
+    let encoded = null;
+    try {
+      encoded = store.get(PHONE_PAIR_KEY_STORE_KEY, null);
+    } catch (err) {
+      log.error('reading the stored phone pair key failed:', err && err.message);
+      return null;
+    }
+    if (typeof encoded !== 'string' || !encoded) return null;
+    try {
+      if (!safeStorage.isEncryptionAvailable()) {
+        log.warn('safeStorage is unavailable; the stored phone pair key cannot be decrypted — re-pair the phone');
+        return null;
+      }
+      const key = Buffer.from(safeStorage.decryptString(Buffer.from(encoded, 'base64')), 'base64');
+      return key.length === 32 ? key : null;
+    } catch (err) {
+      log.warn('stored phone pair key could not be decrypted (different user/machine?); re-pair the phone');
+      return null;
+    }
+  }
+
+  // Returns true only when the key landed on disk; false = memory-only for this run (the UI says so).
+  function persistPairKey(key) {
+    try {
+      if (!key) {
+        store.delete(PHONE_PAIR_KEY_STORE_KEY);
+        return true;
+      }
+      if (!safeStorage.isEncryptionAvailable()) {
+        log.warn('safeStorage is unavailable; the phone pair key is kept for this run only');
+        return false;
+      }
+      store.set(PHONE_PAIR_KEY_STORE_KEY, safeStorage.encryptString(Buffer.from(key).toString('base64')).toString('base64'));
+      return true;
+    } catch (err) {
+      log.error('persisting the phone pair key failed:', err && err.message);
+      return false;
+    }
+  }
+
+  // Unpair = DELETE the slot best-effort, forget K (module) and turn the setting off (here, so the
+  // settings-updated broadcast and side effects run through the one path).
+  async function phoneSyncUnpair() {
+    await phoneSync.unpair();
+    if (getSettings().phoneSyncEnabled) handleSaveSettings({ phoneSyncEnabled: false });
+    return true;
+  }
+
+  // ---------------------------------------------------------------------------------------------
   // IPC (§8). Payloads are `{ key }` objects from preload; bare values are accepted too.
   // ---------------------------------------------------------------------------------------------
   const unwrap = (arg, key) => (arg && typeof arg === 'object' && key in arg ? arg[key] : arg);
@@ -576,6 +692,14 @@ function bootstrap() {
   handle('claude-web-logout', () => claudeWebLogout());
   handle('claude-web-orgs', () => claudeWebOrgs());
   handle('claude-web-select-org', (_event, arg) => claudeWebSelectOrg(unwrap(arg, 'id')));
+  // Phone sync (§8 / docs/PHONE-SYNC.md). K never leaves the main process; the renderer only sees the
+  // pairing string + QR data URL.
+  handle('phone-sync-status', () => phoneSync.getStatus());
+  handle('phone-sync-pairing', () => phoneSync.getPairing());
+  handle('phone-sync-repair', () => phoneSync.repair());
+  handle('phone-sync-unpair', () => phoneSyncUnpair());
+  handle('phone-sync-test', (_event, arg) => phoneSync.test(unwrap(arg, 'relayUrl')));
+  handle('phone-sync-push-now', () => phoneSync.pushNow());
 
   on('minimize-window', () => {
     const win = liveWindow();
@@ -588,7 +712,7 @@ function bootstrap() {
     // hideFromTaskbar with no tray icon (both providers off, or Tray creation failed) would minimize a
     // window that has neither a taskbar button nor a tray icon; give the taskbar button back first.
     // The 'restore' handler in createWindow() re-hides it once a tray icon exists again.
-    if (hideFromTaskbar) win.setSkipTaskbar(false);
+    if (hideFromTaskbar) applyHideFromTaskbar(win, false);
     win.minimize();
   });
   on('close-window', () => {
@@ -635,9 +759,12 @@ function bootstrap() {
 
     // safeStorage needs a ready app; restore the claude.ai session before the first tick.
     loadWebSession();
+    // Same for the phone pair key (the first tick's snapshot is the first push when sync is on).
+    phoneSync.load();
 
     createWindow();
     tray.update(null); // creates placeholder badges when trayStats is on
+    if (process.platform === 'darwin') applyHideFromTaskbar(liveWindow(), settings.hideFromTaskbar);
 
     powerMonitor.on('resume', () => {
       log.info('system resumed; refreshing');
@@ -651,17 +778,25 @@ function bootstrap() {
     // being foreground succeeds and the window jumps back to the topmost band. Never re-asserts
     // `false` (the user may have turned it off meanwhile).
     let topmostDenied = false;
-    setInterval(() => {
+    if (process.platform === 'win32') setInterval(() => {
       const win = liveWindow();
       if (!win || !getSettings().alwaysOnTop) return;
-      if (win.isAlwaysOnTop()) { if (topmostDenied) { topmostDenied = false; log.info('always-on-top regained'); } return; }
+      const raisable = win.isVisible() && !win.isMinimized() && !win.isFocused();
+      if (win.isAlwaysOnTop()) {
+        if (topmostDenied) { topmostDenied = false; log.info('always-on-top regained'); }
+        // Holding the flag is not the whole story: a borderless game that makes ITSELF topmost sits above
+        // us inside the topmost band whenever it is the active window. HWND_TOP (moveTop, non-activating)
+        // moves us back to the top of the band without disturbing the game.
+        if (raisable) win.moveTop();
+        return;
+      }
       win.setAlwaysOnTop(true, 'floating');
       if (win.isAlwaysOnTop()) return;
       if (!topmostDenied) { topmostDenied = true; log.info('always-on-top denied by Windows (fullscreen app in front?); retrying every 2 s'); }
       // Fallback while denied: a plain non-activating raise (HWND_TOP) is still allowed, so keep the
       // widget above the other ordinary windows on its monitor. It cannot cover the fullscreen game
       // itself, and it never takes focus, so the game is undisturbed.
-      if (win.isVisible() && !win.isMinimized() && !win.isFocused()) win.moveTop();
+      if (raisable) win.moveTop();
     }, 2000);
 
     scheduler.start();
@@ -688,6 +823,8 @@ function bootstrap() {
 
   app.on('window-all-closed', () => {
     if (recreatingWindow || BrowserWindow.getAllWindows().length > 0) return;
+    // macOS: the Dock icon (when visible) reopens the window through 'activate', so stay alive.
+    if (process.platform === 'darwin' && app.dock && app.dock.isVisible()) return;
     // Without a tray icon there is no way back to a hidden window, so a closed window means quit.
     if (!tray.hasIcon()) app.quit();
   });
