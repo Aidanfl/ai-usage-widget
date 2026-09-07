@@ -105,6 +105,11 @@ function sanitizeSettings(input, previous = SETTINGS_DEFAULTS) {
     out[key] = allowed.includes(value) ? value : (allowed.includes(previous[key]) ? previous[key] : SETTINGS_DEFAULTS[key]);
   }
 
+  // 0.2.1 made the time part of a weekly "resets at" cell unconditional, so 'date-day-time' (which used to
+  // add it, on two lines) now means exactly 'date-day'. The value stays in ENUMS so an existing config
+  // validates, and is migrated here instead of being reset to the default.
+  if (out.dateFormat === 'date-day-time') out.dateFormat = 'date-day';
+
   out.warnThreshold = clampThreshold(out.warnThreshold, previous.warnThreshold);
   out.dangerThreshold = clampThreshold(out.dangerThreshold, previous.dangerThreshold);
   if (out.warnThreshold > out.dangerThreshold) {

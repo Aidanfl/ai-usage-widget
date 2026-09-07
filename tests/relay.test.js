@@ -257,7 +257,7 @@ test('end to end: desktop push through the worker, phone-side decrypt reproduces
   assert.equal(payload.v, 1);
   assert.equal(payload.generatedAt, T0);
   assert.deepEqual(payload.source, { app: 'ai-usage-widget', version: '0.2.0', platform: 'win32', host: 'AIDAN-PC' });
-  assert.deepEqual(payload.settings, { warnThreshold: 75, dangerThreshold: 90, timeFormat: '24h' });
+  assert.deepEqual(payload.settings, { warnThreshold: 75, dangerThreshold: 90, timeFormat: '24h', dateFormat: 'date' });
   const expected = JSON.parse(JSON.stringify(snapshot));
   delete expected.providers.claude.raw;
   assert.deepEqual(payload.snapshot, expected);

@@ -196,7 +196,7 @@ CodexCredits = {
   ```
   Verify with `getContentSize()` and log a warning if it still differs. Apply the same helper in solid/transparent mode
   (it is a no-op there).
-- Widths: normal **560**, compact **290** (match original). Height is owned by the renderer: it measures its content and
+- Widths: normal **620** (560 through 0.2.0; widened so the weekly "resets at" date+time fits on one line), compact **290**. Height is owned by the renderer: it measures its content and
   calls `api.resizeWindow(height)`; main applies `applyContentSize(WIDTH, height)`.
 - Position persistence (`windowPosition`), off-screen recovery (center on primary work area when not intersecting any
   display), single-instance lock, `before-quit` flag, close → hide when a tray icon exists else quit, minimize → hide
@@ -215,7 +215,7 @@ CodexCredits = {
 | `warnThreshold` | 75 | amber at/above |
 | `dangerThreshold` | 90 | red at/above |
 | `timeFormat` | '12h' | '12h' \| '24h' |
-| `dateFormat` | 'date' | 'date' (Sep 7) \| 'date-day' (Sun Sep 7) \| 'date-day-time' |
+| `dateFormat` | 'date' | 'date' (Sep 7) \| 'date-day' (Sun Sep 7); weekly "resets at" cells always append the time, so the value only picks the weekday. Legacy 'date-day-time' validates and is migrated to 'date-day' |
 | `usageAlerts` | true | desktop notifications |
 | `compactMode` | false | |
 | `refreshInterval` | '120' | seconds as string: '15','30','60','120','300' (the Claude provider additionally enforces a 60 s floor, §6) |
@@ -361,7 +361,8 @@ on      phone-sync-updated (status)          (same shape as phone-sync-status; a
   with tooltip message; "Sign in" affordance when auth_required) + column headers (USED · ELAPSED · RESETS IN · RESETS AT,
   shown once at the top of the panel) + one row per `UsageWindow`: label, gradient bar + percent, elapsed ring
   (SVG r=10, dasharray 63; ring thresholds: amber ≥75% elapsed, green ≥90%), resets-in text ("43m", "1d 8h", "Not started"
-  when percent 0 and no resetsAt), resets-at text (12h/24h; weekly rows use the date format).
+  when percent 0 and no resetsAt), resets-at text (session rows: time only; weekly rows: date AND time,
+  "Sep 7, 3:59 PM" / "Sun Sep 7, 15:59", one line).
 - Bar/percent colour: series colour < warn → amber ≥ warnThreshold → red ≥ dangerThreshold; `blocked` when ≥100.
 - Expand chevron per provider → Claude: Extra Usage row (ON/OFF pill, monthly spend bar `$used / $cap`), Credits row
   (balance, promo/paid split, expiry chip) when known; Codex: Credits row, "Limit reached" badge, model availability.
@@ -393,7 +394,7 @@ blocked window drops below 100 AND no other window of that provider is blocked. 
 ## 12. Verification checklist (for the integration/verify agents)
 
 1. `npm test` passes. 2. `npm start` launches without console errors; both providers show real data on this machine.
-3. Screenshot (harness or app) shows acrylic backdrop, exact 560 px width, rounded corners.
+3. Screenshot (harness or app) shows acrylic backdrop, exact 620 px width (290 px in compact), rounded corners.
 4. Toggle each setting live: theme, background (window recreate), compact, tray stats, thresholds, refresh interval.
 5. Kill network → status stale with last-good values; restore → ok. 6. Expired-token path exercised with a unit test.
 7. `npm run build:portable` produces `dist/AI-Usage-Widget-<ver>-win-portable.exe` that runs.
@@ -434,7 +435,7 @@ createTray({ onShow, onRefresh, onExit, getSettings }) → { update(snapshot), r
   resolveBackground(setting, supported = acrylicSupported()) → one of BACKGROUNDS ('solid' when unsupported, 'acrylic' for unknown),
   materialFor(background) → 'acrylic' | 'mica' | null, themeSourceFor(background) → 'dark' | 'light' | 'system',
   getAppliedBackground(win) → the resolved background the window was created with,
-  WIDGET_WIDTH: 560, COMPACT_WIDTH: 290, isPositionOnScreen(x,y,w,h), getCenteredPosition(w,h) }
+  WIDGET_WIDTH: 620, COMPACT_WIDTH: 290, isPositionOnScreen(x,y,w,h), getCenteredPosition(w,h) }
 
 // src/main/providers/normalize.js (pure)
 { normalizeClaude({ usage, profile, credentials, web, prepaid }) → { windows, extra, plan, account },

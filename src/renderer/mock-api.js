@@ -17,7 +17,8 @@
  *   empty       no history                       loading    no snapshot ever arrives
  *   system      theme "system"                   noacrylic  acrylic unsupported (settings hint)
  *   capped      Claude extra usage with a $200 cap   web    claudeSource = claude_web
- *   ddt         date format "date-day-time"      24h        24-hour time format
+ *   dateday     date format "date-day"           24h        24-hour time format
+ *   mac         get-app-info platform darwin (macOS labels: Smoky/Clear Glass, no Mica)
  *   spinning    simulate a tray refresh (spinner) portable   portable build (autostart disabled)
  *   sparse      hourly history (default is a 2-minute cadence, like the real 60–120 s scheduler)
  *   titles      log every tooltip (dot / updated / row labels / compact labels / credits) to the console for the harness
@@ -61,7 +62,7 @@
     warnThreshold: 75,
     dangerThreshold: 90,
     timeFormat: has('24h') ? '24h' : '12h',
-    dateFormat: has('ddt') ? 'date-day-time' : 'date',
+    dateFormat: has('dateday') ? 'date-day' : 'date',
     usageAlerts: true,
     compactMode: has('compact'),
     refreshInterval: '60',
@@ -330,7 +331,7 @@
     // `background` = the backdrop the window was created with (main: getAppliedBackground); the mock has no
     // window to recreate, so it simply reports the current setting (downgraded to solid without acrylic).
     getAppInfo: async () => ({
-      version: '0.1.1', platform: 'win32', acrylicSupported: !has('noacrylic'), isPortable: has('portable'),
+      version: '0.2.1', platform: has('mac') ? 'darwin' : 'win32', acrylicSupported: !has('noacrylic'), isPortable: has('portable'),
       background: has('noacrylic') ? 'solid' : settings.background,
     }),
     claudeWebLogin: async () => { await delay(600); return { success: true }; },

@@ -92,16 +92,21 @@
 
   /**
    * "Resets at" cell text.
-   * opts: { isWeekly: boolean, timeFormat: '12h'|'24h', dateFormat: 'date'|'date-day'|'date-day-time' }
-   * Session-style windows show the time only; weekly-style windows use the date format.
+   * opts: { isWeekly: boolean, timeFormat: '12h'|'24h', dateFormat: 'date'|'date-day' }
+   * Session-style windows show the time only (they reset within hours, so the day is never in doubt).
+   * Weekly-style windows show the date AND the time — "Sep 7, 3:59 PM" / "Sun Sep 7, 15:59" — because a
+   * bare date never said *when* on that day the week rolls over. `dateFormat` now only decides whether the
+   * weekday is included; the legacy 'date-day-time' value behaves like 'date-day' (store.js migrates it).
    * Missing resetsAt → em dash.
    */
   function formatResetsAt(resetsAt, opts) {
     opts = opts || {};
     var t = toMs(resetsAt);
     if (t === null) return '—';
-    if (!opts.isWeekly) return formatTime(t, opts.timeFormat || '12h');
-    return formatDate(t, opts.dateFormat || 'date', opts.timeFormat || '12h');
+    var timeFormat = opts.timeFormat || '12h';
+    if (!opts.isWeekly) return formatTime(t, timeFormat);
+    var withDay = opts.dateFormat === 'date-day' || opts.dateFormat === 'date-day-time';
+    return formatDate(t, withDay ? 'date-day' : 'date') + ', ' + formatTime(t, timeFormat);
   }
 
   /** Tooltip-style "Sep 7, 3:59 PM". */

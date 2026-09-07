@@ -151,11 +151,16 @@ enum Formatting {
         }
     }
 
-    /// "Resets at" cell text: session-style windows show the time, weekly-style windows the date. Missing → "—".
+    /// "Resets at" cell text: session-style windows show the time only; weekly-style windows show the date
+    /// AND the time ("Sep 7, 3:59 PM" / "Sun Sep 7, 15:59"), matching the desktop widget. `dateFormat` only
+    /// decides whether the weekday is included; the legacy "date-day-time" behaves like "date-day".
+    /// Missing → "—".
     static func resetsAt(_ date: Date?, isWeekly: Bool, timeFormat: String, dateFormat: String) -> String {
         guard let d = date else { return "—" }
         if !isWeekly { return formatTime(d, timeFormat: timeFormat) }
-        return formatDate(d, dateFormat: dateFormat, timeFormat: timeFormat)
+        let withDay: Bool = (dateFormat == "date-day" || dateFormat == "date-day-time")
+        let datePart: String = formatDate(d, dateFormat: withDay ? "date-day" : "date", timeFormat: timeFormat)
+        return "\(datePart), \(formatTime(d, timeFormat: timeFormat))"
     }
 
     /// Tooltip-style "Sep 7, 3:59 PM".

@@ -14,7 +14,7 @@ function defaultScreen() {
   return electron().screen;
 }
 
-const WIDGET_WIDTH = 560;
+const WIDGET_WIDTH = 620;
 const COMPACT_WIDTH = 290;
 // Initial heights only — the renderer measures itself and calls `resize-window` right after load.
 const INITIAL_HEIGHT = 155;

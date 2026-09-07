@@ -10,6 +10,8 @@ It started as a fork of SlavomirDurej's [`claude-usage-widget`](https://github.c
 
 ![Main view: Claude and Codex cards with the details panels open and the 7-day graph showing](docs/screenshot-main.png)
 
+*(Screenshots are rendered with sample data. On a real desktop the panel is translucent - the two right-hand images show the glass.)*
+
 | Compact mode (290 px) | Settings | Light theme (Smoky Acrylic) | Clear Acrylic |
 |---|---|---|---|
 | ![Compact view](docs/screenshot-compact.png) | ![Settings view](docs/screenshot-settings.png) | ![Light theme](docs/screenshot-light.png) | ![Clear Acrylic background](docs/screenshot-clear.png) |
@@ -81,19 +83,19 @@ Note: when running from source the "Launch at startup" toggle saves but does not
 npm run build:portable
 ```
 
-produces `dist\AI-Usage-Widget-0.2.0-win-portable.exe` - a single file, no installer, runs from wherever you put it.
+produces `dist\AI-Usage-Widget-0.2.1-win-portable.exe` - a single file, no installer, runs from wherever you put it.
 
 ```bat
 npm run build
 ```
 
-runs `electron-builder --win`, which builds **both** targets configured in `package.json`: the NSIS installer `dist\AI-Usage-Widget-0.2.0-win-Setup.exe` (lets you choose the folder, adds desktop and Start Menu shortcuts) and the portable exe above.
+runs `electron-builder --win`, which builds **both** targets configured in `package.json`: the NSIS installer `dist\AI-Usage-Widget-0.2.1-win-Setup.exe` (lets you choose the folder, adds desktop and Start Menu shortcuts) and the portable exe above.
 
 ```sh
 npm run build:mac
 ```
 
-on a Mac builds the universal `dist/AI-Usage-Widget-0.2.0-mac.dmg` (and a `.zip`). There is no Apple Developer certificate, so `build/after-pack.js` ad-hoc signs the bundle (Apple Silicon refuses to run unsigned code at all) and the DMG is not notarised.
+on a Mac builds the universal `dist/AI-Usage-Widget-0.2.1-mac.dmg` (and a `.zip`). There is no Apple Developer certificate, so `build/after-pack.js` ad-hoc signs the bundle (Apple Silicon refuses to run unsigned code at all) and the DMG is not notarised.
 
 `dist/` is ignored by git. The version number in the file names comes from `package.json`.
 
@@ -102,7 +104,7 @@ on a Mac builds the universal `dist/AI-Usage-Widget-0.2.0-mac.dmg` (and a `.zip`
 ## Launch at startup
 
 - **Installer build:** Settings -> *Launch at startup*. This registers the installed exe as a Windows login item (`app.setLoginItemSettings`).
-- **Portable build:** the toggle is greyed out ("Not supported in portable mode"). Do it the Windows way instead: press `Win + R`, type `shell:startup`, press Enter, and drop a shortcut to `AI-Usage-Widget-0.2.0-win-portable.exe` into the folder that opens.
+- **Portable build:** the toggle is greyed out ("Not supported in portable mode"). Do it the Windows way instead: press `Win + R`, type `shell:startup`, press Enter, and drop a shortcut to `AI-Usage-Widget-0.2.1-win-portable.exe` into the folder that opens.
 - **macOS:** the same toggle registers the app as a login item (System Settings → General → Login Items shows it).
 
 Either way the widget is single-instance: launching it a second time just brings the existing window forward.
@@ -160,7 +162,7 @@ Usage then comes from `https://claude.ai/api/organizations/<org>/usage`, fetched
 ### Anatomy
 
 - **Title bar:** "AI Usage", then buttons for Settings, Refresh (spins while a fetch is in flight), Graph (highlighted when open), Minimise and Close. Drag the bar to move the widget.
-- **Column headers**, shown once at the top: **USED** (bar + percent), **ELAPSED** (ring), **RESETS IN**, **RESETS AT**.
+- **Column headers**, shown once at the top: **USED** (bar + percent), **ELAPSED** (ring), **RESETS IN**, **RESETS AT**. Session rows show a time in *resets at* (`3:59 PM`); weekly rows - Claude's Weekly Limit, Fable Weekly, Codex's Weekly Limit - show the date **and** the time (`Sep 7, 3:59 PM`), because a bare date never said when in the day the week rolls over.
 - **Provider card header:** logo, name, plan chip (Max 20x, Pro, Team, Plus...), status dot, "updated Ns ago", and a chevron when there are details to show.
 - **Left-edge chevron** switches to compact mode; in compact mode the right-edge chevron switches back.
 
@@ -238,7 +240,7 @@ Every key stored under `settings` in `config.json`, with its default (from `SETT
 | `warnThreshold` | Warn at (amber dot) | `75` | Percent at which bars, badges and alerts go amber. 1-99. |
 | `dangerThreshold` | Warn at (red dot) | `90` | Percent at which they go red. 1-99 and must be above warn; the UI refuses to save otherwise, and the store swaps them if they arrive reversed. |
 | `timeFormat` | Time format | `'12h'` | `12h` (3:59 PM) or `24h` (15:59). |
-| `dateFormat` | Date format | `'date'` | `date` (Sep 7), `date-day` (Sun Sep 7), or `date-day-time` (Sun Sep 7 + time, shown on two lines in weekly rows). |
+| `dateFormat` | Date format | `'date'` | Whether the weekday is shown in a weekly row's *resets at* cell: `date` (Sep 7, 3:59 PM) or `date-day` (Sun Sep 7, 3:59 PM). The time is always shown. Configs from 0.2.1 or earlier that say `date-day-time` are migrated to `date-day`. |
 | `usageAlerts` | Usage alerts | `true` | Desktop notifications on/off. |
 | `compactMode` | Compact mode | `false` | The 290 px view. Also toggled by the edge chevrons. |
 | `refreshInterval` | Auto-refresh | `'120'` | Seconds between polls, as a string: `'15'`, `'30'`, `'60'`, `'120'`, `'300'`. Independently of this, the Claude usage endpoint is never hit more than once per 60 s and the Codex one more than once per 30 s. |

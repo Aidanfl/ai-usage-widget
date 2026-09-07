@@ -176,7 +176,7 @@ svg { display: block; }
 
 /* ---------- Panel ---------- */
 .widget-container {
-  width: 560px;
+  width: 620px;
   background: var(--tint);
   border: 1px solid var(--panel-border);
   border-radius: 10px;
@@ -258,7 +258,8 @@ body.compact-mode .ctl svg { width: 11px; height: 11px; }
 
 .grid {
   display: grid;
-  grid-template-columns: 118px minmax(0, 1fr) 36px 72px 72px;
+  /* Last column fits the longest "resets at" text — "Sun Sep 27, 12:59 PM" — on one line. */
+  grid-template-columns: 118px minmax(0, 1fr) 36px 72px 120px;
   gap: 10px;
   align-items: center;
 }
@@ -431,7 +432,6 @@ body.theme-light .chip { color: rgb(var(--h)); filter: saturate(1.1) brightness(
   overflow: hidden; text-overflow: ellipsis; line-height: 1.15;
 }
 .resat.dim { opacity: 0.5; }
-.resat.twoline { white-space: normal; font-size: 10px; }
 
 /* Auth / error row inside a card */
 .auth-row {

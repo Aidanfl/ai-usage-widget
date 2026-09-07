@@ -325,8 +325,10 @@ test('close/closed callbacks reach main.js with the window; restore recentres an
   win.bounds.x = 8000; // monitor unplugged while minimized
   win.minimize();
   win.restore();
-  assert.deepEqual([win.bounds.x, win.bounds.y], [680, 443]);
-  assert.deepEqual(seen[1], ['move', { x: 680, y: 443 }]);
+  // Centred on PRIMARY's 1920x1040 work area — derived, so a width change does not break this test.
+  const centred = windowing.getCenteredPosition(windowing.WIDGET_WIDTH, windowing.INITIAL_HEIGHT, fakeScreen());
+  assert.deepEqual([win.bounds.x, win.bounds.y], [centred.x, centred.y]);
+  assert.deepEqual(seen[1], ['move', centred]);
 
   win.destroy();
   assert.deepEqual(seen[2], ['closed', win]);

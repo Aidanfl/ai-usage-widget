@@ -197,6 +197,9 @@ function buildPhonePayload({ snapshot, history, settings = {}, appVersion = '0.0
       warnThreshold: Number.isFinite(settings.warnThreshold) ? settings.warnThreshold : 75,
       dangerThreshold: Number.isFinite(settings.dangerThreshold) ? settings.dangerThreshold : 90,
       timeFormat: settings.timeFormat === '24h' ? '24h' : '12h',
+      // Added in 0.2.1 so the phone's weekly "resets at" text matches the desktop's exactly. Older iOS
+      // builds ignore the extra key; the two accepted values are the two the settings UI offers.
+      dateFormat: settings.dateFormat === 'date-day' || settings.dateFormat === 'date-day-time' ? 'date-day' : 'date',
     },
     history: { days: HISTORY_DAYS, samples: downsampleHistory(hist.samples), series },
   };

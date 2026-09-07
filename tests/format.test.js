@@ -53,13 +53,17 @@ test('formatResetsAt — session windows show time only', () => {
   assert.equal(F.formatResetsAt(fixtureIso, { isWeekly: false, timeFormat: '24h', dateFormat: 'date-day-time' }), '15:59');
 });
 
-test('formatResetsAt — weekly windows use the three date formats', () => {
-  assert.equal(F.formatResetsAt(fixtureIso, { isWeekly: true, timeFormat: '12h', dateFormat: 'date' }), 'Sep 7');
-  assert.equal(F.formatResetsAt(fixtureIso, { isWeekly: true, timeFormat: '12h', dateFormat: 'date-day' }), 'Mon Sep 7');
-  assert.equal(F.formatResetsAt(fixtureIso, { isWeekly: true, timeFormat: '12h', dateFormat: 'date-day-time' }), 'Mon Sep 7 3:59 PM');
-  assert.equal(F.formatResetsAt(fixtureIso, { isWeekly: true, timeFormat: '24h', dateFormat: 'date-day-time' }), 'Mon Sep 7 15:59');
+test('formatResetsAt — weekly windows always show the date AND the time', () => {
+  assert.equal(F.formatResetsAt(fixtureIso, { isWeekly: true, timeFormat: '12h', dateFormat: 'date' }), 'Sep 7, 3:59 PM');
+  assert.equal(F.formatResetsAt(fixtureIso, { isWeekly: true, timeFormat: '24h', dateFormat: 'date' }), 'Sep 7, 15:59');
+  assert.equal(F.formatResetsAt(fixtureIso, { isWeekly: true, timeFormat: '12h', dateFormat: 'date-day' }), 'Mon Sep 7, 3:59 PM');
+  assert.equal(F.formatResetsAt(fixtureIso, { isWeekly: true, timeFormat: '24h', dateFormat: 'date-day' }), 'Mon Sep 7, 15:59');
+  // the legacy value (its two-line rendering is gone) is just 'date-day' now
+  assert.equal(F.formatResetsAt(fixtureIso, { isWeekly: true, timeFormat: '12h', dateFormat: 'date-day-time' }), 'Mon Sep 7, 3:59 PM');
   // defaults: date + 12h
-  assert.equal(F.formatResetsAt(fixtureIso, { isWeekly: true }), 'Sep 7');
+  assert.equal(F.formatResetsAt(fixtureIso, { isWeekly: true }), 'Sep 7, 3:59 PM');
+  // the longest string the "RESETS AT" column has to fit (see styles.css .grid)
+  assert.equal(F.formatResetsAt(new Date(2026, 8, 27, 12, 59), { isWeekly: true, dateFormat: 'date-day' }), 'Sun Sep 27, 12:59 PM');
 });
 
 test('formatResetsAt — missing value is an em dash', () => {

@@ -2,6 +2,15 @@
 
 All notable changes to AI Usage Widget. Dates are ISO (YYYY-MM-DD).
 
+## 0.2.1 - 2026-09-07
+
+### Changed
+
+- **Weekly rows now show the date AND the time they reset.** Claude's *Weekly Limit*, *Fable Weekly* and Codex's *Weekly Limit* used to say only `Sep 7` in the RESETS AT column, which never told you when in that day the week rolls over; they now say `Sep 7, 3:59 PM` (or `Sun Sep 7, 15:59` with the weekday option and 24-hour time). Session rows are unchanged - they reset within hours, so the time alone is unambiguous.
+- **The panel is 60 px wider (560 -> 620)** so the longer text fits on one line; the RESETS AT column grew from 72 to 120 px and the bar column gained the remaining 12 px. Compact mode is unchanged at 290 px.
+- **Date format setting** now only chooses whether the weekday is included (`Sep 7, 3:59 PM` / `Sun Sep 7, 3:59 PM`); the time is always shown, so the old third option (`Sun Sep 7 + time`, which rendered on two lines) is gone. Configs that still say `date-day-time` are migrated to `date-day` instead of being reset.
+- The iPhone app and its widgets use the same wording, and the sync payload now carries `dateFormat` as well, so both screens read the same. (Phones running an older build simply keep the `Sep 7, 3:59 PM` form.)
+
 ## 0.2.0 - 2026-09-06
 
 The "everywhere" release: macOS build, iPhone companion widget, public source on GitHub with CI-built installers.

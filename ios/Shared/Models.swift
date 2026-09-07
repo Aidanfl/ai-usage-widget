@@ -101,7 +101,7 @@ struct PhoneSettings: Codable, Equatable {
     var warnThreshold: Double?
     var dangerThreshold: Double?
     var timeFormat: String?    // '12h' | '24h'
-    var dateFormat: String?    // 'date' | 'date-day' | 'date-day-time' (not in the v1 payload; tolerated)
+    var dateFormat: String?    // 'date' | 'date-day' (sent since desktop 0.2.1; older payloads omit it -> 'date')
 }
 
 /// Validated settings with the desktop defaults filled in (warn 75 / danger 90 / 12h / 'date').

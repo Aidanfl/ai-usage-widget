@@ -199,7 +199,7 @@ test('buildPhonePayload strips raw from every provider and copies the rest', () 
   assert.equal(payload.v, 1);
   assert.equal(payload.generatedAt, T0 + 5);
   assert.deepEqual(payload.source, { app: 'ai-usage-widget', version: '0.2.0', platform: 'win32', host: 'AIDAN-PC' });
-  assert.deepEqual(payload.settings, { warnThreshold: 70, dangerThreshold: 95, timeFormat: '24h' }, 'only the three keys the phone needs');
+  assert.deepEqual(payload.settings, { warnThreshold: 70, dangerThreshold: 95, timeFormat: '24h', dateFormat: 'date' }, 'only the four keys the phone needs');
   assert.equal(payload.snapshot.fetchedAt, T0);
   assert.equal(payload.snapshot.providers.codex, null);
   const claude = payload.snapshot.providers.claude;
@@ -216,7 +216,7 @@ test('buildPhonePayload strips raw from every provider and copies the rest', () 
   // Missing / odd inputs never throw.
   const empty = buildPhonePayload({ snapshot: null, history: null, settings: {}, now: T0 });
   assert.deepEqual(empty.history, { days: 7, samples: [], series: [] });
-  assert.deepEqual(empty.settings, { warnThreshold: 75, dangerThreshold: 90, timeFormat: '12h' });
+  assert.deepEqual(empty.settings, { warnThreshold: 75, dangerThreshold: 90, timeFormat: '12h', dateFormat: 'date' });
 });
 
 test('history downsampling: 30-min buckets keep the LAST sample, newest 400 kept, series trimmed', () => {
@@ -450,7 +450,7 @@ test('onSnapshot applies the push policy: first fill, floor, change, 5-min inter
   assert.equal(payload.source.host, 'AIDAN-PC');
   assert.ok(!('raw' in payload.snapshot.providers.claude));
   assert.equal(payload.history.samples.length, 1);
-  assert.deepEqual(payload.settings, { warnThreshold: 75, dangerThreshold: 90, timeFormat: '12h' });
+  assert.deepEqual(payload.settings, { warnThreshold: 75, dangerThreshold: 90, timeFormat: '12h', dateFormat: 'date' });
 
   // 30 s later with a change: floor.
   h.advance(30 * 1000);

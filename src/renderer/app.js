@@ -86,7 +86,7 @@
     expanded: { claude: false, codex: false },
     graphVisible: false,
     settingsOpen: false,
-    compactPending: false, // compact preference while the (560px) settings view is open
+    compactPending: false, // compact preference while the full-width (non-compact) settings view is open
     appInfo: null,
     loading: true,
     orgs: [],
@@ -585,23 +585,17 @@
 
     const resat = row.querySelector('.resat');
     // Parse once: an unparseable `resetsAt` string is truthy but must render like a missing one
-    // (dim em dash, no "Resets —" tooltip). A reset ≥ 24 h away is shown as a date even for rows of
+    // (dim em dash, no "Resets —" tooltip). A reset ≥ 24 h away is shown as date + time even for rows of
     // unknown window length, where a bare "3:59 PM" would not say which day.
     const resetMs = F.toMs(win.resetsAt);
     const weekly = F.isWeeklyWindow(win, now);
-    resat.classList.remove('twoline');
     if (resetMs === null) {
       resat.textContent = '—';
       resat.classList.add('dim');
       resat.title = '';
     } else {
       resat.classList.remove('dim');
-      if (weekly && s.dateFormat === 'date-day-time') {
-        resat.replaceChildren(F.formatDate(resetMs, 'date-day'), document.createElement('br'), F.formatTime(resetMs, s.timeFormat));
-        resat.classList.add('twoline');
-      } else {
-        resat.textContent = F.formatResetsAt(resetMs, { isWeekly: weekly, timeFormat: s.timeFormat, dateFormat: s.dateFormat });
-      }
+      resat.textContent = F.formatResetsAt(resetMs, { isWeekly: weekly, timeFormat: s.timeFormat, dateFormat: s.dateFormat });
       resat.title = 'Resets ' + F.formatDate(resetMs, 'date-day-time', s.timeFormat);
     }
   }
@@ -1192,6 +1186,13 @@
     }
 
     setValue(els.timeFormatSelect, s.timeFormat || '12h');
+    // The two options preview the real "resets at" cell, so they have to follow the Time format setting
+    // (a static "3:59 PM" label would be wrong for a 24h user). Sample = today at 15:59.
+    const dateSample = new Date();
+    dateSample.setHours(15, 59, 0, 0);
+    els.dateFormatSelect.querySelectorAll('option').forEach((o) => {
+      o.textContent = F.formatResetsAt(dateSample, { isWeekly: true, timeFormat: s.timeFormat, dateFormat: o.value });
+    });
     setValue(els.dateFormatSelect, s.dateFormat || 'date');
     setValue(els.refreshIntervalSelect, String(s.refreshInterval || '60'));
 
@@ -1577,7 +1578,7 @@
     saveSettings({ compactMode: compact });
   }
 
-  // The settings view needs the 560px window, so compact mode is suspended while it is open and
+  // The settings view needs the full-width (non-compact) window, so compact mode is suspended while it is open and
   // restored on Done. Main persists `compactMode` on every set-compact-mode, hence the separate
   // `compactPending` preference (the original's "settings-from-compact dance", minus the lost setting).
   function openSettings() {
