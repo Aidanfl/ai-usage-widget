@@ -75,10 +75,9 @@ jobs:
           test "$PKG" = "$TAG"
       - name: Release notes from CHANGELOG.md
         run: |
-          VERSION=$(node -p "require('./package.json').version")
           node -e '
             const fs = require("fs");
-            const [, version] = process.argv.slice(1);
+            const version = require("./package.json").version;
             const md = fs.readFileSync("CHANGELOG.md", "utf8");
             const re = new RegExp("^## " + version.replace(/\./g, "\\.") + "[^\n]*\n([\\s\\S]*?)(?=^## |$(?![\\r\\n]))", "m");
             const m = md.match(re);
@@ -89,7 +88,7 @@ jobs:
               "- iPhone: build the companion app in `ios/` with Xcode (see `ios/README.md`).\n\n" +
               "Builds are not code-signed; Windows SmartScreen and macOS Gatekeeper will warn on first launch.";
             fs.writeFileSync("release-notes.md", body);
-          ' "$VERSION"
+          '
           cat release-notes.md
       - name: Create release
         uses: softprops/action-gh-release@v2
