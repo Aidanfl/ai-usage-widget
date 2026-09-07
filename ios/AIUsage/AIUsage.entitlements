@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Shared container (payload cache) AND keychain access group (pairing secret).
+	     On iOS an App Group identifier is also a valid keychain access group, with no team prefix. -->
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>group.com.aidanfl.aiusage</string>
+	</array>
+</dict>
+</plist>
