@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:; connect-src 'none'">
+<title>AI Usage</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div id="app">
+  <div class="widget-container" id="widgetContainer">
+
+    <!-- ================= Title bar (drag region) ================= -->
+    <div class="titlebar" id="titleBar">
+      <div class="title">
+        <span class="app-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path fill="#ffffff" fill-opacity="0.95" d="M12 2.5c.75 5.6 3.9 8.75 9.5 9.5-5.6.75-8.75 3.9-9.5 9.5-.75-5.6-3.9-8.75-9.5-9.5 5.6-.75 8.75-3.9 9.5-9.5z"/></svg>
+        </span>
+        <span>AI Usage</span>
+      </div>
+      <div class="controls">
+        <button class="ctl settings" id="settingsBtn" type="button" title="Settings" aria-label="Settings">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        </button>
+        <button class="ctl refresh" id="refreshBtn" type="button" title="Refresh" aria-label="Refresh">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+        </button>
+        <button class="ctl graph" id="graphBtn" type="button" title="Toggle usage graph" aria-label="Toggle usage graph" aria-pressed="false">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+        </button>
+        <button class="ctl minimize" id="minimizeBtn" type="button" title="Minimise to system tray" aria-label="Minimise to system tray">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="5" y1="12" x2="19" y2="12"/></svg>
+        </button>
+        <button class="ctl close" id="closeBtn" type="button" title="Exit application" aria-label="Exit application">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="6" y1="6" x2="18" y2="18"/><line x1="18" y1="6" x2="6" y2="18"/></svg>
+        </button>
+      </div>
+    </div>
+
+    <!-- ================= Normal view ================= -->
+    <div class="main" id="mainView">
+      <button class="side-chevron" id="compactBtn" type="button" title="Compact view" aria-label="Switch to compact view">
+        <svg viewBox="7 4 10 16" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+      </button>
+      <div class="grid headers" id="headersRow" aria-hidden="true">
+        <span></span>
+        <span class="colh">Used</span>
+        <span class="colh wide">Elapsed</span>
+        <span class="colh">Resets In</span>
+        <span class="colh">Resets At</span>
+      </div>
+      <div id="providers"></div>
+      <div class="card graph" id="graphCard" hidden>
+        <div class="legend" id="legend"></div>
+        <div class="chart-box">
+          <canvas id="usageChart" role="img" aria-label="7-day usage history"></canvas>
+          <div class="chart-empty" id="chartEmpty" hidden>No history yet — the graph fills in as usage is sampled over the next few refreshes.</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ================= Compact view ================= -->
+    <div class="compact" id="compactView" hidden>
+      <div class="compact-rows" id="compactRows"></div>
+      <button class="side-chevron" id="expandBtn" type="button" title="Normal view" aria-label="Switch to normal view">
+        <svg viewBox="7 4 10 16" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+      </button>
+    </div>
+
+    <!-- ================= Settings view ================= -->
+    <div class="settings" id="settingsView" hidden>
+      <div class="settings-header">
+        <span class="settings-title">Settings</span>
+        <button class="done-btn" id="doneBtn" type="button" title="Close settings">Done</button>
+      </div>
+      <div class="settings-disclaimer">Unofficial tool — not affiliated with Anthropic or OpenAI</div>
+      <div class="settings-rows">
+
+        <div class="srow">
+          <div class="scol" id="autoStartCol">
+            <span class="slabel">Launch at startup</span>
+            <label class="toggle"><input type="checkbox" id="autoStartToggle" aria-label="Launch at startup"><span class="slider"></span></label>
+            <span class="shint" id="autoStartHint" hidden>Not supported in portable mode</span>
+          </div>
+          <div class="scol">
+            <span class="slabel">Hide from taskbar</span>
+            <label class="toggle"><input type="checkbox" id="hideFromTaskbarToggle" aria-label="Hide from taskbar"><span class="slider"></span></label>
+          </div>
+        </div>
+
+        <div class="srow">
+          <div class="scol">
+            <span class="slabel">Always on top</span>
+            <label class="toggle"><input type="checkbox" id="alwaysOnTopToggle" aria-label="Always on top"><span class="slider"></span></label>
+          </div>
+          <div class="scol">
+            <span class="slabel">Usage alerts</span>
+            <label class="toggle"><input type="checkbox" id="usageAlertsToggle" aria-label="Usage alerts"><span class="slider"></span></label>
+          </div>
+        </div>
+
+        <div class="srow">
+          <div class="scol">
+            <span class="slabel">Compact mode</span>
+            <label class="toggle"><input type="checkbox" id="compactModeToggle" aria-label="Compact mode"><span class="slider"></span></label>
+          </div>
+          <div class="scol">
+            <span class="slabel">Providers</span>
+            <div class="scontrol">
+              <label class="toggle-labelled"><span class="toggle"><input type="checkbox" id="providerClaudeToggle" aria-label="Show Claude"><span class="slider"></span></span>Claude</label>
+              <label class="toggle-labelled"><span class="toggle"><input type="checkbox" id="providerCodexToggle" aria-label="Show Codex"><span class="slider"></span></span>Codex</label>
+            </div>
+          </div>
+        </div>
+
+        <div class="srow full">
+          <div class="scol wide">
+            <span class="slabel">Theme</span>
+            <div class="seg" id="themeSeg" role="group" aria-label="Theme">
+              <button class="seg-btn" type="button" data-theme="dark">Dark</button>
+              <button class="seg-btn" type="button" data-theme="light">Light</button>
+              <button class="seg-btn" type="button" data-theme="system">System</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="srow full">
+          <div class="scol wide">
+            <span class="slabel">Background</span>
+            <div class="seg" id="backgroundSeg" role="group" aria-label="Background">
+              <button class="seg-btn" type="button" data-bg="acrylic">Smoky Acrylic</button>
+              <button class="seg-btn" type="button" data-bg="acrylic_clear">Clear Acrylic</button>
+              <button class="seg-btn" type="button" data-bg="mica">Mica</button>
+              <button class="seg-btn" type="button" data-bg="solid">Solid</button>
+            </div>
+            <span class="shint" id="backgroundHint" hidden>Acrylic and Mica need Windows 11 (22H2+)</span>
+            <span class="shint" id="backgroundClearHint" hidden>Clear Acrylic uses dark text</span>
+          </div>
+        </div>
+
+        <div class="srow full">
+          <div class="scol wide">
+            <span class="slabel">Claude source</span>
+            <div class="scontrol">
+              <select class="sselect" id="claudeSourceSelect" aria-label="Claude source">
+                <option value="claude_code">Claude Code login (automatic)</option>
+                <option value="claude_web">claude.ai browser login</option>
+              </select>
+              <button class="small-btn" id="claudeWebLoginBtn" type="button" hidden>Log in</button>
+              <button class="small-btn danger" id="claudeWebLogoutBtn" type="button" hidden>Log out</button>
+              <select class="sselect" id="claudeOrgSelect" aria-label="Claude organisation" hidden></select>
+            </div>
+            <span class="shint web-status" id="claudeWebStatus" hidden></span>
+          </div>
+        </div>
+
+        <div class="srow">
+          <div class="scol">
+            <span class="slabel">Token auto-refresh</span>
+            <label class="toggle"><input type="checkbox" id="tokenAutoRefreshToggle" aria-label="Token auto-refresh"><span class="slider"></span></label>
+            <span class="shint">Renews expired tokens and writes them back to disk</span>
+          </div>
+          <div class="scol">
+            <span class="slabel">Tray stats</span>
+            <select class="sselect" id="trayStatsSelect" aria-label="Tray stats">
+              <option value="off">Off</option>
+              <option value="claude">Claude</option>
+              <option value="codex">Codex</option>
+              <option value="both">Both</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="srow">
+          <div class="scol">
+            <span class="slabel">Warn at</span>
+            <div class="threshold-group">
+              <label class="threshold-label" title="Warning threshold">
+                <span class="threshold-dot warn"></span>
+                <input type="number" class="threshold-input" id="warnThreshold" min="1" max="99" value="75" aria-label="Warning threshold">
+                <span class="threshold-pct">%</span>
+              </label>
+              <label class="threshold-label" title="Danger threshold">
+                <span class="threshold-dot danger"></span>
+                <input type="number" class="threshold-input" id="dangerThreshold" min="1" max="99" value="90" aria-label="Danger threshold">
+                <span class="threshold-pct">%</span>
+              </label>
+            </div>
+            <span class="shint error" id="thresholdHint" hidden>Use 1–99 and keep warn below danger</span>
+          </div>
+          <div class="scol">
+            <span class="slabel">Time format</span>
+            <select class="sselect" id="timeFormatSelect" aria-label="Time format">
+              <option value="12h">12h (3:59 PM)</option>
+              <option value="24h">24h (15:59)</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="srow">
+          <div class="scol">
+            <span class="slabel">Date format</span>
+            <select class="sselect" id="dateFormatSelect" aria-label="Date format">
+              <option value="date">Sep 7</option>
+              <option value="date-day">Sun Sep 7</option>
+              <option value="date-day-time">Sun Sep 7 + time</option>
+            </select>
+          </div>
+          <div class="scol">
+            <span class="slabel">Auto-refresh</span>
+            <select class="sselect" id="refreshIntervalSelect" aria-label="Auto-refresh interval">
+              <option value="15">Every 15s</option>
+              <option value="30">Every 30s</option>
+              <option value="60">Every 1 min</option>
+              <option value="120">Every 2 min</option>
+              <option value="300">Every 5 min</option>
+            </select>
+          </div>
+        </div>
+
+      </div>
+      <div class="settings-footer">
+        <span class="version-label" id="versionLabel">AI Usage Widget</span>
+        <span class="made-for">Made for Aidan</span>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<script src="../../node_modules/chart.js/dist/chart.umd.js"></script>
+<script src="../../node_modules/chartjs-adapter-date-fns/dist/chartjs-adapter-date-fns.bundle.js"></script>
+<script src="format.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
