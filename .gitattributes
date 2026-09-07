@@ -1,0 +1,8 @@
+# Normalise line endings in the repo; check out as LF everywhere (the code, scripts and CI assume LF).
+* text=auto eol=lf
+*.png binary
+*.ico binary
+*.icns binary
+*.ttf binary
+*.woff binary
+*.woff2 binary

@@ -12,6 +12,9 @@ function electron() {
 }
 
 const PLACEHOLDER_ICON_PATH = path.join(__dirname, '..', '..', 'assets', 'tray-icon.png');
+// macOS menu bar: one monochrome template glyph (Electron picks trayTemplate@2x.png for Retina) plus the
+// percentages as menu-bar TEXT — the coloured 20 px bitmap badges below are a Windows notification-area idiom.
+const TEMPLATE_ICON_PATH = path.join(__dirname, '..', '..', 'assets', 'trayTemplate.png');
 
 // Series colours per badge slot; warn/danger recolour to amber/red; ≥ 99 % becomes the red ✕.
 const BADGE_COLORS = {
@@ -379,9 +382,25 @@ function providerStatusText(provider) {
   return 'no data';
 }
 
-function createTray({ onShow, onRefresh, onExit, onClick, getSettings, electron: deps } = {}) {
+// Menu-bar text for macOS: one "NN%" per badge (✕ at ≥ 99 % like the Windows red-cross badge, "–" while a
+// slot has no data). With both providers on, each group is prefixed by its provider name.
+function menuBarTitle(badges) {
+  const groups = new Map();
+  for (const badge of badges) {
+    const pct = badge.window ? Number(badge.window.percent) : NaN;
+    const text = !badge.window ? '–' : !Number.isFinite(pct) ? '–' : pct >= 99 ? '✕' : `${Math.round(Math.max(0, pct))}%`;
+    const name = (badge.provider && badge.provider.name) || PROVIDER_NAMES[badge.providerId] || badge.providerId;
+    if (!groups.has(name)) groups.set(name, []);
+    groups.get(name).push(text);
+  }
+  const parts = [...groups.entries()].map(([name, texts]) => (groups.size > 1 ? `${name} ${texts.join('·')}` : texts.join(' · ')));
+  return parts.join('  ');
+}
+
+function createTray({ onShow, onRefresh, onExit, onClick, getSettings, electron: deps, platform = process.platform } = {}) {
   const { Tray, Menu, nativeImage } = deps || electron();
   const settingsOf = typeof getSettings === 'function' ? getSettings : () => ({});
+  const menuBarMode = platform === 'darwin';
   // Latched by destroy() (called from 'will-quit'). A refresh tick that was in flight when the app
   // began quitting still runs tray.update() afterwards; without the latch reconcile() would create
   // brand-new Tray icons during shutdown and leave ghost icons in the Windows notification area.
@@ -410,8 +429,60 @@ function createTray({ onShow, onRefresh, onExit, onClick, getSettings, electron:
       { label: 'Show Widget', click: () => call(onShow) },
       { label: 'Refresh', click: () => call(onRefresh) },
       { type: 'separator' },
-      { label: 'Exit', click: () => call(onExit) },
+      { label: menuBarMode ? 'Quit AI Usage Widget' : 'Exit', click: () => call(onExit) },
     ]);
+  }
+
+  // macOS: a single menu-bar item. Created when the badge list is non-empty, destroyed when it empties.
+  let templateImage = null;
+  function getTemplateImage() {
+    if (templateImage) return templateImage;
+    try {
+      const img = nativeImage.createFromPath(TEMPLATE_ICON_PATH);
+      if (img && !img.isEmpty()) {
+        if (typeof img.setTemplateImage === 'function') img.setTemplateImage(true);
+        templateImage = img;
+      }
+    } catch (err) { /* fall through to the generated placeholder */ }
+    if (!templateImage) templateImage = getPlaceholder();
+    return templateImage;
+  }
+
+  function reconcileMenuBar(badges, settings) {
+    const existing = trays.get('menubar');
+    if (badges.length === 0) {
+      if (existing) { trays.delete('menubar'); order = []; destroyOne(existing); }
+      return;
+    }
+    let tray = existing && !existing.isDestroyed() ? existing : null;
+    if (!tray) {
+      try {
+        tray = new Tray(getTemplateImage());
+        tray.setContextMenu(buildMenu());
+        tray.on('click', clickHandler);
+        trays.set('menubar', tray);
+        order = ['menubar'];
+      } catch (err) {
+        console.error('[tray] failed to create menu-bar item:', err && err.message);
+        return;
+      }
+    }
+    try {
+      if (typeof tray.setTitle === 'function') tray.setTitle(menuBarTitle(badges), { fontType: 'monospacedDigit' });
+      const timeFormat = settings.timeFormat === '24h' ? '24h' : '12h';
+      const lines = badges.map((badge) => {
+        const providerName = (badge.provider && badge.provider.name) || PROVIDER_NAMES[badge.providerId] || badge.providerId;
+        if (!badge.window) return `${providerName} ${badge.kind === 'weekly' ? 'Weekly' : 'Session'}: ${providerStatusText(badge.provider)}`;
+        const pct = Number(badge.window.percent);
+        let line = `${providerName} ${shortLabel(badge.window, badge.kind)}: ${Math.round(Number.isFinite(pct) ? Math.max(0, pct) : 0)}%`;
+        const resetText = formatResetTime(badge.window.resetsAt, timeFormat, badge.kind !== 'session');
+        if (resetText) line += ` (resets ${resetText})`;
+        return line;
+      });
+      tray.setToolTip(lines.join('\n'));
+    } catch (err) {
+      console.error('[tray] failed to paint menu-bar item:', err && err.message);
+    }
   }
 
   function destroyOne(tray) {
@@ -478,6 +549,10 @@ function createTray({ onShow, onRefresh, onExit, onClick, getSettings, electron:
   function reconcile() {
     const settings = settingsOf() || {};
     const badges = desiredBadges(lastSnapshot, settings);
+    if (menuBarMode) {
+      reconcileMenuBar(badges, settings);
+      return;
+    }
     const ids = badges.map((b) => b.id);
     const same = ids.length === order.length && ids.every((id, i) => id === order[i]) && ids.every((id) => trays.has(id) && !trays.get(id).isDestroyed());
     if (!same) {
@@ -522,4 +597,5 @@ module.exports = {
   generateRedXIcon,
   desiredBadges,
   badgeColor,
+  menuBarTitle,
 };

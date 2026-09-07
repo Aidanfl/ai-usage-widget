@@ -64,7 +64,7 @@ class FakeBrowserWindow extends EventEmitter {
 
 function createWin({
   settings = {}, savedPosition = null, screen = fakeScreen(), onMove, onClose, onClosed, crashReloadDelayMs,
-  BrowserWindow = FakeBrowserWindow, nativeTheme = { themeSource: 'system' }, acrylicSupported = true,
+  BrowserWindow = FakeBrowserWindow, nativeTheme = { themeSource: 'system' }, acrylicSupported = true, platform = 'win32',
 } = {}) {
   const win = windowing.createMainWindow({
     settings: { background: 'solid', compactMode: false, alwaysOnTop: true, ...settings },
@@ -73,7 +73,7 @@ function createWin({
     onClose,
     onClosed,
     log: QUIET,
-    deps: { BrowserWindow, screen, crashReloadDelayMs, nativeTheme, acrylicSupported },
+    deps: { BrowserWindow, screen, crashReloadDelayMs, nativeTheme, acrylicSupported, platform },
   });
   return win;
 }
@@ -81,13 +81,56 @@ function createWin({
 test('background values: both acrylics share the material, differ in DWM theme; everything downgrades to solid when unsupported', () => {
   assert.deepEqual(windowing.BACKGROUNDS, ['acrylic', 'acrylic_clear', 'mica', 'solid']);
   for (const bg of windowing.BACKGROUNDS) {
-    assert.equal(windowing.resolveBackground(bg, true), bg);
-    assert.equal(windowing.resolveBackground(bg, false), 'solid', `${bg} without acrylic support`);
+    assert.equal(windowing.resolveBackground(bg, true, 'win32'), bg);
+    assert.equal(windowing.resolveBackground(bg, false, 'win32'), 'solid', `${bg} without acrylic support`);
   }
-  assert.equal(windowing.resolveBackground('bogus', true), 'acrylic', 'unknown value → default (Smoky)');
-  assert.equal(windowing.resolveBackground(undefined, true), 'acrylic');
+  assert.equal(windowing.resolveBackground('bogus', true, 'win32'), 'acrylic', 'unknown value → default (Smoky)');
+  assert.equal(windowing.resolveBackground(undefined, true, 'win32'), 'acrylic');
   assert.deepEqual(windowing.BACKGROUNDS.map(windowing.materialFor), ['acrylic', 'acrylic', 'mica', null]);
+  assert.deepEqual(windowing.BACKGROUNDS.map(windowing.vibrancyFor), ['under-window', 'under-window', 'under-window', null]);
   assert.deepEqual(windowing.BACKGROUNDS.map(windowing.themeSourceFor), ['dark', 'light', 'system', 'system']);
+  // macOS: Mica is Windows-only and folds into Smoky; everything else keeps its value.
+  assert.deepEqual(windowing.BACKGROUNDS.map((bg) => windowing.resolveBackground(bg, true, 'darwin')), ['acrylic', 'acrylic_clear', 'acrylic', 'solid']);
+});
+
+test('acrylicSupported: Windows 11 22H2+ or macOS; Linux and older Windows get solid', () => {
+  assert.equal(windowing.acrylicSupported('win32', '10.0.22621'), true);
+  assert.equal(windowing.acrylicSupported('win32', '10.0.26200'), true);
+  assert.equal(windowing.acrylicSupported('win32', '10.0.22000'), false, 'Windows 11 21H2 has no backgroundMaterial');
+  assert.equal(windowing.acrylicSupported('win32', '10.0.19045'), false);
+  assert.equal(windowing.acrylicSupported('darwin', '24.5.0'), true);
+  assert.equal(windowing.acrylicSupported('linux', '6.8.0'), false);
+});
+
+test('macOS windows get vibrancy instead of a DWM material, stay opaque, and follow the user across Spaces', () => {
+  class Recording extends FakeBrowserWindow {
+    constructor(options) { super(options); this.workspaces = null; }
+    setVisibleOnAllWorkspaces(flag, options) { this.workspaces = { flag, options }; }
+  }
+  const smoky = createWin({ settings: { background: 'acrylic' }, BrowserWindow: Recording, platform: 'darwin' });
+  assert.equal('backgroundMaterial' in smoky.options, false);
+  assert.equal(smoky.options.vibrancy, 'under-window');
+  assert.equal(smoky.options.visualEffectState, 'active');
+  assert.equal(smoky.options.transparent, false);
+  assert.equal(smoky.options.roundedCorners, true);
+  assert.deepEqual(smoky.workspaces, { flag: true, options: { visibleOnFullScreen: true, skipTransformProcessType: true } });
+  assert.equal(windowing.getAppliedBackground(smoky), 'acrylic');
+
+  const mica = createWin({ settings: { background: 'mica' }, BrowserWindow: Recording, platform: 'darwin' });
+  assert.equal(windowing.getAppliedBackground(mica), 'acrylic', 'Mica folds into Smoky on macOS');
+  assert.equal(mica.options.vibrancy, 'under-window');
+
+  const solid = createWin({ settings: { background: 'solid' }, BrowserWindow: Recording, platform: 'darwin' });
+  assert.equal('vibrancy' in solid.options, false);
+  assert.equal(solid.options.transparent, true);
+
+  const pinned = createWin({ settings: { background: 'acrylic', alwaysOnTop: false }, BrowserWindow: Recording, platform: 'darwin' });
+  assert.equal(pinned.workspaces.flag, false, 'not pinned to every Space when always-on-top is off');
+
+  // Linux: no material of any kind, always solid.
+  const linux = createWin({ settings: { background: 'acrylic' }, platform: 'linux', acrylicSupported: false });
+  assert.equal(windowing.getAppliedBackground(linux), 'solid');
+  assert.equal(linux.options.transparent, true);
 });
 
 test('createMainWindow pins nativeTheme.themeSource for the backdrop BEFORE constructing the window and reports the applied value', () => {

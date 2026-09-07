@@ -2,6 +2,25 @@
 
 All notable changes to AI Usage Widget. Dates are ISO (YYYY-MM-DD).
 
+## 0.2.0 - 2026-09-06
+
+The "everywhere" release: macOS build, iPhone companion widget, public source on GitHub with CI-built installers.
+
+### Added
+
+- **macOS support.** The same widget runs on macOS 12+ (universal DMG for Apple Silicon and Intel). Smoky/Clear Acrylic map to NSVisualEffectView vibrancy (`under-window`, kept active while unfocused; Mica is Windows-only and shows as Smoky). Tray stats become a single **menu-bar item** with the percentages as text (`91% · 42%`, `✕` at 99%+). "Hide from taskbar" hides the Dock icon. Always-on-top windows are shown on every Space and above full-screen apps. Unsigned builds are ad-hoc signed by `build/after-pack.js` so they launch on Apple Silicon after the one-time Gatekeeper step (README → *Installing on macOS*).
+- **Phone sync** (Settings → Phone): the desktop pushes an AES-256-GCM-encrypted copy of every snapshot (plus a downsampled 7-day history) to a relay you host; the key is derived from a pairing secret shown as a QR code and never leaves your devices. Pushes at most once a minute, otherwise every 5 minutes or when a percentage/reset changes; exponential back-off on failure; status line and Test / Show pairing code / Re-pair / Unpair controls. Protocol in `docs/PHONE-SYNC.md`; settings `phoneSyncEnabled`, `phoneRelayUrl`; the pairing key is stored `safeStorage`-encrypted as `phonePairKey`.
+- **Relay** (`relay/`): a dependency-free Cloudflare Worker + KV implementation of the protocol (`PUT/GET/DELETE /v1/slots/{id}`, `GET /v1/health`), first-write-claims slots, constant-time token checks, 256 KB cap, 7-day TTL. Deploy with `wrangler deploy`; runs on the free tier for personal use.
+- **iPhone companion app** (`ios/`, SwiftUI, iOS 17+): pairs by QR or pasted string, decrypts with CryptoKit, mirrors the desktop rows (plan chip, status, bars, resets, extra usage, credits, 7-day Swift Charts view), and ships **home-screen widgets** (small / medium / large) and **lock-screen widgets** (rectangular, inline, circular) that refresh on a 15-minute timeline with an offline cache. XcodeGen project; compiled for the Simulator on every CI run. Not on the App Store yet - build it with Xcode.
+- **GitHub repository, CI and releases.** Source published at github.com/Aidanfl/ai-usage-widget under MIT with the original author's licence preserved (`LICENSE`, `LICENSE-claude-usage-widget`, README → Credits). `ci.yml` runs the unit tests on Windows/macOS/Linux and compiles the iOS app; `release.yml` builds the Windows installer + portable exe and the macOS DMG on a `v*` tag and publishes a GitHub Release with these notes.
+- `npm run build:mac`; `homepage`/`repository` metadata; `.gitattributes` (LF everywhere).
+
+### Changed
+
+- `acrylicSupported()` is now platform-aware (Windows 11 22H2+ *or* macOS); `resolveBackground()` takes the platform and folds Mica into Smoky on macOS; `createTray()` takes a `platform` and `window.js` deps accept `platform` for tests.
+- The renderer relabels the Background buttons on macOS (Smoky Glass / Clear Glass, Mica hidden) and the Windows-only hints stay on Windows.
+- Unit tests pin `platform: 'win32'` where they assert Windows behaviour so the suite passes on macOS and Linux runners.
+
 ## 0.1.1 - 2026-09-06
 
 ### Changed

@@ -4,7 +4,7 @@
 // (which would leave ghost icons in the Windows notification area). Electron is injected as fakes.
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { createTray, desiredBadges, badgeColor } = require('../src/main/tray');
+const { createTray, desiredBadges, badgeColor, menuBarTitle } = require('../src/main/tray');
 
 function fakeElectron() {
   const created = [];
@@ -18,7 +18,8 @@ function fakeElectron() {
     }
     isDestroyed() { return this.destroyed; }
     setToolTip(text) { this.tooltip = text; }
-    setContextMenu() {}
+    setTitle(text, options) { this.title = text; this.titleOptions = options; }
+    setContextMenu(menu) { this.menu = menu; }
     setImage(image) { this.image = image; }
     on() { this.listeners += 1; }
     removeAllListeners() { this.listeners = 0; }
@@ -26,7 +27,9 @@ function fakeElectron() {
   }
   const nativeImage = {
     createFromBuffer: (buffer, size) => ({ buffer, size, isEmpty: () => false }),
-    createFromPath: () => ({ isEmpty: () => true }), // force the generated placeholder
+    createFromPath: (p) => (/trayTemplate[.]png$/.test(p)
+      ? { path: p, template: false, isEmpty: () => false, setTemplateImage(flag) { this.template = flag; } }
+      : { isEmpty: () => true }), // force the generated placeholder for the Windows badges
   };
   const Menu = { buildFromTemplate: (template) => ({ template }) };
   return { deps: { Tray, Menu, nativeImage }, created };
@@ -119,4 +122,32 @@ test('desiredBadges / badgeColor are pure: placeholders without data, thresholds
   assert.deepEqual(badgeColor('claude.weekly', 10, 75, 90), { r: 59, g: 130, b: 246 });
   assert.deepEqual(badgeColor('claude.weekly', 80, 75, 90), { r: 245, g: 158, b: 11 });
   assert.deepEqual(badgeColor('claude.weekly', 95, 75, 90), { r: 239, g: 68, b: 68 });
+});
+
+test("macOS: one menu-bar item with a template glyph and the percentages as text; 'off' removes it", () => {
+  const { deps, created } = fakeElectron();
+  let settings = settingsFor('claude');
+  const tray = createTray({ getSettings: () => settings, electron: deps, platform: 'darwin' });
+  tray.update(SNAPSHOT);
+  assert.equal(created.length, 1, 'a single Tray however many badges');
+  assert.equal(created[0].image.template, true, 'template image so macOS tints it for light/dark menu bars');
+  assert.equal(created[0].title, '91% · 42%', 'weekly then session, like the Windows badge order');
+  assert.deepEqual(created[0].titleOptions, { fontType: 'monospacedDigit' });
+  assert.match(created[0].tooltip, /Claude Weekly: 91%/);
+  assert.match(created[0].tooltip, /Claude Session: 42%/);
+  assert.equal(created[0].menu.template.at(-1).label, 'Quit AI Usage Widget');
+  assert.equal(tray.hasIcon(), true);
+
+  settings = settingsFor('both');
+  tray.rebuild();
+  assert.equal(created.length, 2, 'rebuild recreates the single item');
+  assert.equal(created[1].title, 'Codex –·–  Claude 91%·42%', 'provider names when both are shown; dashes while Codex has no data');
+
+  settings = settingsFor('off');
+  tray.rebuild();
+  assert.equal(tray.hasIcon(), false);
+  assert.equal(created.every((t) => t.destroyed), true);
+
+  assert.equal(menuBarTitle([{ providerId: 'claude', kind: 'weekly', window: { percent: 99.2 } }]), '✕');
+  assert.equal(menuBarTitle([]), '');
 });

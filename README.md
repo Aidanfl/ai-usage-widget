@@ -1,14 +1,42 @@
 # AI Usage Widget
 
-A small always-on-top Windows widget that shows how much of your **Claude** and **Codex** usage limits you have burned through, side by side, on a frosted-glass (acrylic) panel. It reads the same sign-in files that Claude Code and the Codex CLI already keep on your PC, asks the same usage endpoints those tools use, and talks to nobody else.
+A small always-on-top desktop widget for **Windows and macOS** that shows how much of your **Claude** and **Codex** usage limits you have burned through, side by side, on a frosted-glass panel - plus an **iPhone companion app with a home-screen widget** that mirrors the same numbers. The desktop widget reads the sign-in files that Claude Code and the Codex CLI already keep on your machine, asks the same usage endpoints those tools use, and talks to nobody else (unless you turn on phone sync, which sends an encrypted copy to a relay you control).
 
-It started as a fork of SlavomirDurej's `claude-usage-widget` and grew a second provider, a Fable weekly bar, a Windows 11 backdrop, and a much more careful token-handling story.
+It started as a fork of SlavomirDurej's [`claude-usage-widget`](https://github.com/SlavomirDurej/claude-usage-widget) and grew a second provider, a Fable weekly bar, Windows 11 / macOS backdrops, a much more careful token-handling story, and the phone widget.
+
+[![CI](https://github.com/Aidanfl/ai-usage-widget/actions/workflows/ci.yml/badge.svg)](https://github.com/Aidanfl/ai-usage-widget/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/Aidanfl/ai-usage-widget?display_name=tag)](https://github.com/Aidanfl/ai-usage-widget/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 ![Main view: Claude and Codex cards with the details panels open and the 7-day graph showing](docs/screenshot-main.png)
 
 | Compact mode (290 px) | Settings | Light theme (Smoky Acrylic) | Clear Acrylic |
 |---|---|---|---|
 | ![Compact view](docs/screenshot-compact.png) | ![Settings view](docs/screenshot-settings.png) | ![Light theme](docs/screenshot-light.png) | ![Clear Acrylic background](docs/screenshot-clear.png) |
+
+## Download
+
+Grab the latest build from the [**Releases** page](https://github.com/Aidanfl/ai-usage-widget/releases/latest):
+
+| Platform | File | Notes |
+|---|---|---|
+| **Windows 10/11** | `AI-Usage-Widget-<version>-win-Setup.exe` | Installer: pick a folder, get Desktop + Start Menu shortcuts, "Launch at startup" works. |
+| **Windows (no install)** | `AI-Usage-Widget-<version>-win-portable.exe` | Single file, runs from anywhere. |
+| **macOS 12+** (Apple Silicon + Intel) | `AI-Usage-Widget-<version>-mac.dmg` | Universal build. Unsigned - see *Installing on macOS* below. |
+| **iPhone (iOS 17+)** | build from [`ios/`](ios/README.md) | Companion app + home-screen widget. Not on the App Store (yet); needs Xcode or a free Apple ID sideload. |
+
+The builds are not code-signed (no certificate), so **Windows SmartScreen** says "Windows protected your PC" the first time: click *More info* → *Run anyway*. **macOS Gatekeeper** needs the one-time step below. Every release is built from the tagged source by [GitHub Actions](.github/workflows/release.yml), so you can check what went into it.
+
+### Installing on macOS
+
+1. Open the `.dmg` and drag **AI Usage Widget** into *Applications*.
+2. The first launch is blocked because the app is not notarised ("Apple could not verify..." or "is damaged and can't be opened"). Either open **System Settings → Privacy & Security**, scroll down and click **Open Anyway**, or clear the quarantine flag once from Terminal:
+   ```sh
+   xattr -dr com.apple.quarantine "/Applications/AI-Usage-Widget.app"
+   ```
+3. Launch it again. The panel appears with the macOS glass backdrop; the percentages can also live in the **menu bar** (Settings → Tray stats).
+
+On macOS the widget is pinned to every Space and floats above full-screen apps, so "Always on top" really is always on top there.
 
 ## What it is
 
@@ -19,21 +47,22 @@ It started as a fork of SlavomirDurej's `claude-usage-widget` and grew a second 
 - **A 7-day history graph**, a **compact mode**, **tray badges** with the percentages, and **desktop notifications** when a window crosses your warning or danger threshold.
 - **Smoky Acrylic / Clear Acrylic / Mica / Solid backgrounds**, dark, light or system theme. Clear Acrylic is Windows' bright, untinted glass and always uses dark text.
 
-The Windows build is the only one that has been tested. The code has no Mac/Linux-specific paths beyond a couple of `process.platform` guards, but nothing is promised there.
+**Platforms.** Windows is where the widget was built and is tested daily. The macOS build uses the same code with native vibrancy instead of DWM acrylic, a menu-bar item instead of tray badges, and Dock hiding instead of "hide from taskbar"; it is built and unit-tested on GitHub's macOS runners but has not been exercised by hand on a Mac, so please report anything odd. Linux is not packaged (it would run with the Solid background).
 
 ## Requirements
 
 | What | Why |
 |---|---|
-| **Windows 11 22H2 or newer (build 22621+)** | Needed for the Smoky Acrylic, Clear Acrylic and Mica backdrops. On anything older the widget silently falls back to the Solid background (which still works). |
+| **Windows 11 22H2 or newer (build 22621+)**, or **macOS 12+** | Windows 11 22H2 is needed for the Smoky Acrylic, Clear Acrylic and Mica backdrops; on anything older the widget silently falls back to the Solid background (which still works). macOS gets the two glass backdrops through vibrancy (Mica is Windows-only and shows as Smoky there). |
 | **Node.js 18 or newer** | Only to run from source or build. `package.json` says `>=18`; the widget was developed on Node 24. The unit tests (`npm test`) use a glob pattern that needs Node 21+. |
 | **Claude Code signed in** | The default Claude source reads `%USERPROFILE%\.claude\.credentials.json`, which Claude Code writes when you log in. Run `claude` once and log in. (Alternative: the claude.ai browser login, see below.) |
 | **Codex CLI signed in with ChatGPT** | The Codex card reads `%USERPROFILE%\.codex\auth.json`. Run `codex login` and pick the ChatGPT sign-in. API-key mode cannot see usage, and the card will say so. |
 
 ## Run from source
 
-```bat
-cd D:\Dev\ai-usage-widget
+```sh
+git clone https://github.com/Aidanfl/ai-usage-widget.git
+cd ai-usage-widget
 npm install
 npm start
 ```
@@ -52,20 +81,29 @@ Note: when running from source the "Launch at startup" toggle saves but does not
 npm run build:portable
 ```
 
-produces `dist\AI-Usage-Widget-0.1.1-win-portable.exe` - a single file, no installer, runs from wherever you put it.
+produces `dist\AI-Usage-Widget-0.2.0-win-portable.exe` - a single file, no installer, runs from wherever you put it.
 
 ```bat
 npm run build
 ```
 
-runs `electron-builder --win`, which builds **both** targets configured in `package.json`: the NSIS installer `dist\AI-Usage-Widget-0.1.1-win-Setup.exe` (lets you choose the folder, adds desktop and Start Menu shortcuts) and the portable exe above.
+runs `electron-builder --win`, which builds **both** targets configured in `package.json`: the NSIS installer `dist\AI-Usage-Widget-0.2.0-win-Setup.exe` (lets you choose the folder, adds desktop and Start Menu shortcuts) and the portable exe above.
+
+```sh
+npm run build:mac
+```
+
+on a Mac builds the universal `dist/AI-Usage-Widget-0.2.0-mac.dmg` (and a `.zip`). There is no Apple Developer certificate, so `build/after-pack.js` ad-hoc signs the bundle (Apple Silicon refuses to run unsigned code at all) and the DMG is not notarised.
 
 `dist/` is ignored by git. The version number in the file names comes from `package.json`.
+
+**Releases are built by CI.** Pushing a tag `vX.Y.Z` (matching `package.json`) runs [`.github/workflows/release.yml`](.github/workflows/release.yml): the Windows installer + portable exe are built on a Windows runner, the DMG on a macOS runner, and everything is attached to a GitHub Release with the matching CHANGELOG section as notes. [`ci.yml`](.github/workflows/ci.yml) runs the unit tests on Windows, macOS and Linux and compiles the iOS app for the Simulator on every push.
 
 ## Launch at startup
 
 - **Installer build:** Settings -> *Launch at startup*. This registers the installed exe as a Windows login item (`app.setLoginItemSettings`).
-- **Portable build:** the toggle is greyed out ("Not supported in portable mode"). Do it the Windows way instead: press `Win + R`, type `shell:startup`, press Enter, and drop a shortcut to `AI-Usage-Widget-0.1.1-win-portable.exe` into the folder that opens.
+- **Portable build:** the toggle is greyed out ("Not supported in portable mode"). Do it the Windows way instead: press `Win + R`, type `shell:startup`, press Enter, and drop a shortcut to `AI-Usage-Widget-0.2.0-win-portable.exe` into the folder that opens.
+- **macOS:** the same toggle registers the app as a login item (System Settings → General → Login Items shows it).
 
 Either way the widget is single-instance: launching it a second time just brings the existing window forward.
 
@@ -180,6 +218,8 @@ Windows fixes how strong the acrylic blur is; what the widget controls is the ba
 
 Switching backgrounds recreates the window in place (the material and the window theme are fixed at creation time), so the panel blinks once.
 
+On **macOS** the same two glass looks come from NSVisualEffectView vibrancy (`under-window`, kept active even when the widget is not the key window): Smoky pins the dark appearance, Clear the light one. Mica does not exist there and is treated as Smoky.
+
 ### Notifications
 
 With *Usage alerts* on, you get a Windows toast when a window first crosses the warning threshold, first crosses the danger threshold, becomes blocked (100% or Codex "limit reached"), and once more when a blocked provider becomes usable again. Each fires at most once per reset cycle, and the very first check after launch is silent so you are not toasted about a state you are already looking at. Codex blocks are grouped into one toast even when several windows lock at once.
@@ -190,9 +230,9 @@ Every key stored under `settings` in `config.json`, with its default (from `SETT
 
 | Key | In the UI | Default | What it means |
 |---|---|---|---|
-| `autoStart` | Launch at startup | `false` | Register the installed exe to start with Windows. Greyed out in the portable build; has no effect when running from source. |
-| `hideFromTaskbar` | Hide from taskbar | `false` | Removes the taskbar button; Minimise then hides to the tray instead. Turning it on with tray stats off forces `trayStats` to `both`; turning tray stats off turns this back off. (Otherwise there would be no way to get the window back.) |
-| `alwaysOnTop` | Always on top | `true` | Float above other windows. Re-asserted every 5 s because alt-tab and full-screen apps can knock it down. |
+| `autoStart` | Launch at startup | `false` | Register the installed app as a Windows / macOS login item. Greyed out in the portable build; has no effect when running from source. |
+| `hideFromTaskbar` | Hide from taskbar / Dock | `false` | Removes the taskbar button (Windows) or the Dock icon (macOS); Minimise then hides to the tray / menu bar instead. Turning it on with tray stats off forces `trayStats` to `both`; turning tray stats off turns this back off. (Otherwise there would be no way to get the window back.) |
+| `alwaysOnTop` | Always on top | `true` | Float above other windows. On Windows it is re-asserted every 2 s (see Troubleshooting for the full-screen-game case); on macOS the window is also shown on every Space and over full-screen apps. |
 | `theme` | Theme | `'dark'` | `dark`, `light`, or `system` (follows Windows). |
 | `background` | Background | `'acrylic'` | `acrylic` (**Smoky Acrylic** - the name changed in 0.1.1, the stored value did not), `acrylic_clear` (**Clear Acrylic**), `mica`, or `solid`. Changing it recreates the window at the same position (Electron cannot switch backdrops live, and the two acrylics differ in the window theme they are created under). Clear Acrylic always renders with the dark-text palette regardless of `theme`. All three materials are forced to `solid` on Windows builds older than 22621. |
 | `warnThreshold` | Warn at (amber dot) | `75` | Percent at which bars, badges and alerts go amber. 1-99. |
@@ -207,11 +247,13 @@ Every key stored under `settings` in `config.json`, with its default (from `SETT
 | `providers` | Providers | `{ claude: true, codex: true }` | Show or hide each provider. A hidden provider is not polled at all. |
 | `claudeSource` | Claude source | `'claude_code'` | `claude_code` (credentials file) or `claude_web` (claude.ai browser login). |
 | `tokenAutoRefresh` | Token auto-refresh | `true` | Allow the widget to renew expired tokens and write them back to disk. See above. |
-| `trayStats` | Tray stats | `'off'` | `off`, `claude`, `codex`, or `both`. See "Tray badges". |
+| `trayStats` | Tray stats | `'off'` | `off`, `claude`, `codex`, or `both`. See "Tray badges" (menu-bar text on macOS). |
+| `phoneSyncEnabled` | Phone → Sync to phone | `false` | Push an encrypted copy of every snapshot to the relay so the iPhone widget can show it. See "Phone widget". |
+| `phoneRelayUrl` | Phone → Relay URL | `''` | The `https://` base URL of your relay (`relay/`). |
 | `windowPosition` | (drag the window) | `null` | `{ x, y }`, saved about 300 ms after you stop dragging. Ignored and re-centred if it is off every display. |
 | `claudeOrganizationId` | Claude organisation dropdown | `null` | Only used by the claude.ai source. |
 
-`config.json` also holds `claudeWebSession` (the encrypted claude.ai key, only if you used the browser login). Settings changes are applied live; the file is written on every change.
+`config.json` also holds `claudeWebSession` (the encrypted claude.ai key, only if you used the browser login) and `phonePairKey` (the encrypted phone-pairing key). Settings changes are applied live; the file is written on every change.
 
 ## Tray badges
 
@@ -224,6 +266,24 @@ Off by default. Set *Tray stats* to:
 Each badge shows the rounded percent in a bitmap font (ported from the original widget), recoloured amber or red at your thresholds, and replaced by a red **X** at 99% or more. Before the first data arrives, or when a slot has no window, you see a grey dash. Hover for a tooltip like `Claude Weekly: 22%` / `Resets: Sep 7, 1:59 PM` (session badges show just the time); a stale provider adds "(last refresh failed - showing previous values)".
 
 Left-click any badge to show or hide the widget (this also rescues a window that has drifted off-screen). Right-click for **Show Widget**, **Refresh**, **Exit**. While badges exist, the title-bar Close button *hides* the widget instead of quitting; use **Exit** in the tray menu to quit. With tray stats off, Close quits.
+
+**macOS** has no coloured badges: the same setting puts one monochrome menu-bar item up with the percentages as text - `91% · 42%` (weekly · session) for a single provider, `Codex 3%·1%  Claude 91%·42%` for both, `✕` at 99%+ and `–` while a slot has no data. Hover for the per-window tooltip; click for **Show Widget**, **Refresh**, **Quit AI Usage Widget**.
+
+## Phone widget (iPhone)
+
+The `ios/` folder holds a native SwiftUI companion app with **home-screen widgets** (small, medium, large) and **lock-screen widgets** that show the same rows as the desktop: Claude session / weekly / Fable, Codex windows, resets, freshness - plus the details panels and the 7-day chart inside the app.
+
+The phone never signs in to Anthropic or OpenAI. Instead the **desktop widget pushes an encrypted copy of each snapshot to a relay you host** (a tiny Cloudflare Worker in [`relay/`](relay/README.md), free tier is plenty for personal use), and the phone pulls and decrypts it. The key travels inside a QR code between your two devices and never reaches the relay, which only ever stores ciphertext. The protocol is written up in [`docs/PHONE-SYNC.md`](docs/PHONE-SYNC.md).
+
+Setup, once:
+
+1. Deploy the relay: `cd relay && npx wrangler login && npx wrangler kv namespace create SLOTS` (paste the id into `wrangler.toml`) `&& npx wrangler deploy`. You get a `https://aiusage-relay.<you>.workers.dev` URL.
+2. Desktop widget → Settings → **Phone**: paste the relay URL, press *Test*, turn on **Sync to phone**, then **Show pairing code**.
+3. Build the iOS app from `ios/` with Xcode (see [`ios/README.md`](ios/README.md)), open it on your iPhone and scan the code (or paste the `aiusage://pair?...` string). Add the **AI Usage** widget to your home screen.
+
+The desktop pushes at most once a minute and otherwise every five minutes or whenever a percentage changes; the widget refreshes on iOS's schedule (roughly every 15 minutes) and shows how old the numbers are. If the desktop is off, the phone keeps showing the last snapshot with its age.
+
+Why not a standalone phone app? See the top of `docs/PHONE-SYNC.md`: it would have to sign in to Claude and ChatGPT with another product's OAuth client, which is against both providers' terms and a rejection risk at App Review, so the phone stays a display for data your desktop already has.
 
 ## Troubleshooting
 
@@ -253,6 +313,12 @@ All three materials need Windows 11 22H2 (build 22621) or newer; Settings shows 
 **Clear Acrylic ignores my Dark theme.**
 By design: Clear Acrylic sits on Windows' light glass, where white text is unreadable, so it always uses the dark-text palette (Settings says "Clear Acrylic uses dark text"). Pick Smoky Acrylic for a dark panel.
 
+**macOS says the app "is damaged and can't be opened" or "Apple could not verify".**
+The build is not notarised. Use *System Settings → Privacy & Security → Open Anyway*, or run `xattr -dr com.apple.quarantine "/Applications/AI-Usage-Widget.app"` once. See *Installing on macOS*.
+
+**Phone: "Desktop hasn't pushed yet" / the widget never updates.**
+Check the desktop's Settings → Phone status line: it says when the last push succeeded or why it failed (wrong relay URL, relay returned 401 after a re-pair on one side only, network). After a **Re-pair** on the desktop the phone must scan the new code - the old key is gone. The relay keeps a slot for 7 days after the last push.
+
 **The widget has vanished / is off-screen.**
 If you have tray badges, left-click one. Otherwise launch the app again - it is single-instance, so the second launch just shows the existing window and re-centres it if it is off every display. As a last resort quit the widget and set `"windowPosition": null` in `config.json`.
 
@@ -262,7 +328,7 @@ The widget refreshes on resume; give it a few seconds or press Refresh.
 **Both cards are gone and it says "Both providers are turned off".**
 Open Settings and turn a provider back on.
 
-**Where things live.** Settings and the encrypted claude.ai key: `%APPDATA%\ai-usage-widget\config.json`. Graph samples: `%APPDATA%\ai-usage-widget\usage-history.json` (kept for 8 days, at most 10,000 samples). Quit the widget, delete either file, and it starts fresh. The only other files the widget ever writes are the two credential files described under "Token auto-refresh", and only when that setting is on and a token has actually expired.
+**Where things live.** Settings and the encrypted claude.ai / phone-pairing keys: `%APPDATA%\ai-usage-widget\config.json` on Windows, `~/Library/Application Support/ai-usage-widget/config.json` on macOS. Graph samples: `usage-history.json` next to it (kept for 8 days, at most 10,000 samples). Quit the widget, delete either file, and it starts fresh. The only other files the widget ever writes are the two credential files described under "Token auto-refresh", and only when that setting is on and a token has actually expired.
 
 **Getting logs.** Run from source with `npm start -- --debug-log` (or `DEBUG_LOG=1`) to see refresh, rate-limit and token decisions in the terminal; `npm run dev` also opens DevTools. Tokens never appear in logs.
 
@@ -270,9 +336,9 @@ Open Settings and turn a provider back on.
 
 ## Credits
 
-Based on [SlavomirDurej/claude-usage-widget](https://github.com/SlavomirDurej/claude-usage-widget) (MIT), which set the look and feel, the tray bitmap font, the alert rules and the claude.ai login flow. Its licence is kept verbatim in `LICENSE-claude-usage-widget`. This project is MIT-licensed too (see `package.json`).
+**Original author: [Slavomir Durej](https://github.com/SlavomirDurej).** This project is a derivative work of his [claude-usage-widget](https://github.com/SlavomirDurej/claude-usage-widget) (MIT, Copyright (c) 2024 Slavomir Durej), which set the look and feel, the tray bitmap font, the alert rules and the claude.ai login flow. His licence is kept verbatim in [`LICENSE-claude-usage-widget`](LICENSE-claude-usage-widget) and referenced from [`LICENSE`](LICENSE). If you like this widget, go star the original.
 
-Built with Electron, electron-builder, electron-store, Chart.js with `chartjs-adapter-date-fns` and date-fns. The title uses the Libre Baskerville typeface.
+This project is MIT-licensed (see [`LICENSE`](LICENSE)). Built with Electron, electron-builder, electron-store, Chart.js with `chartjs-adapter-date-fns`, date-fns and `qrcode`; the relay runs on Cloudflare Workers; the iPhone app is SwiftUI + WidgetKit + Swift Charts + CryptoKit. The title uses the Libre Baskerville typeface.
 
 ## Disclaimer
 

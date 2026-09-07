@@ -32,10 +32,13 @@ const ICON_PATH = path.join(__dirname, '..', '..', 'assets', 'icon.ico');
 // whether a `background` change requires a recreate).
 const appliedBackground = new WeakMap();
 
-// backgroundMaterial needs Windows 11 22H2 (build 22621) or later; everything else gets 'solid'.
-function acrylicSupported() {
-  if (process.platform !== 'win32') return false;
-  const build = parseInt(String(os.release()).split('.')[2], 10);
+// Translucent backdrops: Windows needs a DWM backgroundMaterial (Windows 11 22H2, build 22621, or later);
+// macOS always has NSVisualEffectView vibrancy. Everything else gets 'solid'. The name is historical —
+// the renderer keys the Background buttons off `acrylicSupported` in get-app-info.
+function acrylicSupported(platform = process.platform, release = os.release()) {
+  if (platform === 'darwin') return true;
+  if (platform !== 'win32') return false;
+  const build = parseInt(String(release).split('.')[2], 10);
   return Number.isFinite(build) && build >= 22621;
 }
 
@@ -44,8 +47,9 @@ function acrylicSupported() {
 // created under (themeSourceFor) and in the renderer's tint (styles.css bg-acrylic vs bg-clear).
 const BACKGROUNDS = Object.freeze(['acrylic', 'acrylic_clear', 'mica', 'solid']);
 
-function resolveBackground(setting, supported = acrylicSupported()) {
-  const wanted = BACKGROUNDS.includes(setting) ? setting : 'acrylic';
+function resolveBackground(setting, supported = acrylicSupported(), platform = process.platform) {
+  let wanted = BACKGROUNDS.includes(setting) ? setting : 'acrylic';
+  if (platform === 'darwin' && wanted === 'mica') wanted = 'acrylic'; // Mica is a Windows-only material
   return supported ? wanted : 'solid';
 }
 
@@ -53,6 +57,14 @@ function resolveBackground(setting, supported = acrylicSupported()) {
 function materialFor(background) {
   if (background === 'acrylic' || background === 'acrylic_clear') return 'acrylic';
   if (background === 'mica') return 'mica';
+  return null;
+}
+
+// macOS counterpart of materialFor(): the NSVisualEffectView material. 'under-window' is the closest
+// match to acrylic (blurs whatever is behind the window, follows the app appearance that
+// themeSourceFor() pins: dark glass for Smoky, bright glass for Clear). null = no vibrancy (solid).
+function vibrancyFor(background) {
+  if (background === 'acrylic' || background === 'acrylic_clear' || background === 'mica') return 'under-window';
   return null;
 }
 
@@ -167,10 +179,15 @@ function createMainWindow({ settings = {}, savedPosition = null, onClose, onClos
   const scr = deps.screen || defaultScreen();
   const crashReloadDelayMs = Number.isFinite(deps.crashReloadDelayMs) ? deps.crashReloadDelayMs : CRASH_RELOAD_DELAY_MS;
 
-  const supported = typeof deps.acrylicSupported === 'boolean' ? deps.acrylicSupported : acrylicSupported();
-  const background = resolveBackground(settings.background, supported);
-  const material = materialFor(background);
-  const useMaterial = material !== null;
+  const platform = deps.platform || process.platform;
+  const supported = typeof deps.acrylicSupported === 'boolean' ? deps.acrylicSupported : acrylicSupported(platform);
+  const background = resolveBackground(settings.background, supported, platform);
+  // Windows: a DWM backgroundMaterial on an opaque window. macOS: NSVisualEffectView vibrancy on an opaque
+  // window. Either way the renderer paints its tint over the blur. Solid mode is a transparent window
+  // and the renderer draws its own rounded panel.
+  const material = platform === 'win32' ? materialFor(background) : null;
+  const vibrancy = platform === 'darwin' ? vibrancyFor(background) : null;
+  const useMaterial = material !== null || vibrancy !== null;
   const width = widthFor(settings);
   const height = settings.compactMode ? COMPACT_INITIAL_HEIGHT : INITIAL_HEIGHT;
 
@@ -193,7 +210,7 @@ function createMainWindow({ settings = {}, savedPosition = null, onClose, onClos
     hasShadow: true,
     alwaysOnTop: settings.alwaysOnTop !== false,
     skipTaskbar: !!settings.hideFromTaskbar,
-    // Materials need an opaque window; the renderer paints a translucent tint over the blur.
+    // Materials/vibrancy need an opaque window; the renderer paints a translucent tint over the blur.
     // Solid mode uses a transparent window and the renderer draws its own rounded panel.
     transparent: !useMaterial,
     title: 'AI Usage',
@@ -206,7 +223,12 @@ function createMainWindow({ settings = {}, savedPosition = null, onClose, onClos
       spellcheck: false,
     },
   };
-  if (useMaterial) options.backgroundMaterial = material;
+  if (material) options.backgroundMaterial = material;
+  if (vibrancy) {
+    options.vibrancy = vibrancy;
+    // Keep the glass "active" while the widget is not the key window — it almost never is.
+    options.visualEffectState = 'active';
+  }
   if (position) {
     options.x = position.x;
     options.y = position.y;
@@ -220,12 +242,21 @@ function createMainWindow({ settings = {}, savedPosition = null, onClose, onClos
   const nativeTheme = deps.nativeTheme || electron().nativeTheme;
   const themeSource = themeSourceFor(background);
   if (nativeTheme && nativeTheme.themeSource !== themeSource) nativeTheme.themeSource = themeSource;
-  if (typeof log.debug === 'function') log.debug(`[window] creating with backdrop ${background} (material ${material || 'none'}, themeSource ${themeSource})`);
+  if (typeof log.debug === 'function') log.debug(`[window] creating with backdrop ${background} (material ${material || vibrancy || 'none'}, themeSource ${themeSource})`);
 
   const win = new Win(options);
   appliedBackground.set(win, background);
 
   if (settings.alwaysOnTop !== false) win.setAlwaysOnTop(true, 'floating');
+  // macOS: follow the user across Spaces and sit above full-screen apps too — the "always on top that
+  // really is always" Windows cannot offer (see main.js's re-assert loop for the Windows story).
+  if (platform === 'darwin' && typeof win.setVisibleOnAllWorkspaces === 'function') {
+    try {
+      win.setVisibleOnAllWorkspaces(settings.alwaysOnTop !== false, { visibleOnFullScreen: true, skipTransformProcessType: true });
+    } catch (err) {
+      log.warn('[window] setVisibleOnAllWorkspaces failed:', err && err.message);
+    }
+  }
 
   // Hardening: the widget never navigates or opens windows; anything else is a bug or an injection.
   win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
@@ -335,6 +366,7 @@ module.exports = {
   acrylicSupported,
   resolveBackground,
   materialFor,
+  vibrancyFor,
   themeSourceFor,
   BACKGROUNDS,
   WIDGET_WIDTH,

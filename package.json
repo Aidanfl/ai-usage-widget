@@ -1,13 +1,14 @@
 {
   "name": "ai-usage-widget",
-  "version": "0.1.1",
-  "description": "Desktop widget showing Claude and Codex usage limits side by side",
+  "version": "0.2.0",
+  "description": "Desktop widget (Windows + macOS) showing Claude and Codex usage limits side by side, with an iPhone companion widget",
   "main": "src/main/main.js",
   "scripts": {
     "start": "electron .",
     "dev": "cross-env NODE_ENV=development electron .",
     "build": "electron-builder --win",
     "build:portable": "electron-builder --win portable",
+    "build:mac": "electron-builder --mac",
     "test": "node --test \"tests/**/*.test.js\""
   },
   "author": "Aidan",
@@ -24,7 +25,8 @@
     "chart.js": "^4.5.1",
     "chartjs-adapter-date-fns": "^3.0.0",
     "date-fns": "^4.1.0",
-    "electron-store": "^8.2.0"
+    "electron-store": "^8.2.0",
+    "qrcode": "^1.5.4"
   },
   "build": {
     "appId": "com.aidan.ai-usage-widget",
@@ -57,7 +59,66 @@
       "!src/renderer/mock-api.js",
       "!ARCHITECTURE.md",
       "!.gitignore",
-      "!docs/**"
-    ]
+      "!.gitattributes",
+      "!docs/**",
+      "!ios/**",
+      "!relay/**",
+      "!.github/**",
+      "!build/**"
+    ],
+    "afterPack": "build/after-pack.js",
+    "mac": {
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "universal"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "universal"
+          ]
+        }
+      ],
+      "icon": "build/icon.png",
+      "category": "public.app-category.utilities",
+      "identity": null,
+      "notarize": false,
+      "hardenedRuntime": false,
+      "gatekeeperAssess": false,
+      "darkModeSupport": true,
+      "extendInfo": {
+        "CFBundleDisplayName": "AI Usage Widget",
+        "CFBundleName": "AI Usage Widget",
+        "LSApplicationCategoryType": "public.app-category.utilities"
+      },
+      "artifactName": "${productName}-${version}-mac.${ext}"
+    },
+    "dmg": {
+      "sign": false,
+      "artifactName": "${productName}-${version}-mac.${ext}",
+      "contents": [
+        {
+          "x": 130,
+          "y": 190
+        },
+        {
+          "x": 410,
+          "y": 190,
+          "type": "link",
+          "path": "/Applications"
+        }
+      ]
+    }
+  },
+  "homepage": "https://github.com/Aidanfl/ai-usage-widget",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Aidanfl/ai-usage-widget.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Aidanfl/ai-usage-widget/issues"
   }
 }

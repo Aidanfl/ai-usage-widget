@@ -1,0 +1,103 @@
+name: Release
+
+# Builds the Windows installer + portable exe and the macOS disk image, then publishes them as a GitHub
+# Release. Triggered by pushing a tag like v0.2.0 (the tag must match package.json's version).
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: Windows (installer + portable)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - name: Build
+        run: npx electron-builder --win --publish never
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            dist/*.exe
+            dist/*.blockmap
+          if-no-files-found: error
+
+  macos:
+    name: macOS (universal dmg)
+    runs-on: macos-latest
+    env:
+      # No Apple Developer certificate: electron-builder must not look for one; build/after-pack.js ad-hoc signs.
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Build
+        run: npx electron-builder --mac --publish never
+      - name: List output
+        run: ls -la dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: |
+            dist/*.dmg
+            dist/*.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Check the tag matches package.json
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          PKG=$(node -p "require('./package.json').version")
+          TAG=${GITHUB_REF_NAME#v}
+          echo "package.json=$PKG tag=$TAG"
+          test "$PKG" = "$TAG"
+      - name: Release notes from CHANGELOG.md
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          node -e '
+            const fs = require("fs");
+            const [, version] = process.argv.slice(1);
+            const md = fs.readFileSync("CHANGELOG.md", "utf8");
+            const re = new RegExp("^## " + version.replace(/\./g, "\\.") + "[^\n]*\n([\\s\\S]*?)(?=^## |$(?![\\r\\n]))", "m");
+            const m = md.match(re);
+            let body = m ? m[1].trim() : "See CHANGELOG.md.";
+            body += "\n\n---\n\n**Downloads**\n\n" +
+              "- Windows: `AI-Usage-Widget-" + version + "-win-Setup.exe` (installer) or `AI-Usage-Widget-" + version + "-win-portable.exe` (no install).\n" +
+              "- macOS: `AI-Usage-Widget-" + version + "-mac.dmg` (universal, Apple Silicon + Intel). Unsigned: see the README section *Installing on macOS* for the one-time Gatekeeper step.\n" +
+              "- iPhone: build the companion app in `ios/` with Xcode (see `ios/README.md`).\n\n" +
+              "Builds are not code-signed; Windows SmartScreen and macOS Gatekeeper will warn on first launch.";
+            fs.writeFileSync("release-notes.md", body);
+          ' "$VERSION"
+          cat release-notes.md
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: release-notes.md
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            artifacts/windows/*
+            artifacts/macos/*
+          fail_on_unmatched_files: true
