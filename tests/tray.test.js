@@ -55,7 +55,7 @@ function settingsFor(trayStats, providers = { claude: true, codex: true }) {
 
 test("trayStats 'claude' creates weekly+session badges once, repaints in place and reports hasIcon()", () => {
   const { deps, created } = fakeElectron();
-  const tray = createTray({ getSettings: () => settingsFor('claude'), electron: deps });
+  const tray = createTray({ getSettings: () => settingsFor('claude'), electron: deps, platform: 'win32' });
 
   tray.update(null); // startup placeholders
   assert.equal(created.length, 2);
@@ -71,7 +71,7 @@ test("trayStats 'claude' creates weekly+session badges once, repaints in place a
 
 test('destroy() latches: a late update()/rebuild() (in-flight tick finishing during quit) creates no icons', () => {
   const { deps, created } = fakeElectron();
-  const tray = createTray({ getSettings: () => settingsFor('both'), electron: deps });
+  const tray = createTray({ getSettings: () => settingsFor('both'), electron: deps, platform: 'win32' });
   tray.update(SNAPSHOT);
   const before = created.length;
   assert.ok(before > 0);
@@ -90,7 +90,7 @@ test('destroy() latches: a late update()/rebuild() (in-flight tick finishing dur
 test('rebuild() follows settings: off → no icons; a disabled provider drops its badges; both → codex first', () => {
   let settings = settingsFor('claude');
   const { deps, created } = fakeElectron();
-  const tray = createTray({ getSettings: () => settings, electron: deps });
+  const tray = createTray({ getSettings: () => settings, electron: deps, platform: 'win32' });
   tray.update(SNAPSHOT);
   assert.equal(created.filter((t) => !t.destroyed).length, 2);
 

@@ -15,7 +15,9 @@ const b64url = (obj) => Buffer.from(JSON.stringify(obj)).toString('base64url');
 /** Synthetic (unsigned) JWT — decodeJwt never verifies signatures. */
 const makeJwt = (claims) => `${b64url({ alg: 'RS256', typ: 'JWT' })}.${b64url(claims)}.FAKESIG`;
 
-const tmpDir = () => fs.mkdtempSync(path.join(os.tmpdir(), 'aiuw-tokens-'));
+// realpath: GitHub's Windows runners hand out an 8.3 short-name TEMP (C:\Users\RUNNER~1\...), and libuv's fs.watch
+// asserts (`!_wcsnicmp(filename, dir, dirlen)`, fs-event.c) when the watched directory's name is a short name.
+const tmpDir = () => fs.mkdtempSync(path.join(fs.realpathSync.native(os.tmpdir()), 'aiuw-tokens-'));
 const noSleep = async () => {};
 
 /** Minimal Response-like object for the injected fetch. */
