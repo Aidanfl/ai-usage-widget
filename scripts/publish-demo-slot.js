@@ -70,30 +70,45 @@ const snapshot = {
   },
 };
 
-// Seven days of plausible history: each series drifts upward and resets on its own cadence.
+// Seven days of plausible history. Session windows saw-tooth on their own reset cadence; weekly
+// windows climb steadily towards where the cards say they are now. Kept smooth on purpose - a noisy
+// synthetic series reads as a rendering bug rather than as usage.
+//
+// The Fable weekly window is deliberately absent from the chart: the app derives its own legend label
+// from the series key and has no name for that one, so it renders as "Claude 7d (claude.weekly_fable)".
+// It still appears in the cards above the chart, where it is labelled properly.
 const series = [
   { key: 'claude.session', label: 'Claude · Current Session', color: 'purple' },
   { key: 'claude.weekly', label: 'Claude · Weekly Limit', color: 'blue' },
-  { key: 'claude.weekly_fable', label: 'Claude · Fable Weekly', color: 'fuchsia' },
   { key: 'codex.primary', label: 'Codex · 5-Hour Limit', color: 'teal' },
-  { key: 'codex.weekly', label: 'Codex · Weekly Limit', color: 'green' },
+  { key: 'codex.secondary', label: 'Codex · Weekly Limit', color: 'green' },
 ];
 const samples = [];
-for (let i = 7 * 24 * 2; i >= 0; i--) {            // every 30 min for 7 days
-  const t = now - i * 30 * 60e3;
-  const hoursAgo = i / 2;
-  const saw = (periodH, peak, phase = 0) => {
-    const p = ((hoursAgo + phase) % periodH) / periodH;
-    return Math.round(peak * (1 - p) * (0.75 + 0.25 * Math.sin(hoursAgo)) * 10) / 10;
-  };
+const TOTAL_H = 7 * 24;
+// Deterministic per-day variation, so the chart is not identical every day but is stable between runs.
+const dayFactor = (day) => 0.55 + 0.45 * Math.abs(Math.sin(day * 2.399963));
+// Session windows: active during waking hours only, climbing through each ~5h window and dropping at
+// its reset, idle overnight. A round-the-clock saw-tooth reads as a rendering artefact, not as usage.
+const sessionAt = (hoursFromStart, peak, phase) => {
+  const hourOfDay = (hoursFromStart + 8) % 24;                 // series starts at 08:00
+  if (hourOfDay < 8.5 || hourOfDay > 23) return 0;
+  const day = Math.floor(hoursFromStart / 24);
+  const through = (((hoursFromStart + phase) % 5) / 5);
+  return Math.round(peak * dayFactor(day + phase) * Math.pow(through, 0.8) * 10) / 10;
+};
+// Weekly windows: a steady climb to the figure the cards show now.
+const weeklyAt = (hoursFromStart, nowPct) =>
+  Math.round(nowPct * Math.pow(hoursFromStart / TOTAL_H, 1.15) * 10) / 10;
+
+for (let i = TOTAL_H * 2; i >= 0; i--) {            // every 30 min for 7 days
+  const hoursFromStart = TOTAL_H - i / 2;
   samples.push({
-    t,
+    t: now - i * 30 * 60e3,
     v: {
-      'claude.session': Math.max(0, saw(5, 66, 1)),
-      'claude.weekly': Math.max(0, saw(168, 72)),
-      'claude.weekly_fable': Math.max(0, saw(168, 88)),
-      'codex.primary': Math.max(0, saw(5, 41, 3)),
-      'codex.weekly': Math.max(0, saw(168, 55)),
+      'claude.session': sessionAt(hoursFromStart, 66, 0),
+      'claude.weekly': weeklyAt(hoursFromStart, 61.5),
+      'codex.primary': sessionAt(hoursFromStart, 41, 2.5),
+      'codex.secondary': weeklyAt(hoursFromStart, 47.3),
     },
   });
 }
