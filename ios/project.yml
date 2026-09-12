@@ -77,6 +77,11 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.aidanfl.aiusage
         PRODUCT_NAME: AIUsage
+        # XcodeGen's product-type setting presets inject TARGETED_DEVICE_FAMILY = "1,2" at TARGET level,
+        # which beats the project-level "1" above -- so the spec said iPhone-only while the build was
+        # universal. That ships an iPad binary, and App Store validation then demands all four
+        # orientations for iPad multitasking. Pin it per target; the project-level value is not enough.
+        TARGETED_DEVICE_FAMILY: "1"
         CODE_SIGN_ENTITLEMENTS: AIUsage/AIUsage.entitlements
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
@@ -107,6 +112,7 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.aidanfl.aiusage.widget
         PRODUCT_NAME: AIUsageWidget
+        TARGETED_DEVICE_FAMILY: "1"
         CODE_SIGN_ENTITLEMENTS: AIUsageWidget/AIUsageWidget.entitlements
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
         ASSETCATALOG_COMPILER_WIDGET_BACKGROUND_COLOR_NAME: WidgetBackground
