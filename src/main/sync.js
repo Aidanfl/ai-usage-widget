@@ -537,7 +537,10 @@ function createPhoneSync({
 
   async function renderQr(text) {
     const impl = qr || require('qrcode');
-    return impl.toDataURL(text, QR_OPTIONS);
+    // qrcode mutates the options object in place (getOptions does `if (!options.color) options.color = {}`
+    // before reading options.color.dark). QR_OPTIONS is frozen, so that write silently no-ops in sloppy
+    // mode and the next read throws. Hand it a throwaway copy.
+    return impl.toDataURL(text, { ...QR_OPTIONS });
   }
 
   // { pairString, qrDataUrl, slotId, error }. Creates K when absent; never rotates an existing one.

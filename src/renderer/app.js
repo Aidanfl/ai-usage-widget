@@ -1227,8 +1227,8 @@
       const retry = st.nextRetryAt ? ', retrying at ' + F.formatTime(st.nextRetryAt, state.settings.timeFormat) : '';
       return { text: 'Failed: ' + st.lastError + retry, cls: 'err' };
     }
-    if (!st.lastPushAt) return { text: 'Waiting for first push' + memNote, cls: '' };
-    return { text: 'Last pushed ' + F.relativeAgo(st.lastPushAt, Date.now()) + memNote, cls: 'ok' };
+    if (!st.lastPushAt) return { text: 'Paired · waiting for first push' + memNote, cls: '' };
+    return { text: 'Paired · last pushed ' + F.relativeAgo(st.lastPushAt, Date.now()) + memNote, cls: 'ok' };
   }
 
   function renderPhoneSettings() {

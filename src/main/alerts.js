@@ -7,6 +7,9 @@
 // "Available again" fires once when a window that was blocked (this cycle or the previous one)
 // is no longer blocked AND no other window of the same provider is blocked.
 
+// A reset instant that moves by less than this between polls is provider clock drift, not a new
+// cycle. Real windows are hours (session) or days (weekly) long, so a minute cleanly separates them.
+const CYCLE_DRIFT_TOLERANCE_MS = 60 * 1000;
 const DEFAULT_WARN = 75;
 const DEFAULT_DANGER = 90;
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
@@ -78,12 +81,27 @@ function createAlertEngine({ notify, now = Date.now } = {}) {
           state = { cycle, warned: false, dangered: false, blocked: false };
           windowStates.set(id, state);
         } else if (state.cycle !== cycle) {
-          // New reset cycle: remember whether the old one ended blocked, then re-arm every latch.
+          // The cycle key moved — but a moved key is usually DRIFT, not a new window. claude.ai
+          // recomputes `resets_at` as (server clock + whole seconds remaining) on every request, so one
+          // logical reset instant arrives as a slightly different ISO string each poll. Re-arming on the
+          // string alone re-fired every latch on every poll (a toast every refresh, forever). Only treat
+          // it as a genuine rollover when the instant really moved: it jumped by more than the drift
+          // tolerance, the old reset time has now passed, or usage fell back on its own.
+          const prevReset = Date.parse(state.cycle);
+          const nextReset = Date.parse(cycle);
+          const jump = Number.isFinite(prevReset) && Number.isFinite(nextReset)
+            ? Math.abs(nextReset - prevReset)
+            : Infinity;
+          const rolledOver = jump > CYCLE_DRIFT_TOLERANCE_MS
+            || (Number.isFinite(prevReset) && now() >= prevReset)
+            || percent < warnAt;
           wasBlocked = state.blocked;
           state.cycle = cycle;
-          state.warned = false;
-          state.dangered = false;
-          state.blocked = false;
+          if (rolledOver) {
+            state.warned = false;
+            state.dangered = false;
+            state.blocked = false;
+          }
         } else {
           wasBlocked = state.blocked;
         }
@@ -137,7 +155,7 @@ function createAlertEngine({ notify, now = Date.now } = {}) {
       const anyBlockedNow = evaluated.some((i) => i.isBlocked);
       const recovered = [];
       for (const item of evaluated) {
-        if (item.wasBlocked && !item.isBlocked) {
+        if (item.wasBlocked && !item.isBlocked && !anyBlockedNow) {
           item.state.blocked = false;
           recovered.push(item.window.label || item.window.key);
         }

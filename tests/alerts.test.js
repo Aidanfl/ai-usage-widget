@@ -198,3 +198,51 @@ test('formatResetTime honours 12h/24h and the optional date', () => {
   assert.equal(formatResetTime(null, '12h', true), null);
   assert.equal(formatResetTime('garbage', '12h', true), null);
 });
+
+// Regression: claude.ai recomputes `resets_at` as (server clock + whole seconds remaining) on every
+// request, so one logical reset instant arrives as a slightly different ISO string each poll. These three
+// values are real, captured ~5 s apart from a live account — note they straddle a second, a minute AND an
+// hour boundary, which is why quantising the timestamp is not a sufficient fix. Before the drift tolerance
+// the blocked latch re-armed every poll and toasted every refresh, forever.
+const DRIFT = [
+  '2026-09-14T13:59:59.665Z',
+  '2026-09-14T13:59:59.884Z',
+  '2026-09-14T14:00:00.086Z',
+];
+
+test('a drifting resetsAt is absorbed: a blocked window toasts once, not once per poll', () => {
+  const { alerts, calls } = engine();
+
+  // Seed below the warning threshold so the later 100% is a genuine transition, not a state the user
+  // was already looking at when the widget launched.
+  alerts.evaluate(claudeSnapshot(10, DRIFT[0]), SETTINGS);
+  assert.equal(calls.length, 0, 'seed is silent');
+
+  for (const reset of [DRIFT[1], DRIFT[2], DRIFT[0], DRIFT[1], DRIFT[2]]) {
+    alerts.evaluate(claudeSnapshot(100, reset), SETTINGS);
+  }
+  assert.equal(calls.length, 1, 'exactly one blocked toast across five drifting polls');
+  assert.match(calls[0].title, /Claude · Weekly Limit reached/);
+});
+
+test('drift tolerance does not swallow a genuine rollover', () => {
+  const { alerts, calls } = engine();
+
+  alerts.evaluate(claudeSnapshot(100, CYCLE_A), SETTINGS);   // seed, silent
+  alerts.evaluate(claudeSnapshot(100, DRIFT[0]), SETTINGS);  // real new cycle (7 days on)
+  assert.equal(calls.length, 1, 'a week-long jump still re-arms and fires');
+  alerts.evaluate(claudeSnapshot(100, DRIFT[1]), SETTINGS);  // drift within the new cycle
+  assert.equal(calls.length, 1, 'and then stays quiet');
+});
+
+test('a window recovering while a sibling is still blocked keeps its latch', () => {
+  const { alerts, calls } = engine();
+  const snap = (sessionPct, weeklyPct) => claudeSnapshot(weeklyPct, DRIFT[0], sessionPct, DRIFT[0]);
+
+  alerts.evaluate(snap(100, 100), SETTINGS);        // seed, silent
+  assert.equal(calls.length, 0);
+  alerts.evaluate(snap(10, 100), SETTINGS);         // session recovers, weekly still blocked
+  assert.equal(calls.length, 0, 'no "available again" while the provider is still blocked');
+  alerts.evaluate(snap(100, 100), SETTINGS);        // session blocked again
+  assert.equal(calls.length, 0, 'and no fresh "reached" toast — the latch was never cleared');
+});
