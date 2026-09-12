@@ -7,9 +7,12 @@ compatibility_date = "2026-06-01"
 # Create it once and paste the id it prints:
 #   npx wrangler kv namespace create SLOTS
 # → prints something like  { binding = "SLOTS", id = "0123456789abcdef0123456789abcdef" }
+# The id below is the namespace this project's own relay uses. A KV namespace id is not a secret --
+# it is meaningless without your account credentials -- but it only resolves inside the account that
+# created it. If you are deploying your own relay, run the command above and paste YOUR id here.
 [[kv_namespaces]]
 binding = "SLOTS"
-id = "REPLACE_WITH_THE_ID_FROM_wrangler_kv_namespace_create"
+id = "dd3af88d4b3541bcb95f99b2dd41c999"
 
 # Nothing else is required. The default *.workers.dev URL that `wrangler deploy` prints is the relay URL
 # you paste into the widget's Settings → Phone → Relay URL field.

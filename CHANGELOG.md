@@ -2,6 +2,56 @@
 
 All notable changes to AI Usage Widget. Dates are ISO (YYYY-MM-DD).
 
+## 1.0.0 - 2026-09-12
+
+The iPhone app ships. It is on the App Store as a free download, so the phone half of this project no
+longer needs Xcode and an Apple ID. Everything below the App Store line is a fix for something that was
+genuinely broken: pairing could not complete at all, and alerts repeated forever.
+
+### Added
+
+- **The iPhone companion app is on the App Store**, free, iOS 17+. Nothing about how it works changed:
+  it still pairs to one desktop, still decrypts locally, and the relay still only ever sees ciphertext.
+- **Privacy manifests** (`PrivacyInfo.xcprivacy`) for both the app and the widget extension, declaring no
+  tracking, no collected data types and no "required reason" API use - which is accurate, the app has no
+  analytics, no third-party SDKs and never calls `UserDefaults`.
+- **The widget keeps drawing when the keychain cannot be read.** `PairingStore.load()` returns nil when
+  nothing is paired but *throws* when the key exists and is unreadable - a keychain error, or simply the
+  first widget refresh after a reboot, before the device has been unlocked once (the pairing item is
+  `kSecAttrAccessibleAfterFirstUnlock`). Both used to render "Pair in the app", which looked like the
+  pairing had been lost. A throw now falls back to the cached payload and shows the last known numbers.
+
+### Changed
+
+- **Every home-screen widget shows one size more information than it used to.** The large layout's full
+  detail - per-window rows with reset times - now fits the **medium** widget, and what medium used to show
+  now fits the **small** one, so small finally shows Codex alongside Claude instead of Claude alone. Large
+  gained the breathing room it was short of. Rewritten around two row styles (`CompactUsageRow`,
+  `DetailUsageRow`) and a shared `ProviderMark` in place of the old single row view.
+- The desktop's Phone settings line now begins **"Paired ·"** once a phone is attached, so the pairing
+  state is readable at a glance instead of being implied by a push timestamp.
+
+### Fixed
+
+- **Alerts no longer repeat every refresh.** claude.ai recomputes `resets_at` as (server clock + whole
+  seconds remaining) on each request, so one logical reset instant arrives as a slightly different ISO
+  string every poll. The alert engine treated any change of that string as a new cycle and re-armed every
+  latch, which re-fired "Fable Weekly is used up" on a loop - roughly every two minutes, forever. A moved
+  reset instant now only counts as a rollover if it jumped by more than a minute, the old reset time has
+  actually passed, or usage fell on its own. "Available again" also waits until no window of that provider
+  is still blocked, instead of firing while a sibling window is at 100%.
+- **The pairing code could not be generated at all.** `QR_OPTIONS` is `Object.freeze`n and the `qrcode`
+  library writes `options.color = {}` into the object it is handed before reading `options.color.dark`.
+  In sloppy mode that write silently does nothing and the read then throws, so both "Show pairing code"
+  and "Show QR code" failed with *Cannot read properties of undefined (reading 'dark')* before you could
+  type anything. `renderQr` now passes a throwaway copy.
+- **`xcodegen generate` no longer wipes the iOS entitlements.** `project.yml` declared
+  `entitlements: path: <file>` with no `properties:` block, which in XcodeGen means *generate that file*,
+  so every regeneration overwrote both committed `.entitlements` files with an empty `<dict/>` and
+  stripped `com.apple.security.application-groups`. The app still built and installed, then failed to pair
+  on a real device with keychain error -34018. Both targets now set `CODE_SIGN_ENTITLEMENTS` instead.
+  `ios/MAC-SETUP.md` blamed this on free-tier App Group restrictions; it was never that.
+
 ## 0.2.1 - 2026-09-07
 
 ### Changed

@@ -90,7 +90,7 @@ Semantics:
 PhonePayload = {
   v: 1,
   generatedAt: 1788700000000,           // ms epoch when the desktop built this payload
-  source: { app: 'ai-usage-widget', version: '0.2.1', platform: 'win32' | 'darwin' | 'linux', host: 'AIDAN-PC' },
+  source: { app: 'ai-usage-widget', version: '1.0.0', platform: 'win32' | 'darwin' | 'linux', host: 'AIDAN-PC' },
   snapshot: Snapshot,                   // ARCHITECTURE.md §3, with every ProviderSnapshot.raw REMOVED (debug-only, may
                                         // carry identifiers). All other fields as-is (status, error, plan, account, windows,
                                         // extra, credits, updatedAt).

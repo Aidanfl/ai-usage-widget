@@ -1,6 +1,6 @@
 {
   "name": "ai-usage-widget",
-  "version": "0.2.1",
+  "version": "1.0.0",
   "description": "Desktop widget (Windows + macOS) showing Claude and Codex usage limits side by side, with an iPhone companion widget",
   "main": "src/main/main.js",
   "scripts": {
