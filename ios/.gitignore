@@ -2,6 +2,10 @@
 *.xcodeproj/
 *.xcworkspace/
 
+# Info.plist files are generated from the `info:` blocks in project.yml
+AIUsage/Info.plist
+AIUsageWidget/Info.plist
+
 # Per-user Xcode state
 xcuserdata/
 *.xcuserstate

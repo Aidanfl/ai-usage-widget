@@ -16,6 +16,10 @@ desktop widget ──(AES-256-GCM snapshot, every few minutes)──▶ relay (C
 iPhone app / widget ◀───────(GET + decrypt, on its own schedule)────┘
 ```
 
+**Getting it onto a phone:** [`MAC-SETUP.md`](MAC-SETUP.md) is the ordered, Mac-side walkthrough (toolchain,
+signing, device pairing, the on-phone taps, the relay). This file is the reference for what the app is and how
+it is put together.
+
 ## What's in here
 
 ```
@@ -48,16 +52,22 @@ ios/
 ```
 
 Bundle ids: app `com.aidanfl.aiusage`, widget `com.aidanfl.aiusage.widget`, App Group `group.com.aidanfl.aiusage`.
-**If you are not the original author you must change all three** (project.yml, both `.entitlements`,
-`PairingStore.accessGroup` in `Shared/Pairing.swift`, `PayloadCache.appGroup` in `Shared/Cache.swift`) — bundle
-ids and App Group ids are unique per Apple developer account.
+**If you are not the original author you must change all of them** — bundle ids and App Group ids are unique
+per Apple developer account: `project.yml` (both `PRODUCT_BUNDLE_IDENTIFIER`s; the widget's must stay prefixed
+by the app's), both `.entitlements` files, `PairingStore.accessGroup` in `Shared/Pairing.swift`,
+`PayloadCache.appGroup` in `Shared/Cache.swift`, and the group id quoted inside the -34018 error message in
+`Shared/Pairing.swift`. Leave the `aiusage` URL scheme alone — the desktop emits `aiusage://pair?…`.
 
 ## Requirements
 
 - To **compile-check only**: nothing local — GitHub Actions on a `macos-latest` runner does it (see CI below).
-- To **run on a phone**: a Mac with Xcode 16+, [XcodeGen](https://github.com/yonaskolb/XcodeGen)
-  (`brew install xcodegen`), an iPhone on **iOS 17.0 or later**, and an Apple ID.
-- The desktop widget (this repo) with **Sync to phone** enabled and a relay deployed (`relay/`, one `wrangler deploy`).
+- To **run on a phone**: a Mac with Xcode, [XcodeGen](https://github.com/yonaskolb/XcodeGen)
+  (`brew install xcodegen`), an **iPhone** on iOS 17.0 or later (`TARGETED_DEVICE_FAMILY: "1"` — iPad is not a
+  build target), and an Apple ID. Pick the Xcode version by what the *phone* runs, not by this project's
+  deployment target: Xcode's "Device Support" has to cover the installed iOS, and that in turn sets the macOS
+  floor ([system requirements](https://developer.apple.com/xcode/system-requirements/)).
+- The desktop widget (this repo) with **Sync to phone** enabled and a relay deployed (`relay/` — four steps, see
+  [`relay/README.md`](../relay/README.md), not a bare `wrangler deploy`).
 
 ## Build
 
@@ -67,19 +77,29 @@ xcodegen generate            # writes AIUsage.xcodeproj from project.yml
 open AIUsage.xcodeproj
 ```
 
-In Xcode:
+Set your Team **in `project.yml`** (`DEVELOPMENT_TEAM`, in `settings.base`, so it covers both targets) rather
+than in Xcode's UI: `xcodegen generate` rewrites `AIUsage.xcodeproj` from scratch and discards anything set
+through the UI. Then in Xcode:
 
-1. Select the **AIUsage** target ▸ *Signing & Capabilities* ▸ pick your **Team**. Repeat for **AIUsageWidget**
-   (or set `DEVELOPMENT_TEAM` once in `project.yml` and regenerate).
+1. Check *Signing & Capabilities* on **both** targets: same Team, automatic signing on, **App Groups** ticked
+   with the same group. A widget signed by a different team cannot join the app's keychain access group.
 2. If Xcode complains the bundle id is taken, change the ids as described above.
 3. Pick your iPhone as the run destination and press Run. The widget is embedded automatically.
+
+A bare Mac needs `sudo xcodebuild -license accept` and `sudo xcodebuild -runFirstLaunch` before any of this, and
+one GUI session to add the Apple ID (Xcode ▸ Settings ▸ Accounts) — `-allowProvisioningUpdates` can create
+profiles but cannot add an account. Full sequence, including the device-side steps: [`MAC-SETUP.md`](MAC-SETUP.md).
 
 CI does exactly this (no signing, simulator SDK):
 
 ```bash
 cd ios && xcodegen generate && xcodebuild -project AIUsage.xcodeproj -scheme AIUsage -configuration Debug \
-  -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
+  -destination 'generic/platform=iOS Simulator' \
+  CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build
 ```
+
+(`CODE_SIGN_IDENTITY=""` matters on a Mac that has certificates installed — without it the build can pick one
+up and fail.)
 
 Scheme name: **`AIUsage`** (shared, builds both targets). Project: **`AIUsage.xcodeproj`**.
 
@@ -96,9 +116,16 @@ Both targets need, on the Apple developer portal / in the provisioning profile:
 With **Automatic** signing Xcode registers the App Group for you the first time you build to a device, but the
 Team must be set. Notes on account types:
 
-- A free **Personal Team** can install on your own iPhone; the build expires after **7 days** and must be
-  re-run from Xcode. App Groups *are* available to personal teams.
-- **TestFlight / App Store** distribution needs the paid Apple Developer Program (US$99/year).
+- A free **Personal Team** can install on your own iPhone. App Groups *is* a free-tier capability — it is
+  ticked in the no-cost column of Apple's
+  [supported capabilities](https://developer.apple.com/help/account/reference/supported-capabilities-ios/)
+  table, as is Keychain Sharing — but a free account cannot open Certificates, Identifiers & Profiles, so the
+  group can only be registered by Xcode's automatic signing on the first device build. Test that first.
+- The free provisioning profile expires after **7 days**, and it takes the widget with it: on day 8 the app
+  stops launching and the home-screen widget goes dead until you rebuild from Xcode. Free accounts also cap you
+  at 3 devices and ~10 App IDs per 7 days, and this project uses two (app + extension).
+- The paid **Apple Developer Program** (US$99/year) is what ends that weekly treadmill; it is *not* needed for
+  App Groups. It is also required for TestFlight / App Store distribution.
 
 ## Pairing flow
 
@@ -133,7 +160,7 @@ use **Push now** on the desktop. `401` means the key changed (re-pair on the des
 
 | symptom | cause / fix |
 |---|---|
-| Pairing fails with **Keychain error -34018** (`errSecMissingEntitlement`) | The keychain access group `group.com.aidanfl.aiusage` is not in the provisioning profile: enable **App Groups** with that id on **both** targets, make sure both entitlements files list it, clean build, reinstall. In the Simulator the app falls back to the private keychain so you can still test the app (the widget then shows "Pair in the app"). |
+| Pairing fails with **Keychain error -34018** (`errSecMissingEntitlement`) | The keychain access group `group.com.aidanfl.aiusage` is not in the provisioning profile: enable **App Groups** with that id on **both** targets, make sure both entitlements files list it, clean build, reinstall. The private-keychain fallback in `Shared/Pairing.swift` is inside `#if targetEnvironment(simulator)` — in the Simulator the app still pairs (and the widget then shows "Pair in the app"), but **on a real device there is no fallback and the app cannot pair at all**. |
 | Widget says **Pair in the app** although the app is paired | The widget cannot read the shared keychain item — same App Group problem as above, or the widget target has a different `DEVELOPMENT_TEAM`. Settings ▸ Status shows whether the shared container is available. |
 | **Desktop hasn't pushed yet** | Relay has no slot for this key: desktop ▸ Phone ▸ *Push now*; check the relay URL is the same on both sides; slots expire after 7 days without a push. |
 | **Relay rejected this phone's read token** (401) | The desktop re-paired with a new key. Scan the new code. |

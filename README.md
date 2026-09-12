@@ -281,7 +281,7 @@ Setup, once:
 
 1. Deploy the relay: `cd relay && npx wrangler login && npx wrangler kv namespace create SLOTS` (paste the id into `wrangler.toml`) `&& npx wrangler deploy`. You get a `https://aiusage-relay.<you>.workers.dev` URL.
 2. Desktop widget → Settings → **Phone**: paste the relay URL, press *Test*, turn on **Sync to phone**, then **Show pairing code**.
-3. Build the iOS app from `ios/` with Xcode (see [`ios/README.md`](ios/README.md)), open it on your iPhone and scan the code (or paste the `aiusage://pair?...` string). Add the **AI Usage** widget to your home screen.
+3. Build the iOS app from `ios/` with Xcode and install it on your iPhone: [`ios/MAC-SETUP.md`](ios/MAC-SETUP.md) is the ordered walkthrough (toolchain, signing, device pairing, the on-phone taps), [`ios/README.md`](ios/README.md) describes the app itself. Then open it, scan the code (or paste the `aiusage://pair?...` string), and add the **AI Usage** widget to your home screen.
 
 The desktop pushes at most once a minute and otherwise every five minutes or whenever a percentage changes; the widget refreshes on iOS's schedule (roughly every 15 minutes) and shows how old the numbers are. If the desktop is off, the phone keeps showing the last snapshot with its age.
 
