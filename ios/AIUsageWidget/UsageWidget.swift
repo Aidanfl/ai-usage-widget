@@ -33,9 +33,20 @@ enum UsageWidgetLoader {
         do {
             pairing = try PairingStore.load()
         } catch {
-            pairing = nil
+            // PairingStore.load() returns nil when nothing is stored and THROWS when the key exists but
+            // could not be read — a keychain failure (-34018), or the keychain still locked before the
+            // first unlock after a reboot, since the item is kSecAttrAccessibleAfterFirstUnlock. Treating
+            // that as "unpaired" would put "Pair in the app" on the home screen of a perfectly well paired
+            // phone, on top of cached numbers we can still draw. Show the last known data instead and let
+            // the next refresh recover.
+            if let cached = PayloadCache.load() {
+                return UsageEntry(date: now,
+                                  state: .data(cached.payload, fetchedAt: cached.fetchedDate, fromCache: true))
+            }
+            return UsageEntry(date: now, state: .message(error.localizedDescription))
         }
         guard let pairing = pairing else {
+            // A clean nil: there really is no pairing stored.
             return UsageEntry(date: now, state: .unpaired)
         }
 

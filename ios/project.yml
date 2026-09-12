@@ -22,11 +22,11 @@ settings:
     SWIFT_STRICT_CONCURRENCY: minimal
     IPHONEOS_DEPLOYMENT_TARGET: "17.0"
     TARGETED_DEVICE_FAMILY: "1"               # iPhone only
-    # Put your Apple Developer Team ID here (or pick it in Xcode ▸ target ▸ Signing & Capabilities).
-    # Left empty on purpose: CI compiles with signing disabled and never needs it.
-    DEVELOPMENT_TEAM: ""
+    # Apple Developer Team ID. CI never needs it (it compiles with signing disabled); a local device
+    # build, an archive and a TestFlight upload all do. Replace it with your own if you fork this.
+    DEVELOPMENT_TEAM: "9NPF39JB76"
     CODE_SIGN_STYLE: Automatic
-    MARKETING_VERSION: "0.2.1"
+    MARKETING_VERSION: "1.0.0"
     CURRENT_PROJECT_VERSION: "1"
     ENABLE_USER_SCRIPT_SANDBOXING: "YES"
     SWIFT_EMIT_LOC_STRINGS: "NO"
@@ -50,13 +50,16 @@ targets:
     dependencies:
       - target: AIUsageWidget
         embed: true
-    entitlements:
-      path: AIUsage/AIUsage.entitlements
     info:
       path: AIUsage/Info.plist
       properties:
         CFBundleDisplayName: AI Usage
         CFBundleName: AIUsage
+        # Read the build settings above, so MARKETING_VERSION / CURRENT_PROJECT_VERSION are the single
+        # source of truth. Hardcoding them here silently overrides project.yml: the plist wins, and an
+        # archive ships the stale number while every setting says otherwise.
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
@@ -74,6 +77,7 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.aidanfl.aiusage
         PRODUCT_NAME: AIUsage
+        CODE_SIGN_ENTITLEMENTS: AIUsage/AIUsage.entitlements
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
         LD_RUNPATH_SEARCH_PATHS:
@@ -89,19 +93,21 @@ targets:
     sources:
       - path: AIUsageWidget
       - path: Shared
-    entitlements:
-      path: AIUsageWidget/AIUsageWidget.entitlements
     info:
       path: AIUsageWidget/Info.plist
       properties:
         CFBundleDisplayName: AI Usage
         CFBundleName: AIUsageWidget
+        # Must match the host app exactly or App Store validation rejects the upload.
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         NSExtension:
           NSExtensionPointIdentifier: com.apple.widgetkit-extension
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.aidanfl.aiusage.widget
         PRODUCT_NAME: AIUsageWidget
+        CODE_SIGN_ENTITLEMENTS: AIUsageWidget/AIUsageWidget.entitlements
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
         ASSETCATALOG_COMPILER_WIDGET_BACKGROUND_COLOR_NAME: WidgetBackground
         SKIP_INSTALL: "YES"

@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- No tracking, no data collection, no third-party SDKs. Everything the app shows arrives
+	     AES-256-GCM-encrypted from the user's own desktop through a relay the user hosts; the key
+	     never leaves the paired devices and the relay only ever sees ciphertext. -->
+	<key>NSPrivacyTracking</key>
+	<false/>
+	<key>NSPrivacyTrackingDomains</key>
+	<array/>
+	<key>NSPrivacyCollectedDataTypes</key>
+	<array/>
+	<!-- No "required reason" APIs are used: no UserDefaults, no file-timestamp, disk-space,
+	     active-keyboard or system-boot-time calls. Verified against the Swift sources. -->
+	<key>NSPrivacyAccessedAPITypes</key>
+	<array/>
+</dict>
+</plist>
