@@ -1,6 +1,6 @@
 {
   "name": "ai-usage-widget",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Desktop widget (Windows + macOS) showing Claude and Codex usage limits side by side, with an iPhone companion widget",
   "main": "src/main/main.js",
   "scripts": {
@@ -90,8 +90,8 @@
       "gatekeeperAssess": false,
       "darkModeSupport": true,
       "extendInfo": {
+        "_comment_CFBundleName": "Do NOT override CFBundleName. electron-builder names the helper apps after productName ('AI-Usage-Widget Helper.app'), but Electron resolves the helper path from CFBundleName. Setting it to 'AI Usage Widget' made every macOS build die at launch with FATAL 'Unable to find helper app'. CFBundleDisplayName is what Finder and the menu bar show, and it is safe to set.",
         "CFBundleDisplayName": "AI Usage Widget",
-        "CFBundleName": "AI Usage Widget",
         "LSApplicationCategoryType": "public.app-category.utilities"
       },
       "artifactName": "${productName}-${version}-mac.${ext}"

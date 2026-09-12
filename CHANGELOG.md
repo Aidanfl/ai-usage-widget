@@ -2,6 +2,26 @@
 
 All notable changes to AI Usage Widget. Dates are ISO (YYYY-MM-DD).
 
+## 1.0.1 - 2026-09-12
+
+### Fixed
+
+- **The macOS app could not launch at all.** Every macOS build ever published - 0.2.0, 0.2.1 and
+  1.0.0 - died immediately with `FATAL ... Unable to find helper app` and never drew a window.
+  electron-builder names the helper bundles after `productName`, giving
+  `AI-Usage-Widget Helper.app`, but Electron resolves the helper path from the main bundle's
+  `CFBundleName`, and `build.mac.extendInfo` overrode that to `AI Usage Widget`. The two never
+  matched, so the app looked for a helper that does not exist and aborted before any logging. The
+  override is gone; `CFBundleName` now follows `productName` again, and `CFBundleDisplayName` still
+  gives Finder and the menu bar the spaced name. **If you were running the widget from source on a
+  Mac because the DMG "did nothing", this is why.**
+
+- **"Launch at startup" now works on macOS**, as a consequence: the setting is a deliberate no-op in
+  a `npm start` run (registering `electron` as a login item would launch a bare Electron), so it only
+  ever took effect in a packaged build - which could not start.
+
+The iPhone app is unchanged; its version moves with the project.
+
 ## 1.0.0 - 2026-09-12
 
 The iPhone app ships. It is on the App Store as a free download, so the phone half of this project no

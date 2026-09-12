@@ -26,8 +26,8 @@ settings:
     # build, an archive and a TestFlight upload all do. Replace it with your own if you fork this.
     DEVELOPMENT_TEAM: "9NPF39JB76"
     CODE_SIGN_STYLE: Automatic
-    MARKETING_VERSION: "1.0.0"
-    CURRENT_PROJECT_VERSION: "1"
+    MARKETING_VERSION: "1.0.1"
+    CURRENT_PROJECT_VERSION: "2"
     ENABLE_USER_SCRIPT_SANDBOXING: "YES"
     SWIFT_EMIT_LOC_STRINGS: "NO"
   configs:

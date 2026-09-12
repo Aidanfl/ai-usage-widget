@@ -83,19 +83,19 @@ Note: when running from source the "Launch at startup" toggle saves but does not
 npm run build:portable
 ```
 
-produces `dist\AI-Usage-Widget-1.0.0-win-portable.exe` - a single file, no installer, runs from wherever you put it.
+produces `dist\AI-Usage-Widget-1.0.1-win-portable.exe` - a single file, no installer, runs from wherever you put it.
 
 ```bat
 npm run build
 ```
 
-runs `electron-builder --win`, which builds **both** targets configured in `package.json`: the NSIS installer `dist\AI-Usage-Widget-1.0.0-win-Setup.exe` (lets you choose the folder, adds desktop and Start Menu shortcuts) and the portable exe above.
+runs `electron-builder --win`, which builds **both** targets configured in `package.json`: the NSIS installer `dist\AI-Usage-Widget-1.0.1-win-Setup.exe` (lets you choose the folder, adds desktop and Start Menu shortcuts) and the portable exe above.
 
 ```sh
 npm run build:mac
 ```
 
-on a Mac builds the universal `dist/AI-Usage-Widget-1.0.0-mac.dmg` (and a `.zip`). There is no Apple Developer certificate, so `build/after-pack.js` ad-hoc signs the bundle (Apple Silicon refuses to run unsigned code at all) and the DMG is not notarised.
+on a Mac builds the universal `dist/AI-Usage-Widget-1.0.1-mac.dmg` (and a `.zip`). There is no Apple Developer certificate, so `build/after-pack.js` ad-hoc signs the bundle (Apple Silicon refuses to run unsigned code at all) and the DMG is not notarised.
 
 `dist/` is ignored by git. The version number in the file names comes from `package.json`.
 
@@ -104,7 +104,7 @@ on a Mac builds the universal `dist/AI-Usage-Widget-1.0.0-mac.dmg` (and a `.zip`
 ## Launch at startup
 
 - **Installer build:** Settings -> *Launch at startup*. This registers the installed exe as a Windows login item (`app.setLoginItemSettings`).
-- **Portable build:** the toggle is greyed out ("Not supported in portable mode"). Do it the Windows way instead: press `Win + R`, type `shell:startup`, press Enter, and drop a shortcut to `AI-Usage-Widget-1.0.0-win-portable.exe` into the folder that opens.
+- **Portable build:** the toggle is greyed out ("Not supported in portable mode"). Do it the Windows way instead: press `Win + R`, type `shell:startup`, press Enter, and drop a shortcut to `AI-Usage-Widget-1.0.1-win-portable.exe` into the folder that opens.
 - **macOS:** the same toggle registers the app as a login item (System Settings → General → Login Items shows it).
 
 Either way the widget is single-instance: launching it a second time just brings the existing window forward.
