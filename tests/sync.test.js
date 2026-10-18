@@ -1,6 +1,7 @@
 'use strict';
 // Phone sync (docs/PHONE-SYNC.md): derivations against pinned vectors, pair string, envelope crypto,
-// payload building, the push policy and the createPhoneSync state machine with injected deps.
+// payload building (incl. several Claude accounts and the relay size budget), the push policy and the
+// createPhoneSync state machine with injected deps.
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const crypto = require('crypto');
@@ -661,4 +662,154 @@ test('never logs the key, the tokens, the encryption key or the payload', async 
     assert.ok(!everything.includes(secret), `log leaked ${secret.slice(0, 12)}…`);
   }
   assert.ok(everything.length > 0);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Several Claude accounts in the payload
+// ---------------------------------------------------------------------------------------------
+const { PAYLOAD_BUDGET_CHARS } = sync;
+const { normalizeClaude, normalizeCodex } = require('../src/main/providers/normalize');
+const { buildValues, buildSeries } = require('../src/main/history');
+const RELAY_MAX_BODY_BYTES = 256 * 1024; // relay/src/worker.js MAX_BODY_BYTES
+const DAY = 24 * 60 * MIN;
+const fixture = (name) => require(`./fixtures/${name}`);
+
+test('the payload drops identity and duplicates; extra accounts travel under their own ids and names', () => {
+  const identity = { account: 'abcdef0123456789', org: '0123456789abcdef', personalOrg: true };
+  const snap = {
+    fetchedAt: T0,
+    providers: {
+      claude: provider('claude', [win('weekly', 22)], { name: 'Claude 1', identity }),
+      'claude-2': provider('claude-2', [win('weekly', 40)], { name: 'Work', source: 'claude_web', identity: { ...identity, account: null } }),
+      'claude-3': null,
+      codex: provider('codex', [win('primary', 9)]),
+    },
+    duplicates: { 'claude-3': 'claude' },
+  };
+  const payload = buildPhonePayload({ snapshot: snap, history: history(), now: T0 });
+  assert.deepEqual(Object.keys(payload.snapshot), ['fetchedAt', 'providers'], 'no duplicates key');
+  assert.deepEqual(Object.keys(payload.snapshot.providers), ['claude', 'claude-2', 'claude-3', 'codex']);
+  assert.equal(payload.snapshot.providers.claude.name, 'Claude 1', 'providers.claude stays account 1');
+  assert.equal(payload.snapshot.providers['claude-2'].name, 'Work');
+  assert.equal(payload.snapshot.providers['claude-2'].windows[0].percent, 40);
+  assert.equal(payload.snapshot.providers['claude-3'], null, 'a deduped account is just absent for the phone');
+  for (const id of ['claude', 'claude-2', 'codex']) {
+    assert.ok(!('identity' in payload.snapshot.providers[id]), `${id}: identity removed`);
+    assert.ok(!('raw' in payload.snapshot.providers[id]), `${id}: raw removed`);
+  }
+  const text = JSON.stringify(payload);
+  assert.ok(!text.includes(identity.account) && !text.includes(identity.org), 'no identity hash leaves the desktop');
+  assert.deepEqual(snap.duplicates, { 'claude-3': 'claude' }, 'input not mutated');
+  assert.deepEqual(snap.providers.claude.identity, identity, 'input not mutated');
+});
+
+// A realistic widget: each Claude account looks like the fixture account (session, weekly, Fable weekly),
+// Codex like the fixture with additional model limits; one sample every 2 minutes for 7 days, built by
+// history.js itself so the keys and rounding are the real ones.
+function realisticWidget(accountCount, codexFixture = 'codex-usage-additional.json') {
+  const claude = normalizeClaude({ usage: fixture('claude-usage.json'), profile: fixture('claude-profile.json'), credentials: fixture('claude-credentials.json') });
+  const codex = normalizeCodex({ usage: fixture(codexFixture), now: () => T0 });
+  const providers = {};
+  for (let slot = 1; slot <= accountCount; slot++) {
+    const id = slot === 1 ? 'claude' : `claude-${slot}`;
+    providers[id] = provider(id, claude.windows, { name: accountCount === 1 ? 'Claude' : `Claude ${slot}`, plan: claude.plan, extra: claude.extra });
+  }
+  providers.codex = provider('codex', codex.windows, { plan: codex.plan, credits: codex.credits });
+  const snap = { fetchedAt: T0, providers, duplicates: {} };
+  const samples = [];
+  let i = 0;
+  for (let t = T0 - 7 * DAY; t <= T0; t += 2 * MIN, i++) {
+    const tickSnap = JSON.parse(JSON.stringify(snap));
+    Object.values(tickSnap.providers).forEach((p, k) => p.windows.forEach((w, j) => { w.percent = ((i * (j + 3) + k * 17) % 1000) / 9.7; }));
+    samples.push({ t, v: buildValues(tickSnap) });
+  }
+  return { snap, history: { samples, series: buildSeries(snap, samples) } };
+}
+
+// Size of the payload as it would be with the history downsampled at `bucketMs` (null = no samples).
+function sizeAt(payload, samples, bucketMs) {
+  const atBucket = bucketMs === null ? [] : downsampleHistory(samples, { bucketMs });
+  return JSON.stringify({ ...payload, history: { ...payload.history, samples: atBucket } }).length;
+}
+
+function assertBucket(samplesOut, bucketMs) {
+  const buckets = samplesOut.map((s) => Math.floor(s.t / bucketMs));
+  assert.equal(new Set(buckets).size, samplesOut.length, `one sample per ${bucketMs / MIN}-min bucket`);
+}
+
+test('payload budget: today\'s single account keeps the 30-minute history untouched', (t) => {
+  const { snap, history: hist } = realisticWidget(1, 'codex-usage-plus.json');
+  const payload = buildPhonePayload({ snapshot: snap, history: hist, now: T0 });
+  const size = JSON.stringify(payload).length;
+  t.diagnostic(`1 account + Codex: ${size} chars at 30-min buckets (budget ${PAYLOAD_BUDGET_CHARS})`);
+  assert.ok(size <= PAYLOAD_BUDGET_CHARS, `1 account: ${size} chars fits the ${PAYLOAD_BUDGET_CHARS} budget`);
+  assert.deepEqual(payload.history.samples, downsampleHistory(hist.samples), 'the 30-min downsample, unchanged');
+  assert.ok(payload.history.samples.length > 300, '7 days of 30-min buckets');
+});
+
+test('payload budget: four realistic accounts over 7 days at a 2-minute cadence are re-downsampled until they fit', (t) => {
+  const { snap, history: hist } = realisticWidget(4);
+  const inputCopy = JSON.stringify(hist.samples.slice(-3));
+  const payload = buildPhonePayload({ snapshot: snap, history: hist, now: T0 });
+  const before = sizeAt(payload, hist.samples, HISTORY_BUCKET_MS);
+  const after = JSON.stringify(payload).length;
+  const message = `4 accounts + Codex, ${hist.samples.length} samples, ${Object.keys(hist.samples[0].v).length} keys each: `
+    + `${before} chars at 30-min buckets → ${after} chars at 60-min buckets (budget ${PAYLOAD_BUDGET_CHARS})`;
+  t.diagnostic(message);
+  assert.ok(before > PAYLOAD_BUDGET_CHARS, `the fixture must exceed the budget at 30 min: ${message}`);
+  assert.ok(after <= PAYLOAD_BUDGET_CHARS, message);
+  assert.deepEqual(payload.history.samples, downsampleHistory(hist.samples, { bucketMs: 2 * HISTORY_BUCKET_MS }), `first bucket that fits: ${message}`);
+  assertBucket(payload.history.samples, 60 * MIN);
+  assert.equal(payload.history.samples[payload.history.samples.length - 1].t, hist.samples[hist.samples.length - 1].t, 'the newest sample survives');
+  assert.deepEqual(payload.snapshot, JSON.parse(JSON.stringify(sync.buildPhonePayload({ snapshot: snap, now: T0 }).snapshot)), 'snapshot untouched');
+  assert.equal(payload.history.series.length, hist.series.length, 'every series kept');
+  assert.equal(JSON.stringify(hist.samples.slice(-3)), inputCopy, 'input history not mutated');
+
+  // And the envelope the relay sees stays well under its 256 KB limit.
+  const { encKey, slotId } = deriveSlot(K);
+  const body = JSON.stringify(encryptPayload(encKey, slotId, payload, { iv: Buffer.alloc(12, 1) }));
+  assert.ok(body.length < RELAY_MAX_BODY_BYTES, `envelope ${body.length} bytes < ${RELAY_MAX_BODY_BYTES}`);
+});
+
+// Synthetic samples with `keyCount` keys each, one every 2 minutes for 7 days.
+function wideHistory(keyCount) {
+  const keys = Array.from({ length: keyCount }, (_, k) => `claude-${2 + (k % 5)}.window_${k}`);
+  const samples = [];
+  for (let t = T0 - 7 * DAY, i = 0; t <= T0; t += 2 * MIN, i++) {
+    const v = {};
+    keys.forEach((key, k) => { v[key] = ((i + k) % 1000) / 10; });
+    samples.push({ t, v });
+  }
+  return { samples, series: keys.map((key) => ({ key, label: key, color: 'slate' })) };
+}
+
+test('payload budget: the bucket keeps doubling (120, 240 min), then the samples go but the series stay', () => {
+  for (const [keyCount, bucketMin] of [[50, 120], [100, 240], [300, null]]) {
+    const hist = wideHistory(keyCount);
+    const payload = buildPhonePayload({ snapshot: baseSnapshot(), history: hist, now: T0 });
+    const ladder = [30, 60, 120, 240].map((m) => `${m} min: ${sizeAt(payload, hist.samples, m * MIN)}`).join(', ');
+    const label = `${keyCount} keys/sample (${ladder})`;
+    assert.ok(JSON.stringify(payload).length <= PAYLOAD_BUDGET_CHARS, label);
+    if (bucketMin === null) {
+      assert.ok(sizeAt(payload, hist.samples, 240 * MIN) > PAYLOAD_BUDGET_CHARS, `fixture must not fit even at 240 min: ${label}`);
+      assert.deepEqual(payload.history.samples, [], label);
+    } else {
+      assert.ok(sizeAt(payload, hist.samples, (bucketMin / 2) * MIN) > PAYLOAD_BUDGET_CHARS, `fixture must not fit at ${bucketMin / 2} min: ${label}`);
+      assert.deepEqual(payload.history.samples, downsampleHistory(hist.samples, { bucketMs: bucketMin * MIN }), label);
+      assert.ok(payload.history.samples.length > 0, label);
+    }
+    assert.equal(payload.history.series.length, keyCount, `series kept: ${label}`);
+    assert.equal(payload.history.days, 7);
+  }
+});
+
+test('payload budget: a snapshot that alone exceeds the budget is still sent (samples dropped, never the snapshot)', () => {
+  const huge = baseSnapshot();
+  huge.providers.claude.windows = Array.from({ length: 1500 }, (_, i) => win(`weekly_model_${i}`, i % 100, { label: `Model ${i} Weekly` }));
+  const hist = history([{ t: T0 - MIN, v: { 'claude.session': 20 } }]);
+  const payload = buildPhonePayload({ snapshot: huge, history: hist, now: T0 });
+  assert.ok(JSON.stringify(payload).length > PAYLOAD_BUDGET_CHARS, 'over budget even without samples');
+  assert.deepEqual(payload.history.samples, []);
+  assert.equal(payload.snapshot.providers.claude.windows.length, 1500, 'snapshot kept whole');
+  assert.equal(payload.history.series.length, 1);
 });

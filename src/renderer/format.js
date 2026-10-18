@@ -1,5 +1,6 @@
 /*
- * format.js — PURE formatting helpers for the AI Usage widget renderer.
+ * format.js — PURE formatting helpers for the AI Usage widget renderer, plus the pure Claude-account
+ * helpers (id/slot rules, display order, display names) the renderer needs for several accounts.
  *
  * Plain script: attaches `window.Format` in the renderer and exports the same
  * object through `module.exports` for node:test.  No DOM, no Electron.
@@ -206,19 +207,132 @@
     return '';
   }
 
-  /** Compact-row label: "CLAUDE 5H" / "CLAUDE 7D" / "FABLE 7D" / "CODEX 7D". */
-  function compactLabel(providerName, win) {
-    var base = (win && win.kind === 'weekly_scoped' && win.scope) ? win.scope : (providerName || '');
-    var short = shortWindowName(win);
-    var text = short ? base + ' ' + short : base + ' ' + ((win && win.label) || '');
-    return text.trim().toUpperCase();
+  /**
+   * Compact-row label in two parts, { base: "CLAUDE 2", win: "5H" }: with several Claude accounts the
+   * renderer ellipsizes the name and keeps the window part, so "MAIN ACCOUNT 5H" never loses its "5H".
+   * `qualify` (several Claude accounts) keeps the account name on scoped rows and moves the scope into the
+   * window part — { base: "WORK", win: "FABLE 7D" } — or every account's Fable row reads "FABLE 7D".
+   */
+  function compactLabelParts(providerName, win, qualify) {
+    var scoped = !!(win && win.kind === 'weekly_scoped' && win.scope);
+    var short = shortWindowName(win) || ((win && win.label) || '');
+    if (scoped && qualify && providerName) {
+      return { base: String(providerName).toUpperCase(), win: (win.scope + ' ' + short).trim().toUpperCase() };
+    }
+    var base = scoped ? win.scope : (providerName || '');
+    return { base: String(base).toUpperCase(), win: String(short).toUpperCase() };
   }
 
-  /** Legend label for the chart: "Claude 5h" / "Fable 7d" / "Codex 7d". */
-  function seriesLabel(providerName, win) {
-    var base = (win && win.kind === 'weekly_scoped' && win.scope) ? win.scope : (providerName || '');
+  /** Compact-row label: "CLAUDE 5H" / "CLAUDE 7D" / "FABLE 7D" / "CODEX 7D". */
+  function compactLabel(providerName, win) {
+    var parts = compactLabelParts(providerName, win);
+    return (parts.base + ' ' + parts.win).trim();
+  }
+
+  /**
+   * Legend label for the chart: "Claude 5h" / "Fable 7d" / "Codex 7d". `qualify` (several Claude accounts)
+   * names the account on scoped rows too — "Claude 2 Fable 7d" — or every account's Fable line reads the same.
+   */
+  function seriesLabel(providerName, win, qualify) {
+    var scoped = !!(win && win.kind === 'weekly_scoped' && win.scope);
+    var base = scoped ? win.scope : (providerName || '');
+    if (scoped && qualify && providerName) base = providerName + ' ' + base;
     var short = shortWindowName(win);
     return short ? base + ' ' + short.toLowerCase() : (base + ' ' + ((win && win.label) || '')).trim();
+  }
+
+  // ---- Claude accounts (up to six at once) -----------------------------------------
+  // Slot 1 keeps the id 'claude' (the shipped phone app, history keys and tray read it); slot N ≥ 2 is
+  // 'claude-N'. The main process has the same rules in src/main/accounts.js — the renderer cannot load it.
+
+  var MAX_ACCOUNTS = 6;
+  var CLAUDE_SOURCES = ['claude_code', 'claude_web', 'claude_keychain'];
+  // Chart line style per account slot: series keep their window colour, accounts differ by dash.
+  var ACCOUNT_DASHES = [[], [6, 3], [2, 3], [8, 3, 2, 3], [12, 4], [1, 4]];
+
+  function isClaudeId(id) {
+    return id === 'claude' || (typeof id === 'string' && /^claude-[2-6]$/.test(id));
+  }
+
+  /** 'claude' → 1, 'claude-4' → 4, anything else → 0. */
+  function claudeSlot(id) {
+    if (id === 'claude') return 1;
+    return isClaudeId(id) ? Number(id.slice(7)) : 0;
+  }
+
+  /** Display order: Claude accounts by slot, then Codex, then any other id alphabetically. Drops duplicates. */
+  function orderProviderIds(ids) {
+    var seen = {};
+    var list = (Array.isArray(ids) ? ids : []).filter(function (id) {
+      if (typeof id !== 'string' || seen[id]) return false;
+      seen[id] = true;
+      return true;
+    });
+    function rank(id) {
+      var slot = claudeSlot(id);
+      return slot || (id === 'codex' ? MAX_ACCOUNTS + 1 : MAX_ACCOUNTS + 2);
+    }
+    return list.sort(function (a, b) {
+      return rank(a) - rank(b) || (a < b ? -1 : (a > b ? 1 : 0));
+    });
+  }
+
+  /** Chart.js `borderDash` for a provider's series: slot 1 (and every non-Claude id) solid. */
+  function accountDash(id) {
+    var slot = claudeSlot(id);
+    return slot ? ACCOUNT_DASHES[slot - 1].slice() : [];
+  }
+
+  /** The label when set; else "Claude" for a lone account, "Claude <slot>" once there are several. */
+  function accountDisplayName(account, accounts) {
+    var label = account && typeof account.label === 'string' ? account.label.trim() : '';
+    if (label) return label;
+    var count = Array.isArray(accounts) ? accounts.length : 1;
+    var slot = claudeSlot(account && account.id);
+    return count === 1 || !slot ? 'Claude' : 'Claude ' + slot;
+  }
+
+  /** Id for "Add account": the lowest free slot ≥ 2, or null when all six are taken. */
+  function nextAccountId(accounts) {
+    var used = {};
+    (Array.isArray(accounts) ? accounts : []).forEach(function (a) { if (a && typeof a.id === 'string') used[a.id] = true; });
+    for (var slot = 2; slot <= MAX_ACCOUNTS; slot++) {
+      if (!used['claude-' + slot]) return 'claude-' + slot;
+    }
+    return null;
+  }
+
+  /**
+   * settings → the Claude account list the renderer draws, always ≥ 1 entry with 'claude' first, slot order,
+   * ≤ 6, every field typed. Main (store.js) already sanitizes; this only keeps a malformed or 1.0.x
+   * settings object from breaking the UI — without a 'claude' entry, account 1 comes from the legacy keys.
+   */
+  function accountsFromSettings(settings) {
+    var s = settings && typeof settings === 'object' ? settings : {};
+    var seen = {};
+    var list = (Array.isArray(s.claudeAccounts) ? s.claudeAccounts : []).filter(function (a) {
+      if (!a || typeof a !== 'object' || !isClaudeId(a.id) || seen[a.id]) return false;
+      seen[a.id] = true;
+      return true;
+    }).map(function (a) {
+      return {
+        id: a.id,
+        label: typeof a.label === 'string' ? a.label : '',
+        source: CLAUDE_SOURCES.indexOf(a.source) >= 0 ? a.source : 'claude_code',
+        configDir: typeof a.configDir === 'string' ? a.configDir : '',
+        organizationId: typeof a.organizationId === 'string' && a.organizationId ? a.organizationId : null,
+      };
+    });
+    if (!seen.claude) {
+      list.unshift({
+        id: 'claude',
+        label: '',
+        source: CLAUDE_SOURCES.indexOf(s.claudeSource) >= 0 ? s.claudeSource : 'claude_code',
+        configDir: '',
+        organizationId: typeof s.claudeOrganizationId === 'string' && s.claudeOrganizationId ? s.claudeOrganizationId : null,
+      });
+    }
+    return list.sort(function (a, b) { return claudeSlot(a.id) - claudeSlot(b.id); }).slice(0, MAX_ACCOUNTS);
   }
 
   /** "updated 12s ago" helper: ms epoch → "12s ago" | "3m ago" | "2h ago" | "5d ago" | "never". */
@@ -261,8 +375,17 @@
     ringClass: ringClass,
     isWeeklyWindow: isWeeklyWindow,
     shortWindowName: shortWindowName,
+    compactLabelParts: compactLabelParts,
     compactLabel: compactLabel,
     seriesLabel: seriesLabel,
+    MAX_ACCOUNTS: MAX_ACCOUNTS,
+    isClaudeId: isClaudeId,
+    claudeSlot: claudeSlot,
+    orderProviderIds: orderProviderIds,
+    accountDash: accountDash,
+    accountDisplayName: accountDisplayName,
+    nextAccountId: nextAccountId,
+    accountsFromSettings: accountsFromSettings,
     relativeAgo: relativeAgo,
     daysUntil: daysUntil
   };

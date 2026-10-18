@@ -174,6 +174,15 @@ test('compactLabel and seriesLabel', () => {
   assert.equal(F.seriesLabel('Codex', weekly), 'Codex 7d');
 });
 
+test('compactLabelParts — with several accounts a scoped row keeps its account name; one account looks as before', () => {
+  const session = { key: 'session', kind: 'session', windowSeconds: 18000, label: 'Current Session', scope: null };
+  const fable = { key: 'weekly_fable', kind: 'weekly_scoped', windowSeconds: 604800, label: 'Fable Weekly', scope: 'Fable' };
+  assert.deepEqual(F.compactLabelParts('Work', fable, true), { base: 'WORK', win: 'FABLE 7D' });
+  assert.deepEqual(F.compactLabelParts('Work', fable), { base: 'FABLE', win: '7D' }, 'unqualified: the 1.0.x label');
+  assert.deepEqual(F.compactLabelParts('Work', session, true), { base: 'WORK', win: '5H' }, 'unscoped rows are unchanged');
+  assert.deepEqual(F.compactLabelParts('', fable, true), { base: 'FABLE', win: '7D' }, 'no name to keep → the scope stays the base');
+});
+
 test('isWeeklyWindow', () => {
   assert.equal(F.isWeeklyWindow({ kind: 'session', windowSeconds: 18000 }), false);
   assert.equal(F.isWeeklyWindow({ kind: 'weekly', windowSeconds: 604800 }), true);

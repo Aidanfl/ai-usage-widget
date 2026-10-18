@@ -26,6 +26,11 @@
  *   phonepairing  phone + the pairing panel (QR + code) opened after settings   phonewaiting  paired, no push yet
  *   phonefail   paired, last push failed (HTTP 401, retrying at hh:mm)        phonememkey   key kept in memory only
  *   phoneconfirm  phone + the inline Unpair confirmation shown
+ *   multi       four Claude accounts + Codex: Claude 1 ok, "Work" stale, Claude 3 a claude.ai sign-in that needs
+ *               a login (auth_required), Claude 4 the same login as Claude 1 (hidden as a duplicate). Combines
+ *               with settings / compact / mac / light / graph / expanded (mac: claude.ai + Keychain sources)
+ *   six         multi + two more accounts (six = the maximum; a long label; "Add account" disabled)
+ *   removeconfirm  multi + settings with the inline "Remove Work?" confirmation shown
  *
  * The Fable row always carries `note` (as normalize.js produces it); every other row has `note: null`.
  */
@@ -52,6 +57,26 @@
     return ((h % 12) || 12) + ':' + m + ' ' + (h >= 12 ? 'PM' : 'AM');
   }
 
+  // ---- Claude accounts (settings.claudeAccounts). Fake identities only: the repo is public. ----
+  const MULTI = has('multi') || has('six') || has('removeconfirm');
+  function accountsFixture() {
+    if (!MULTI) return [{ id: 'claude', label: '', source: has('web') ? 'claude_web' : 'claude_code', configDir: '', organizationId: null }];
+    const mac = has('mac');
+    const list = [
+      { id: 'claude', label: '', source: mac ? 'claude_web' : 'claude_code', configDir: '', organizationId: mac ? 'org_1' : null },
+      { id: 'claude-2', label: 'Work', source: mac ? 'claude_keychain' : 'claude_code', configDir: '~/.claude-2', organizationId: null },
+      { id: 'claude-3', label: '', source: 'claude_web', configDir: '', organizationId: null },
+      { id: 'claude-4', label: '', source: mac ? 'claude_web' : 'claude_code', configDir: mac ? '' : '~/.claude-4', organizationId: null },
+    ];
+    if (has('six')) {
+      list.push(
+        { id: 'claude-5', label: 'Weekend experiments account', source: mac ? 'claude_keychain' : 'claude_code', configDir: '~/.claude-weekend-experiments', organizationId: null },
+        { id: 'claude-6', label: '', source: 'claude_web', configDir: '', organizationId: null });
+    }
+    return list;
+  }
+  const initialAccounts = accountsFixture();
+
   const settings = {
     autoStart: false,
     hideFromTaskbar: false,
@@ -67,13 +92,14 @@
     compactMode: has('compact'),
     refreshInterval: '60',
     graphVisible: has('graph'),
-    expandedOpen: { claude: has('expanded'), codex: has('expanded') },
+    expandedOpen: initialAccounts.reduce((o, a) => Object.assign(o, { [a.id]: has('expanded') }), { codex: has('expanded') }),
     providers: { claude: true, codex: true },
-    claudeSource: has('web') ? 'claude_web' : 'claude_code',
+    claudeAccounts: initialAccounts,
+    claudeSource: initialAccounts[0].source, // legacy mirror of account 1 (store.js keeps it in sync)
     tokenAutoRefresh: true,
     trayStats: 'off',
     windowPosition: null,
-    claudeOrganizationId: null,
+    claudeOrganizationId: initialAccounts[0].organizationId,
     phoneSyncEnabled: false,
     phoneRelayUrl: '',
   };
@@ -172,10 +198,10 @@
     else if (stale) error = { code: 'network', message: 'Network error' };
     return {
       id: 'claude',
-      name: 'Claude',
+      name: displayName(settings.claudeAccounts[0]),
       status: stale ? 'stale' : 'ok',
       error,
-      source: settings.claudeSource,
+      source: settings.claudeAccounts[0].source,
       plan: 'Max 20x',
       account: 'aidan@example.com',
       updatedAt: stale ? now - (rateLimited ? 7 : 5) * MIN : now - 12000,
@@ -188,6 +214,64 @@
       credits: null,
       raw: {},
     };
+  }
+
+  /** accounts.accountDisplayName: the label, else "Claude" alone / "Claude <slot>" among several. */
+  function displayName(acc) {
+    if (acc.label && acc.label.trim()) return acc.label.trim();
+    return settings.claudeAccounts.length === 1 ? 'Claude' : 'Claude ' + (acc.id === 'claude' ? 1 : acc.id.slice(7));
+  }
+
+  function claudeWindows(session, weekly, fable, sessionResetMs, weeklyResetMs) {
+    const rows = [
+      { key: 'session', label: 'Current Session', kind: 'session', percent: session, resetsAt: iso(sessionResetMs), windowSeconds: 18000, severity: 'normal', isActive: false, color: 'purple', scope: null, note: null },
+      { key: 'weekly', label: 'Weekly Limit', kind: 'weekly', percent: weekly, resetsAt: iso(weeklyResetMs), windowSeconds: 604800, severity: 'normal', isActive: true, color: 'blue', scope: null, note: null },
+    ];
+    if (fable !== null) rows.push({ key: 'weekly_fable', label: 'Fable Weekly', kind: 'weekly_scoped', percent: fable, resetsAt: iso(weeklyResetMs), windowSeconds: 604800, severity: 'normal', isActive: false, color: 'fuchsia', scope: 'Fable', note: FABLE_NOTE });
+    return rows;
+  }
+
+  // Accounts 2–6 of the multi / six fixtures; [session, weekly, fable] are pinned into the history too.
+  const ACCOUNT_FIXTURES = {
+    'claude-2': { plan: 'Max 5x', account: 'work@example.com', pct: [64, 41, 18], stale: true },
+    'claude-3': { authRequired: true },
+    'claude-4': { plan: 'Max 20x', account: 'aidan@example.com', pct: [20, 22, 10] }, // = account 1 (deduped)
+    'claude-5': { plan: 'Pro', account: 'weekend.experiments@example.com', pct: [5, 12, null] },
+    'claude-6': { plan: 'Max 20x', account: 'sixth@example.com', pct: [33, 70, 25] },
+  };
+  const signedInWeb = new Set(); // accounts signed in through the mock's claudeWebLogin
+
+  /** Snapshot of account 2–6 (account 1 is claudeSnapshot()); an unknown account added in the preview needs a login. */
+  function accountSnapshot(acc) {
+    const fx = ACCOUNT_FIXTURES[acc.id] && !(acc.source === 'claude_web' && ACCOUNT_FIXTURES[acc.id].authRequired && signedInWeb.has(acc.id))
+      ? ACCOUNT_FIXTURES[acc.id]
+      : (signedInWeb.has(acc.id) ? { plan: 'Pro', account: 'new@example.com', pct: [3, 8, null] } : { authRequired: true });
+    const base = { id: acc.id, name: displayName(acc), source: acc.source, extra: null, credits: null, raw: {} };
+    if (fx.authRequired) {
+      const folder = acc.configDir || '~/.claude';
+      const error = acc.source === 'claude_web'
+        ? { code: 'no_credentials', message: 'Log in to claude.ai in Settings to see usage' }
+        : acc.source === 'claude_keychain'
+          ? { code: 'no_credentials', message: 'No Claude Code login in the Keychain for ' + folder + ' - open it in Claude Code and run /login' }
+          : { code: 'no_credentials', message: 'No Claude Code login in ' + folder + ' - run claude in that folder and /login' };
+      return Object.assign(base, { status: 'auth_required', error, plan: null, account: null, updatedAt: 0, windows: [] });
+    }
+    let error = null;
+    if (fx.stale) {
+      error = acc.source === 'claude_keychain'
+        ? { code: 'token_expired', message: 'Claude token expired - waiting for Claude Code to refresh it (open ' + displayName(acc) + ' in Claude Code)' }
+        : { code: 'network', message: 'Network error' };
+    }
+    return Object.assign(base, {
+      status: fx.stale ? 'stale' : 'ok',
+      error,
+      plan: fx.plan,
+      account: fx.account,
+      updatedAt: fx.stale ? now - 9 * MIN : now - 20000,
+      windows: claudeWindows(fx.pct[0], fx.pct[1], fx.pct[2], now + 3 * HOUR + 5 * MIN, now + 4 * DAY + 2 * HOUR),
+      extra: { enabled: false, currency: 'USD', exponent: 2, usedMinor: null, limitMinor: null, percent: null, disabledReason: null,
+        balanceMinor: null, promoMinor: null, paidMinor: null, nextExpiresAt: null, nextExpiryMinor: null },
+    });
   }
 
   function codexSnapshot() {
@@ -229,14 +313,21 @@
   }
 
   function buildSnapshot() {
-    return {
-      fetchedAt: Date.now(),
-      providers: {
-        // `null` = provider disabled (settings) — noclaude/nocodex force it regardless of the settings toggles.
-        claude: settings.providers.claude && !has('noclaude') ? claudeSnapshot() : null,
-        codex: settings.providers.codex && !has('nocodex') ? codexSnapshot() : null,
-      },
-    };
+    const providers = {};
+    const duplicates = {};
+    // `null` = provider disabled (settings) — noclaude/nocodex force it regardless of the settings toggles.
+    settings.claudeAccounts.forEach((acc) => {
+      const visible = settings.providers[acc.id] !== false;
+      if (acc.id === 'claude') providers.claude = visible && !has('noclaude') ? claudeSnapshot() : null;
+      else providers[acc.id] = visible ? accountSnapshot(acc) : null;
+    });
+    // main dedupes (accounts.dedupeSnapshot): in the multi fixture claude-4 is account 1's login a second time.
+    if (MULTI && providers['claude-4'] && providers.claude && providers['claude-4'].status !== 'auth_required') {
+      providers['claude-4'] = null;
+      duplicates['claude-4'] = 'claude';
+    }
+    providers.codex = settings.providers.codex && !has('nocodex') ? codexSnapshot() : null;
+    return { fetchedAt: Date.now(), providers, duplicates };
   }
 
   // Deterministic PRNG so screenshots are reproducible.
@@ -255,9 +346,21 @@
       { key: 'claude.weekly', label: 'Claude · Weekly Limit', color: 'blue' },
       { key: 'claude.weekly_fable', label: 'Claude · Fable Weekly', color: 'fuchsia' },
     ];
+    // Several accounts: main labels series with the display name; claude-3 (needs a login) and claude-4 (a
+    // duplicate) have no card, so they have no series either.
+    const extraIds = MULTI ? ['claude-2'].concat(has('six') ? ['claude-5', 'claude-6'] : []) : [];
+    if (MULTI) series.forEach((sr) => { sr.label = sr.label.replace(/^Claude/, displayName(settings.claudeAccounts[0])); });
+    extraIds.forEach((id) => {
+      const name = displayName(settings.claudeAccounts.find((a) => a.id === id));
+      series.push({ key: id + '.session', label: name + ' · Current Session', color: 'purple' });
+      series.push({ key: id + '.weekly', label: name + ' · Weekly Limit', color: 'blue' });
+      if (ACCOUNT_FIXTURES[id].pct[2] !== null) series.push({ key: id + '.weekly_fable', label: name + ' · Fable Weekly', color: 'fuchsia' });
+    });
     if (has('twowindows')) series.push({ key: 'codex.primary', label: 'Codex · 5-Hour Limit', color: 'green' });
     if (!has('nowindows')) series.push({ key: 'codex.secondary', label: 'Codex · Weekly Limit', color: 'teal' });
     if (has('empty')) return { samples: [], series };
+    // Their own PRNGs, so the default fixture's history stays exactly what it was before accounts existed.
+    const walks = extraIds.map((id, i) => ({ id, rnd: mulberry32(100 + i), session: 0, weekly: 10 + i * 15, fable: 5, resetAt: 30 + i * 9 }));
 
     const rnd = mulberry32(42);
     const samples = [];
@@ -288,6 +391,15 @@
       };
       if (!has('nowindows')) v['codex.secondary'] = Math.round(codex * 10) / 10;
       if (has('twowindows')) v['codex.primary'] = Math.round(codex5 * 10) / 10;
+      walks.forEach((wk) => {
+        if (fiveHourBoundary) wk.session = working ? wk.rnd() * 6 : 0;
+        else if (working) wk.session = Math.min(100, wk.session + wk.rnd() * 18 / perHour);
+        if (k === wk.resetAt * perHour) { wk.weekly = 1; wk.fable = 0; }
+        else { wk.weekly = Math.min(100, wk.weekly + wk.rnd() * 0.6 / perHour); wk.fable = Math.min(100, wk.fable + wk.rnd() * 0.25 / perHour); }
+        v[wk.id + '.session'] = Math.round(wk.session * 10) / 10;
+        v[wk.id + '.weekly'] = Math.round(wk.weekly * 10) / 10;
+        if (ACCOUNT_FIXTURES[wk.id].pct[2] !== null) v[wk.id + '.weekly_fable'] = Math.round(wk.fable * 10) / 10;
+      });
       samples.push({ t, v });
     }
     // Pin the latest sample to the fixture values so the live dots match the bars.
@@ -298,6 +410,12 @@
     last.v['claude.weekly_fable'] = 10;
     if (!has('nowindows')) last.v['codex.secondary'] = 99;
     if (has('twowindows')) last.v['codex.primary'] = 34;
+    walks.forEach((wk) => {
+      const pct = ACCOUNT_FIXTURES[wk.id].pct;
+      last.v[wk.id + '.session'] = pct[0];
+      last.v[wk.id + '.weekly'] = pct[1];
+      if (pct[2] !== null) last.v[wk.id + '.weekly_fable'] = pct[2];
+    });
     return { samples, series };
   }
 
@@ -311,6 +429,19 @@
         if (k === 'expandedOpen' || k === 'providers') settings[k] = Object.assign({}, settings[k], patch[k]);
         else settings[k] = patch[k];
       });
+      // store.js: claudeAccounts replaces the list; the legacy keys alone patch account 1; the legacy keys
+      // mirror account 1 and a removed account leaves no providers / expandedOpen flag behind.
+      if (patch && !patch.claudeAccounts && ('claudeSource' in patch || 'claudeOrganizationId' in patch)) {
+        settings.claudeAccounts = settings.claudeAccounts.map((a, i) => (i ? a : Object.assign({}, a,
+          'claudeSource' in patch ? { source: patch.claudeSource } : null,
+          'claudeOrganizationId' in patch ? { organizationId: patch.claudeOrganizationId } : null)));
+      }
+      settings.claudeSource = settings.claudeAccounts[0].source;
+      settings.claudeOrganizationId = settings.claudeAccounts[0].organizationId;
+      const ids = settings.claudeAccounts.map((a) => a.id);
+      ['providers', 'expandedOpen'].forEach((key) => Object.keys(settings[key]).forEach((id) => {
+        if (/^claude-\d$/.test(id) && !ids.includes(id)) delete settings[key][id];
+      }));
       console.log('[saveSettings] ' + JSON.stringify(patch));
       // Mirrors main.js: enabling phone sync without a key generates one; both phone keys re-broadcast the status.
       if (patch && patch.phoneSyncEnabled === true && !phone.paired) { phone.paired = true; phone.lastPushAt = null; }
@@ -334,10 +465,30 @@
       version: '0.2.1', platform: has('mac') ? 'darwin' : 'win32', acrylicSupported: !has('noacrylic'), isPortable: has('portable'),
       background: has('noacrylic') ? 'solid' : settings.background,
     }),
-    claudeWebLogin: async () => { await delay(600); return { success: true }; },
-    claudeWebLogout: async () => true,
-    claudeWebOrgs: async () => [{ id: 'org_1', name: 'Aidan', isTeam: false }, { id: 'org_2', name: 'Acme Corp', isTeam: true }],
-    claudeWebSelectOrg: async () => true,
+    // claude.ai sign-in per account (main.js: one session partition per account id; default account 1).
+    claudeWebLogin: async (accountId) => {
+      console.log('[claudeWebLogin] ' + (accountId || 'claude'));
+      await delay(600);
+      signedInWeb.add(accountId || 'claude');
+      return { success: true };
+    },
+    claudeWebLogout: async (accountId) => {
+      console.log('[claudeWebLogout] ' + (accountId || 'claude'));
+      signedInWeb.delete(accountId || 'claude');
+      return true;
+    },
+    claudeWebOrgs: async (accountId) => ((accountId || 'claude') === 'claude'
+      ? [{ id: 'org_1', name: 'Aidan', isTeam: false }, { id: 'org_2', name: 'Acme Corp', isTeam: true }]
+      : [{ id: 'org_' + accountId, name: 'Personal', isTeam: false }]),
+    claudeWebSelectOrg: async (id, accountId) => {
+      // main.js stores it as that account's organizationId (account 1 mirrored to claudeOrganizationId).
+      const target = accountId || 'claude';
+      settings.claudeAccounts = settings.claudeAccounts.map((a) => (a.id === target ? Object.assign({}, a, { organizationId: id }) : a));
+      settings.claudeOrganizationId = settings.claudeAccounts[0].organizationId;
+      const copy = JSON.parse(JSON.stringify(settings));
+      setTimeout(() => listeners.settings.forEach((cb) => cb(copy)), 0);
+      return true;
+    },
     // Phone sync (same shapes as main.js / sync.js)
     phoneSyncStatus: async () => phoneStatus(),
     phoneSyncPairing: async () => {
@@ -397,9 +548,15 @@
 
   // Harness hooks: open settings after load; simulate a tray refresh spinner; report chart point counts.
   window.addEventListener('load', () => {
-    if (has('settings')) setTimeout(() => document.getElementById('settingsBtn').click(), 200);
+    if (has('settings') || has('removeconfirm')) setTimeout(() => document.getElementById('settingsBtn').click(), 200);
     if (has('phonepairing')) setTimeout(() => document.getElementById('phonePairBtn').click(), 500);
     if (has('phoneconfirm')) setTimeout(() => document.getElementById('phoneUnpairBtn').click(), 500);
+    if (has('removeconfirm')) {
+      setTimeout(() => {
+        const block = document.querySelector('#claudeAccounts [data-key="claude-2"]');
+        if (block) block.querySelector('.acct-remove').click();
+      }, 500);
+    }
     if (has('spinning')) setTimeout(() => listeners.refresh.forEach((cb) => cb()), 200);
     if (has('graph')) {
       setTimeout(() => {
@@ -413,7 +570,9 @@
         document.querySelectorAll('.card[data-provider]').forEach((card) => {
           const dot = card.querySelector('.dot');
           const upd = card.querySelector('.updated');
-          console.log('[titles] ' + card.dataset.provider + ' dot="' + dot.title + '" updated="' + upd.textContent + '" updatedTitle="' + upd.title + '"');
+          const acct = card.querySelector('.acct');
+          console.log('[titles] ' + card.dataset.provider + ' dot="' + dot.title + '" updated="' + upd.textContent + '" updatedTitle="' + upd.title + '"'
+            + (acct && !acct.hidden ? ' account="' + acct.title + '"' : ''));
         });
         document.querySelectorAll('.row .label').forEach((l) => console.log('[titles] row "' + l.textContent + '" has-note=' + l.classList.contains('has-note') + ' title="' + l.title + '"'));
         document.querySelectorAll('.crow .clabel').forEach((l) => console.log('[titles] compact "' + l.textContent + '" title="' + l.title + '"'));

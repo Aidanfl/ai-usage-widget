@@ -6,10 +6,15 @@
  *
  * Expected preload surface (window.api, see ARCHITECTURE.md §8):
  *   getSettings() saveSettings(patch) getSnapshot() refreshNow() getHistory(days) getAppInfo()
- *   claudeWebLogin() claudeWebLogout() claudeWebOrgs() claudeWebSelectOrg(id)
+ *   claudeWebLogin(accountId) claudeWebLogout(accountId) claudeWebOrgs(accountId) claudeWebSelectOrg(id, accountId)
  *   phoneSyncStatus() phoneSyncPairing() phoneSyncRepair() phoneSyncUnpair() phoneSyncTest(relayUrl) phoneSyncPushNow()
  *   minimizeWindow() closeWindow() resizeWindow(height) setCompactMode(bool) openExternal(url)
- *   onUsageUpdated(cb) onSettingsUpdated(cb) onRefreshRequested(cb) onClaudeWebSessionExpired(cb) onPhoneSyncUpdated(cb)
+ *   onUsageUpdated(cb) onSettingsUpdated(cb) onRefreshRequested(cb) onClaudeWebSessionExpired(cb({ accountId }))
+ *   onPhoneSyncUpdated(cb)
+ *
+ * Several Claude accounts: settings.claudeAccounts lists them (slot 1 = id 'claude', then 'claude-2' …
+ * 'claude-6'); each visible one is its own card, keyed by id, with Claude's mark and hue. With one account
+ * the widget looks exactly as it did before accounts existed.
  */
 (function () {
   'use strict';
@@ -20,7 +25,6 @@
   // ---------------------------------------------------------------------------
   // Constants
   // ---------------------------------------------------------------------------
-  const PROVIDER_ORDER = ['claude', 'codex'];
   const PROVIDER_HUE = { claude: '217,119,87', codex: '16,163,127' };
   const HUE_ON = '52,211,153';
   const HUE_OFF = '160,160,175';
@@ -59,6 +63,17 @@
   const LOCAL_RELAY_HOSTS = ['localhost', '127.0.0.1', '[::1]'];
   const COPIED_FEEDBACK_MS = 1500;
 
+  // Claude account sources (settings.claudeAccounts[i].source). The Keychain one is offered on macOS only.
+  const SOURCE_LABELS = {
+    claude_code: 'Claude Code folder',
+    claude_web: 'claude.ai sign-in',
+    claude_keychain: 'Claude Code Keychain',
+  };
+  const DEFAULT_FOLDER_PLACEHOLDER = '~/.claude (default)';
+  const LABEL_MAX = 40;
+  const CONFIG_DIR_MAX = 1024;
+  const SETTINGS_SCREEN_MARGIN = 16; // px kept free below a settings view capped at the screen's work area
+
   const ICONS = {
     claude: '<svg viewBox="0 0 24 24" aria-hidden="true"><g stroke="#d97757" stroke-width="2.6" stroke-linecap="round" style="filter: drop-shadow(0 0 3px rgba(217,119,87,0.55))">'
       + '<line x1="14.4" y1="12" x2="22" y2="12"/><line x1="14.08" y1="13.2" x2="18.93" y2="16"/><line x1="13.2" y1="14.08" x2="16.75" y2="20.23"/>'
@@ -71,14 +86,16 @@
     generic: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="6" fill="#8b5cf6" style="filter: drop-shadow(0 0 3px rgba(139,92,246,0.55))"/></svg>',
     chevronDown: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>',
     ring: '<svg class="ring" viewBox="0 0 24 24" aria-hidden="true"><circle class="bg" cx="12" cy="12" r="10"/><circle class="fg" cx="12" cy="12" r="10" style="stroke-dashoffset: 62.83"/></svg>',
-    alert: '<svg class="auth-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>',
+    // Legend line sample (several accounts): stroke colour from --sc, stroke-dasharray = the account's dash.
+    dash: '<svg viewBox="0 0 18 6" width="18" height="6" aria-hidden="true"><line x1="0" y1="3" x2="18" y2="3"/></svg>',
+    alert: '<svg class="auth-icon"viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>',
   };
 
   // ---------------------------------------------------------------------------
   // State
   // ---------------------------------------------------------------------------
   const state = {
-    settings: Object.assign({}, SETTINGS_DEFAULTS),
+    settings: withDefaults(null),
     snapshot: null,
     history: null,
     refreshing: false,
@@ -89,9 +106,9 @@
     compactPending: false, // compact preference while the full-width (non-compact) settings view is open
     appInfo: null,
     loading: true,
-    orgs: [],
-    webStatus: '',
-    webBusy: false,
+    // claude.ai sign-in UI per account id: { busy, status, orgs } (see webState()).
+    web: {},
+    confirmRemove: null,   // account id whose inline "Remove?" confirmation is showing
     // Phone sync (docs/PHONE-SYNC.md). `status` mirrors phone-sync-status; the rest is transient UI state.
     phone: {
       status: null,        // { enabled, relayUrl, paired, keyPersisted, lastPushAt, lastError, nextRetryAt, slotId }
@@ -208,7 +225,16 @@
     s.warnThreshold = clampThreshold(s.warnThreshold, 75);
     s.dangerThreshold = clampThreshold(s.dangerThreshold, 90);
     s.refreshInterval = String(s.refreshInterval || SETTINGS_DEFAULTS.refreshInterval);
+    // From `raw`, not the merged object: a 1.0.x settings object without the list describes account 1
+    // through claudeSource / claudeOrganizationId.
+    s.claudeAccounts = F.accountsFromSettings(raw);
     return s;
+  }
+
+  /** Changes whenever a chart label would (accounts added, removed or renamed). */
+  function accountNamesKey(s) {
+    const accounts = F.accountsFromSettings(s);
+    return accounts.map((a) => a.id + ':' + F.accountDisplayName(a, accounts)).join('|');
   }
 
   function clampThreshold(v, fallback) {
@@ -226,7 +252,8 @@
     state.graphVisible = !!s.graphVisible;
     state.expanded = Object.assign({}, s.expandedOpen);
     if (!prev || prev.theme !== s.theme || prev.timeFormat !== s.timeFormat
-      || prev.dangerThreshold !== s.dangerThreshold || prev.warnThreshold !== s.warnThreshold) chartDirty = true;
+      || prev.dangerThreshold !== s.dangerThreshold || prev.warnThreshold !== s.warnThreshold
+      || accountNamesKey(prev) !== accountNamesKey(s)) chartDirty = true;
     applyBackground(); // before the theme: Clear Acrylic forces the light palette
     applyTheme();
   }
@@ -299,11 +326,21 @@
     els.settingsView.hidden = !state.settingsOpen;
 
     renderTitleBar();
+    capSettingsHeight();
     if (state.settingsOpen) renderSettings();
     else if (compactVisible) renderCompact();
     else renderNormal();
 
     measureAndResize(forceResize);
+  }
+
+  /**
+   * Settings can outgrow the screen (six accounts, the pairing QR): the view stops at the work area and its
+   * rows scroll (styles.css), instead of a window taller than the screen with the bottom out of reach.
+   */
+  function capSettingsHeight() {
+    const avail = window.screen ? window.screen.availHeight : 0;
+    els.settingsView.style.maxHeight = state.settingsOpen && avail > 300 ? (avail - SETTINGS_SCREEN_MARGIN) + 'px' : '';
   }
 
   function renderTitleBar() {
@@ -318,16 +355,53 @@
   // ---------------------------------------------------------------------------
   // Rendering — normal view
   // ---------------------------------------------------------------------------
-  /** Known providers first, then anything else present in the object (data-driven, no fixed pair). */
+  /** Claude accounts by slot, then Codex, then any other id present (data-driven, no fixed pair). */
   function orderedIds(obj) {
-    const keys = Object.keys(obj || {});
-    return PROVIDER_ORDER.filter((id) => keys.includes(id)).concat(keys.filter((id) => !PROVIDER_ORDER.includes(id)));
+    return F.orderProviderIds(Object.keys(obj || {}));
   }
 
+  /** Ids the skeleton draws before the first snapshot: the configured accounts + the other providers, visible ones. */
   function enabledProviderIds() {
     const p = state.settings.providers || {};
-    const ids = orderedIds(Object.assign({}, SETTINGS_DEFAULTS.providers, p));
+    const others = Object.keys(Object.assign({}, SETTINGS_DEFAULTS.providers, p)).filter((id) => !F.isClaudeId(id));
+    const ids = F.orderProviderIds(state.settings.claudeAccounts.map((a) => a.id).concat(others));
     return ids.filter((id) => p[id] !== false);
+  }
+
+  function accountById(id) {
+    return state.settings.claudeAccounts.find((a) => a.id === id) || null;
+  }
+
+  function multiAccount() {
+    return state.settings.claudeAccounts.length > 1;
+  }
+
+  /**
+   * Card / legend / compact name. For a Claude account it follows the settings at once — the same display
+   * name main stamps on the snapshot (accounts.accountDisplayName), without waiting a refresh after a rename.
+   */
+  function nameOf(p) {
+    const acc = F.isClaudeId(p.id) ? accountById(p.id) : null;
+    if (acc) return F.accountDisplayName(acc, state.settings.claudeAccounts);
+    return p.name || p.id;
+  }
+
+  /**
+   * Compact rows with several accounts: the account's own label, else "C<slot>" (the phone widget's short
+   * name), so "C2 FABLE 7D" fits the label column where "CLAUDE 2 FABLE 7D" cannot.
+   */
+  function compactNameOf(p) {
+    const acc = F.isClaudeId(p.id) ? accountById(p.id) : null;
+    if (!acc) return nameOf(p);
+    return acc.label && acc.label.trim() ? acc.label.trim() : 'C' + F.claudeSlot(p.id);
+  }
+
+  function iconFor(pid) {
+    return ICONS[F.isClaudeId(pid) ? 'claude' : pid] || ICONS.generic;
+  }
+
+  function hueFor(pid) {
+    return PROVIDER_HUE[F.isClaudeId(pid) ? 'claude' : pid] || '139,92,246';
   }
 
   /** Providers present in the snapshot; `null` entries (disabled providers) drop out → no card. */
@@ -402,9 +476,10 @@
   }
 
   function createEmptyCard() {
+    const both = state.settings.claudeAccounts.length === 1; // one Claude account + Codex
     return h('div', { class: 'card' },
       h('div', { class: 'msg-row' },
-        'Both providers are turned off. ',
+        (both ? 'Both' : 'All') + ' providers are turned off. ',
         h('button', { class: 'pill-btn', type: 'button', text: 'Open Settings', onclick: openSettings, style: 'margin-left: 8px' })));
   }
 
@@ -415,9 +490,10 @@
       html: ICONS.chevronDown, onclick: () => toggleExpanded(pid),
     });
     const prov = h('div', { class: 'prov' },
-      svgFrom(ICONS[pid] || ICONS.generic, 'mark'),
+      svgFrom(iconFor(pid), 'mark'),
       h('span', { class: 'name' }),
-      h('span', { class: 'chip plan', style: '--h:' + (PROVIDER_HUE[pid] || '139,92,246') }),
+      h('span', { class: 'acct', hidden: true }),
+      h('span', { class: 'chip plan', style: '--h:' + hueFor(pid) }),
       h('span', { class: 'dot', role: 'img' }),
       h('span', { class: 'updated' }),
       expandBtn);
@@ -453,7 +529,19 @@
   function updateCard(card, p) {
     const now = Date.now();
     const pid = p.id;
-    card.querySelector('.name').textContent = p.name || pid;
+    const name = nameOf(p);
+    const nameEl = card.querySelector('.name');
+    nameEl.textContent = name;
+    const long = name.length > 24; // a long account label ellipsizes (styles.css .name.long)
+    setClass(nameEl, 'long', long);
+    nameEl.title = long ? name : '';
+
+    // Several Claude accounts: which account a card is, as a muted subtitle (a lone account looks as before).
+    const acct = card.querySelector('.acct');
+    const account = F.isClaudeId(pid) && multiAccount() && typeof p.account === 'string' ? p.account.trim() : '';
+    acct.hidden = !account;
+    acct.textContent = account;
+    acct.title = account;
 
     const chip = card.querySelector('.chip.plan');
     chip.hidden = !p.plan;
@@ -603,7 +691,6 @@
   function renderAuthRow(el, p, show) {
     el.hidden = !show;
     if (!show) return;
-    const s = state.settings;
     el.className = 'auth-row' + (p.status === 'error' ? ' err' : '');
     const msg = (p.error && p.error.message) || (p.status === 'auth_required' ? 'Sign-in required' : 'Could not fetch usage');
     let hint = '';
@@ -611,15 +698,20 @@
     let action = () => doRefresh();
     let disabled = state.refreshing;
     if (p.status === 'auth_required') {
-      // Keyed off the credential source reported in the snapshot (id is only a fallback).
-      const source = p.source || (p.id === 'claude' ? s.claudeSource : (p.id === 'codex' ? 'codex_auth_file' : ''));
+      // Keyed off the credential source reported in the snapshot (the account's setting is only a fallback).
+      const acc = F.isClaudeId(p.id) ? accountById(p.id) : null;
+      const source = p.source || (acc ? acc.source : (p.id === 'codex' ? 'codex_auth_file' : ''));
       if (source === 'claude_web') {
-        btnLabel = state.webBusy ? 'Waiting…' : 'Sign in';
-        action = claudeWebLogin;
-        disabled = state.webBusy;
+        // Signs in THIS account (its own claude.ai session), not account 1.
+        const ws = webState(p.id);
+        btnLabel = ws.busy ? 'Waiting…' : 'Sign in';
+        action = () => claudeWebLogin(p.id);
+        disabled = ws.busy;
         hint = 'Opens the claude.ai login window.';
       } else if (source === 'claude_code') {
         hint = 'Run any Claude Code command to refresh the token, then retry.';
+      } else if (source === 'claude_keychain') {
+        hint = 'The widget only reads the Keychain; it never signs in or refreshes the token.';
       } else if (source === 'codex_auth_file') {
         hint = 'Sign in to Codex with ChatGPT (codex login), then retry.';
       }
@@ -817,11 +909,18 @@
     const wkey = parts.slice(1).join('.');
     const p = state.snapshot && state.snapshot.providers && state.snapshot.providers[pid];
     if (p) {
-      if (wkey === 'extra') return (p.name || pid) + ' extra';
+      if (!p.id) p.id = pid;
+      const name = nameOf(p);
+      if (wkey === 'extra') return name + ' extra';
       const win = windowsOf(p).find((w) => w.key === wkey);
-      if (win) return F.seriesLabel(p.name || pid, win);
+      if (win) return F.seriesLabel(name, win, multiAccount() && F.isClaudeId(pid));
     }
     return series.label || series.key || '?';
+  }
+
+  /** Series key → its provider id ("claude-2.session" → "claude-2"), for the per-account dash pattern. */
+  function seriesProvider(series) {
+    return String(series.key || '').split('.')[0];
   }
 
   function seriesHex(series) {
@@ -834,13 +933,18 @@
   function renderLegend(hist) {
     const series = (hist && hist.series) || [];
     const items = series.map((sr, i) => ({ key: sr.key, sr, i }));
+    // Several Claude accounts share the window colours, so the legend shows each line's dash instead of a dot.
+    const dashed = multiAccount();
+    setClass(els.legend, 'dashed', dashed);
     reconcile(els.legend, items, (it) => 'legend-' + it.key,
       (it) => h('button', {
         class: 'legend-item', type: 'button', 'aria-pressed': 'true',
         onclick: () => toggleSeries(it.key),
-      }, h('i'), h('span')),
+      }, h('i'), svgFrom(ICONS.dash, 'dash'), h('span')),
       (node, it) => {
         node.style.setProperty('--sc', seriesHex(it.sr));
+        const dash = F.accountDash(seriesProvider(it.sr));
+        node.querySelector('svg.dash line').setAttribute('stroke-dasharray', dashed && dash.length ? dash.join(' ') : 'none');
         node.querySelector('span').textContent = legendLabelFor(it.sr);
         const off = hiddenSeries.has(it.key);
         setClass(node, 'off', off);
@@ -929,6 +1033,7 @@
         borderColor: color,
         backgroundColor: color,
         borderWidth: 1.5,
+        borderDash: F.accountDash(seriesProvider(sr)), // accounts share window colours; slot 1 stays solid
         stepped: 'before',
         spanGaps: false,
         // Scales with explicit min/max get a 0px clip in Chart.js, which halves the live dot at x = now / y = 100.
@@ -1018,6 +1123,7 @@
   // ---------------------------------------------------------------------------
   function renderCompact() {
     const items = [];
+    setClass(els.compactView, 'multi', multiAccount()); // wider labels: "CLAUDE 2 5H" / "<label> 7D"
     if (!state.snapshot) {
       enabledProviderIds().forEach((id, i) => {
         items.push({ type: 'skeleton', key: 'sk-' + id + '-a', group: i > 0 });
@@ -1031,7 +1137,7 @@
         if (!wins.length) {
           const st = statusOf(p, Date.now());
           const note = st.cls === 'ok' ? 'No usage windows reported' : (st.line || st.title);
-          items.push({ type: 'note', key: p.id + '.__status', p, label: String(p.name || p.id).toUpperCase(), note, title: st.title, group: pi > 0, err: st.cls === 'err' });
+          items.push({ type: 'note', key: p.id + '.__status', p, label: String(nameOf(p)).toUpperCase(), note, title: st.title, group: pi > 0, err: st.cls === 'err' });
           return;
         }
         wins.forEach((w, i) => items.push({ type: 'win', key: p.id + '.' + (w.key !== undefined && w.key !== null ? w.key : 'w' + i), p, w, first: i === 0, group: pi > 0 && i === 0 }));
@@ -1063,7 +1169,7 @@
     }
     const pid = item.p ? item.p.id : null;
     if (item.type === 'note') {
-      mark.replaceChildren(pid ? svgFrom(ICONS[pid] || ICONS.generic) : h('i', { style: 'background:#8b5cf6' }));
+      mark.replaceChildren(pid ? svgFrom(iconFor(pid)) : h('i', { style: 'background:#8b5cf6' }));
       label.textContent = item.label;
       const note = row.querySelector('.cnote');
       note.textContent = item.note;
@@ -1075,17 +1181,26 @@
     const w = item.w;
     const color = w.color || 'purple';
     if (item.first) {
-      if (!mark.querySelector('svg')) mark.replaceChildren(svgFrom(ICONS[pid] || ICONS.generic));
+      if (!mark.querySelector('svg')) mark.replaceChildren(svgFrom(iconFor(pid)));
     } else {
       let dot = mark.querySelector('i');
       if (!dot) { dot = h('i'); mark.replaceChildren(dot); }
       dot.style.background = SERIES_HEX[color] || SERIES_HEX.purple;
       dot.style.boxShadow = '0 0 5px ' + (SERIES_HEX[color] || SERIES_HEX.purple);
     }
-    const text = F.compactLabel(item.p.name || pid, w);
-    label.textContent = text;
+    const name = nameOf(item.p);
+    const multi = multiAccount();
+    setClass(label, 'split', multi);
+    if (multi) {
+      // Name and window in separate cells: a long account label ellipsizes, its "5H" / "7D" never does.
+      const parts = F.compactLabelParts(compactNameOf(item.p), w, true);
+      label.replaceChildren(h('span', { class: 'cbase', text: parts.base }), h('span', { class: 'cwin', text: ' ' + parts.win }));
+    } else {
+      label.textContent = F.compactLabel(name, w);
+    }
     const cnote = typeof w.note === 'string' && w.note.trim() ? w.note.trim() : null;
-    label.title = (item.p.name || pid) + ' · ' + (w.label || w.key) + (cnote ? ' — ' + cnote : '');
+    const who = multi && F.isClaudeId(pid) && item.p.account ? name + ' (' + item.p.account + ')' : name;
+    label.title = who + ' · ' + (w.label || w.key) + (cnote ? ' — ' + cnote : '');
     const pct = F.clampPercent(w.percent);
     const thr = w.severity === 'blocked' ? 'danger' : F.thresholdClass(w.percent, s.warnThreshold, s.dangerThreshold);
     const fill = row.querySelector('.fill');
@@ -1149,32 +1264,14 @@
     els.backgroundClearHint.textContent = mac ? 'Clear Glass uses dark text' : 'Clear Acrylic uses dark text';
     els.backgroundClearHint.hidden = s.background !== 'acrylic_clear';
 
-    setChecked(els.providerClaudeToggle, s.providers.claude !== false);
     setChecked(els.providerCodexToggle, s.providers.codex !== false);
 
-    setValue(els.claudeSourceSelect, s.claudeSource || 'claude_code');
-    const web = s.claudeSource === 'claude_web';
-    const claude = state.snapshot && state.snapshot.providers && state.snapshot.providers.claude;
-    const signedIn = web && claude && claude.source === 'claude_web' && claude.status !== 'auth_required';
-    els.claudeWebLoginBtn.hidden = !web || (signedIn && !state.webBusy);
-    els.claudeWebLoginBtn.disabled = state.webBusy;
-    els.claudeWebLoginBtn.textContent = state.webBusy ? 'Waiting…' : 'Log in';
-    els.claudeWebLogoutBtn.hidden = !web || !signedIn;
-    const orgs = Array.isArray(state.orgs) ? state.orgs : [];
-    els.claudeOrgSelect.hidden = !web || orgs.length < 2;
-    if (web && orgs.length >= 2 && document.activeElement !== els.claudeOrgSelect) {
-      els.claudeOrgSelect.replaceChildren.apply(els.claudeOrgSelect, orgs.map((o) => h('option', {
-        value: o.id, text: o.name + (o.isTeam ? ' (Team)' : ''),
-        selected: o.id === s.claudeOrganizationId ? true : null,
-      })));
-    }
-    const status = web ? (state.webStatus || (signedIn ? (claude.account ? 'Signed in as ' + claude.account : 'Signed in') : 'Not signed in')) : '';
-    els.claudeWebStatus.hidden = !web || !status;
-    els.claudeWebStatus.textContent = status;
-    els.claudeWebStatus.title = status;
-    setClass(els.claudeWebStatus, 'err', /fail|expired|error|invalid/i.test(status));
+    renderAccounts();
 
     setChecked(els.tokenAutoRefreshToggle, s.tokenAutoRefresh !== false);
+    // The tray badges follow account 1 (provider id 'claude'): the option carries its name.
+    const trayClaude = els.trayStatsSelect.querySelector('option[value="claude"]');
+    if (trayClaude) trayClaude.textContent = F.accountDisplayName(s.claudeAccounts[0], s.claudeAccounts);
     setValue(els.trayStatsSelect, s.trayStats || 'off');
 
     if (document.activeElement !== els.warnThreshold && document.activeElement !== els.dangerThreshold) {
@@ -1199,6 +1296,287 @@
     renderPhoneSettings();
 
     els.versionLabel.textContent = 'AI Usage Widget' + (info.version ? ' v' + info.version : '');
+  }
+
+  // ---------------------------------------------------------------------------
+  // Settings — Claude accounts (one block per account, keyed by id)
+  // ---------------------------------------------------------------------------
+  // Every change saves the FULL list — saveSettings({ claudeAccounts }) — which main replaces and sanitizes.
+  // Text fields commit on change / blur / Enter, never per keystroke, and a focused field is never written
+  // by a re-render (snapshots keep arriving while the user types).
+
+  function isMac() {
+    return !!(state.appInfo && state.appInfo.platform === 'darwin');
+  }
+
+  /** claude.ai sign-in UI of one account: login in flight, the last action's status line, its org list. */
+  function webState(id) {
+    if (!state.web[id]) state.web[id] = { busy: false, status: '', statusAt: 0, orgs: [] };
+    return state.web[id];
+  }
+
+  function setWebStatus(id, text) {
+    const ws = webState(id);
+    ws.status = text;
+    ws.statusAt = Date.now();
+  }
+
+  function saveAccount(id, changes) {
+    const list = state.settings.claudeAccounts.map((a) => Object.assign({}, a, a.id === id ? changes : null));
+    return saveSettings({ claudeAccounts: list });
+  }
+
+  /** One-line help under a folder-based account (also the folder field's tooltip). */
+  function sourceHint(source) {
+    if (source === 'claude_keychain') return 'Read-only: the widget never refreshes this login, so keep using the folder in Claude Code';
+    if (isMac()) return 'macOS keeps Claude Code logins in the Keychain, not in this folder: use claude.ai sign-in or the Keychain';
+    return 'The account\'s Claude Code config folder (CLAUDE_CONFIG_DIR); empty = CLAUDE_CONFIG_DIR or ~/.claude';
+  }
+
+  /**
+   * The line under an account block → { text, cls }. In order: a login in flight, the duplicate notice,
+   * a sign-in action newer than the snapshot, "hidden" (a hidden account is not fetched), what the snapshot
+   * says (signed in as / its error), a claude.ai status that explains "not signed in" better than the
+   * snapshot can, the source's help text.
+   */
+  function accountStatus(acc) {
+    const snap = state.snapshot;
+    const web = acc.source === 'claude_web';
+    const ws = webState(acc.id);
+    const webCls = /fail|expired|error|invalid/i.test(ws.status) ? 'error' : '';
+    if (web && ws.busy) return { text: ws.status, cls: '' };
+    const firstId = snap && snap.duplicates && typeof snap.duplicates[acc.id] === 'string' ? snap.duplicates[acc.id] : null;
+    if (firstId) {
+      const first = accountById(firstId);
+      const firstName = first ? F.accountDisplayName(first, state.settings.claudeAccounts) : firstId;
+      return { text: 'Same account as ' + firstName + ' - shown once', cls: 'warn' };
+    }
+    if (web && ws.status && ws.statusAt > ((snap && snap.fetchedAt) || 0)) return { text: ws.status, cls: webCls };
+    if (state.settings.providers[acc.id] === false) return { text: 'Hidden from the widget', cls: '' };
+    const p = snap && snap.providers && snap.providers[acc.id];
+    // A snapshot from before a source switch says nothing about the new source.
+    const current = p && typeof p === 'object' && p.source === acc.source ? p : null;
+    if (current && (current.status === 'ok' || current.status === 'stale')) {
+      const msg = current.error && typeof current.error.message === 'string' ? current.error.message.trim() : '';
+      if (current.status === 'stale' && msg) return { text: msg, cls: 'warn' };
+      return { text: (current.account ? 'Signed in as ' + current.account : 'Signed in') + (current.plan ? ' · ' + current.plan : ''), cls: '' };
+    }
+    if (web && ws.status) return { text: ws.status, cls: webCls };
+    if (current) {
+      if (web && current.status === 'auth_required') return { text: 'Not signed in', cls: '' };
+      const msg = current.error && typeof current.error.message === 'string' ? current.error.message.trim() : '';
+      return { text: msg || 'Could not fetch usage', cls: 'error' };
+    }
+    return { text: web ? 'Not signed in' : sourceHint(acc.source), cls: '' };
+  }
+
+  /** Text fields commit on change / blur / Enter (Enter also leaves the field), never per keystroke. */
+  function commitOnChange(input, commit) {
+    input.addEventListener('change', commit);
+    input.addEventListener('blur', commit);
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); commit(); input.blur(); }
+    });
+  }
+
+  function commitAccountText(id, field, raw, max) {
+    const acc = accountById(id);
+    if (!acc) return; // removed while the field still had focus
+    const value = String(raw || '').trim().slice(0, max);
+    if (value === acc[field]) { render(); return; } // unchanged: the re-render tidies the field once it is left
+    const change = {};
+    change[field] = value;
+    saveAccount(id, change).then(() => { if (field === 'configDir') doRefresh(); });
+  }
+
+  function createAccountBlock(acc) {
+    const id = acc.id;
+    const show = h('input', { type: 'checkbox', class: 'acct-show', onchange: (e) => saveSettings({ providers: { [id]: e.target.checked } }) });
+    const label = h('input', { type: 'text', class: 'sinput acct-label', maxlength: String(LABEL_MAX), spellcheck: 'false', autocomplete: 'off' });
+    const folder = h('input', {
+      type: 'text', class: 'sinput acct-folder', maxlength: String(CONFIG_DIR_MAX), placeholder: DEFAULT_FOLDER_PLACEHOLDER,
+      spellcheck: 'false', autocomplete: 'off',
+    });
+    commitOnChange(label, () => commitAccountText(id, 'label', label.value, LABEL_MAX));
+    commitOnChange(folder, () => commitAccountText(id, 'configDir', folder.value, CONFIG_DIR_MAX));
+    // updateAccountBlock adds the Keychain option where it is offered (keychainOffered).
+    const source = h('select', { class: 'sselect acct-source', onchange: (e) => changeSource(id, e.target.value) },
+      h('option', { value: 'claude_code', text: SOURCE_LABELS.claude_code }),
+      h('option', { value: 'claude_web', text: SOURCE_LABELS.claude_web }));
+    return h('div', { class: 'srow full account' },
+      h('div', { class: 'scol wide' },
+        h('span', { class: 'slabel' }),
+        h('div', { class: 'scontrol' },
+          h('label', { class: 'toggle' }, show, h('span', { class: 'slider' })),
+          label,
+          source,
+          h('button', { class: 'small-btn danger acct-remove', type: 'button', text: 'Remove', onclick: () => askRemoveAccount(id) })),
+        h('div', { class: 'scontrol acct-line acct-folder-line' }, folder),
+        h('div', { class: 'scontrol acct-line acct-web-line' },
+          h('button', { class: 'small-btn acct-login', type: 'button', text: 'Log in', onclick: () => claudeWebLogin(id) }),
+          h('button', { class: 'small-btn danger acct-logout', type: 'button', text: 'Log out', onclick: () => claudeWebLogout(id) }),
+          h('select', { class: 'sselect acct-org', onchange: (e) => selectOrg(id, e.target.value) })),
+        h('span', { class: 'shint acct-status' }),
+        h('div', { class: 'confirm-row acct-confirm', role: 'alertdialog', hidden: true },
+          h('span', { class: 'confirm-text' }),
+          h('button', { class: 'small-btn danger acct-confirm-yes', type: 'button', text: 'Remove', onclick: () => removeAccount(id) }),
+          h('button', { class: 'small-btn acct-confirm-no', type: 'button', text: 'Cancel', onclick: cancelRemoveAccount }))));
+  }
+
+  function updateAccountBlock(block, acc) {
+    const accounts = state.settings.claudeAccounts;
+    const id = acc.id;
+    const slot = F.claudeSlot(id);
+    const name = F.accountDisplayName(acc, accounts);
+    const visible = state.settings.providers[id] !== false;
+    const web = acc.source === 'claude_web';
+
+    setClass(block.querySelector('.scol'), 'disabled', !visible);
+    block.querySelector('.slabel').textContent = 'Account ' + slot;
+
+    const show = block.querySelector('.acct-show');
+    setChecked(show, visible);
+    show.setAttribute('aria-label', 'Show ' + name);
+    show.parentElement.title = visible ? 'Shown in the widget' : 'Hidden from the widget';
+
+    const label = block.querySelector('.acct-label');
+    label.placeholder = F.accountDisplayName(Object.assign({}, acc, { label: '' }), accounts);
+    label.title = 'Name shown on the card, the phone and the alerts';
+    label.setAttribute('aria-label', 'Name of account ' + slot);
+    setValue(label, acc.label);
+
+    const source = block.querySelector('.acct-source');
+    const keychainOption = source.querySelector('option[value="claude_keychain"]');
+    const wantKeychain = keychainOffered();
+    if (wantKeychain && !keychainOption) source.append(h('option', { value: 'claude_keychain', text: SOURCE_LABELS.claude_keychain }));
+    else if (!wantKeychain && keychainOption) keychainOption.remove();
+    source.setAttribute('aria-label', 'Source of ' + name);
+    setValue(source, acc.source);
+
+    // Account 1 can never be removed; its button keeps its space so every block's controls line up.
+    const remove = block.querySelector('.acct-remove');
+    remove.style.visibility = id === 'claude' ? 'hidden' : '';
+    remove.disabled = id === 'claude';
+    remove.setAttribute('aria-label', 'Remove ' + name);
+
+    const folderLine = block.querySelector('.acct-folder-line');
+    folderLine.hidden = web;
+    const folder = folderLine.querySelector('.acct-folder');
+    folder.title = sourceHint(acc.source);
+    folder.setAttribute('aria-label', 'Claude Code folder of ' + name);
+    setValue(folder, acc.configDir);
+
+    const webLine = block.querySelector('.acct-web-line');
+    webLine.hidden = !web;
+    if (web) {
+      const ws = webState(id);
+      const snap = state.snapshot;
+      const p = snap && snap.providers && snap.providers[id];
+      // A duplicate's own card is gone, but it was only merged because it fetched fine: it is signed in.
+      const signedIn = !!(snap && snap.duplicates && snap.duplicates[id])
+        || !!(p && p.source === 'claude_web' && p.status !== 'auth_required');
+      const login = webLine.querySelector('.acct-login');
+      login.hidden = signedIn && !ws.busy;
+      login.disabled = ws.busy;
+      login.textContent = ws.busy ? 'Waiting…' : 'Log in';
+      webLine.querySelector('.acct-logout').hidden = !signedIn;
+      const org = webLine.querySelector('.acct-org');
+      const orgs = Array.isArray(ws.orgs) ? ws.orgs : [];
+      org.hidden = orgs.length < 2;
+      org.setAttribute('aria-label', 'claude.ai organisation of ' + name);
+      // Rebuilt only when the list or the selection changed, and never under an open dropdown.
+      const sig = JSON.stringify([orgs, acc.organizationId]);
+      if (orgs.length >= 2 && org.dataset.sig !== sig && document.activeElement !== org) {
+        org.dataset.sig = sig;
+        org.replaceChildren.apply(org, orgs.map((o) => h('option', {
+          value: o.id, text: o.name + (o.isTeam ? ' (Team)' : ''),
+          selected: o.id === acc.organizationId ? true : null,
+        })));
+      }
+    }
+
+    const st = accountStatus(acc);
+    const status = block.querySelector('.acct-status');
+    status.hidden = !st.text;
+    status.textContent = st.text;
+    status.title = st.text;
+    status.className = 'shint acct-status' + (st.cls ? ' ' + st.cls : '');
+
+    const confirm = block.querySelector('.acct-confirm');
+    const asking = state.confirmRemove === id;
+    confirm.hidden = !asking;
+    confirm.setAttribute('aria-label', 'Confirm removing ' + name);
+    if (asking) {
+      confirm.querySelector('.confirm-text').textContent = 'Remove ' + name + '? '
+        + (web ? 'Its claude.ai sign-in is deleted.' : 'The Claude Code folder itself is not touched.');
+    }
+  }
+
+  /** macOS only — unless an account already uses it (then every block offers it, so the selects line up). */
+  function keychainOffered() {
+    return isMac() || state.settings.claudeAccounts.some((a) => a.source === 'claude_keychain');
+  }
+
+  function renderAccounts() {
+    const accounts = state.settings.claudeAccounts;
+    if (state.confirmRemove && !accountById(state.confirmRemove)) state.confirmRemove = null;
+    setClass(els.claudeAccounts, 'keychain', keychainOffered());
+    reconcile(els.claudeAccounts, accounts, (a) => a.id, createAccountBlock, updateAccountBlock);
+    const full = accounts.length >= F.MAX_ACCOUNTS;
+    els.addAccountBtn.disabled = full;
+    els.addAccountBtn.title = full ? 'Up to ' + F.MAX_ACCOUNTS + ' Claude accounts' : '';
+    els.accountsMacHint.hidden = !isMac();
+  }
+
+  function addAccount() {
+    const accounts = state.settings.claudeAccounts;
+    const id = F.nextAccountId(accounts);
+    if (!id || accounts.length >= F.MAX_ACCOUNTS) return;
+    // A claude.ai sign-in on macOS, where Claude Code keeps its tokens in the Keychain; a folder elsewhere.
+    const added = { id, label: '', source: isMac() ? 'claude_web' : 'claude_code', configDir: '', organizationId: null };
+    const list = accounts.concat([added]).map((a) => Object.assign({}, a))
+      .sort((a, b) => F.claudeSlot(a.id) - F.claudeSlot(b.id));
+    delete state.web[id]; // a slot freed by a removal starts clean
+    saveSettings({ claudeAccounts: list, providers: { [id]: true } });
+    // saveSettings renders the optimistic list synchronously: the new block exists now (focus scrolls to it).
+    const block = els.claudeAccounts.querySelector('[data-key="' + id + '"]');
+    if (block) block.querySelector('.acct-label').focus();
+  }
+
+  function askRemoveAccount(id) {
+    if (id === 'claude') return;
+    state.confirmRemove = id;
+    render();
+    const block = els.claudeAccounts.querySelector('[data-key="' + id + '"]');
+    if (block) block.querySelector('.acct-confirm-no').focus({ preventScroll: true }); // safe default under the keyboard
+  }
+
+  function cancelRemoveAccount() {
+    const id = state.confirmRemove;
+    state.confirmRemove = null;
+    render();
+    const block = id && els.claudeAccounts.querySelector('[data-key="' + id + '"]');
+    if (block) block.querySelector('.acct-remove').focus({ preventScroll: true });
+  }
+
+  /** Main disposes the account: a claude.ai sign-in is logged out and its stored session deleted. */
+  function removeAccount(id) {
+    if (id === 'claude' || !accountById(id)) return;
+    state.confirmRemove = null;
+    delete state.web[id];
+    saveSettings({ claudeAccounts: state.settings.claudeAccounts.filter((a) => a.id !== id).map((a) => Object.assign({}, a)) });
+    els.addAccountBtn.focus({ preventScroll: true }); // the focused Remove button is gone
+  }
+
+  async function changeSource(id, source) {
+    const acc = accountById(id);
+    if (!acc || acc.source === source) return;
+    const ws = webState(id);
+    ws.status = '';
+    ws.orgs = [];
+    await saveAccount(id, { source });
+    if (source === 'claude_web') loadOrgs(id);
+    doRefresh();
   }
 
   // ---------------------------------------------------------------------------
@@ -1525,7 +1903,7 @@
     if (!series.length) {
       // Derive descriptors from the current snapshot when main did not provide them.
       providerList().forEach((p) => windowsOf(p).forEach((w) => {
-        series.push({ key: p.id + '.' + w.key, label: (p.name || p.id) + ' · ' + w.label, color: w.color || 'purple' });
+        series.push({ key: p.id + '.' + w.key, label: nameOf(p) + ' · ' + w.label, color: w.color || 'purple' });
       }));
     }
     return { samples, series };
@@ -1586,7 +1964,7 @@
     state.settingsOpen = true;
     state.compactPending = state.compact;
     if (state.compact) safeCall('setCompactMode', false);
-    if (state.settings.claudeSource === 'claude_web') loadOrgs();
+    state.settings.claudeAccounts.forEach((a) => { if (a.source === 'claude_web') loadOrgs(a.id); });
     loadPhoneStatus();
     render(true);
     els.doneBtn.focus({ preventScroll: true });
@@ -1601,6 +1979,7 @@
     state.phone.confirmUnpair = false;
     state.phone.testResult = null;
     setPairHint('');
+    state.confirmRemove = null;
     const wantCompact = !!state.compactPending;
     if (wantCompact !== state.compact) {
       state.compact = wantCompact;
@@ -1613,34 +1992,44 @@
     if (!els.settingsBtn.hidden) els.settingsBtn.focus({ preventScroll: true });
   }
 
-  async function loadOrgs() {
-    const orgs = await safeInvoke('claudeWebOrgs');
-    state.orgs = Array.isArray(orgs) ? orgs : [];
+  // claude.ai sign-in, per account: every account has its own session (main keeps one partition each).
+  async function loadOrgs(id) {
+    const orgs = await safeInvoke('claudeWebOrgs', id);
+    webState(id).orgs = Array.isArray(orgs) ? orgs : [];
     if (state.settingsOpen) render();
   }
 
-  async function claudeWebLogin() {
-    if (state.webBusy) return;
-    state.webBusy = true;
-    state.webStatus = 'Waiting for the login window…';
+  async function claudeWebLogin(id) {
+    const ws = webState(id);
+    if (ws.busy) return;
+    ws.busy = true;
+    setWebStatus(id, 'Waiting for the login window…');
     render();
-    const r = await safeInvoke('claudeWebLogin');
+    const r = await safeInvoke('claudeWebLogin', id);
     if (r && r.success) {
-      state.webStatus = 'Signed in';
-      await loadOrgs();
+      setWebStatus(id, 'Signed in');
+      await loadOrgs(id);
       doRefresh();
     } else {
-      state.webStatus = (r && r.error) || 'Login failed';
+      setWebStatus(id, (r && r.error) || 'Login failed');
     }
-    state.webBusy = false;
+    ws.busy = false;
     render();
   }
 
-  async function claudeWebLogout() {
-    await safeInvoke('claudeWebLogout');
-    state.webStatus = 'Logged out';
-    state.orgs = [];
+  async function claudeWebLogout(id) {
+    await safeInvoke('claudeWebLogout', id);
+    setWebStatus(id, 'Logged out');
+    webState(id).orgs = [];
     render();
+    doRefresh();
+  }
+
+  async function selectOrg(id, orgId) {
+    // Main stores the choice as that account's organizationId and broadcasts settings-updated.
+    await safeInvoke('claudeWebSelectOrg', orgId, id);
+    const acc = accountById(id);
+    if (acc) acc.organizationId = orgId;
     doRefresh();
   }
 
@@ -1660,7 +2049,9 @@
     document.addEventListener('keydown', (e) => {
       if (e.key !== 'Escape' || !state.settingsOpen) return;
       e.preventDefault();
-      // Escape backs out of the inline Unpair confirmation / pairing reveal before it closes the view.
+      // Escape backs out of an inline confirmation (Remove account / Unpair) or the pairing reveal before it
+      // closes the view.
+      if (state.confirmRemove) { cancelRemoveAccount(); return; }
       if (state.phone.confirmUnpair) { state.phone.confirmUnpair = false; render(); return; }
       if (state.phone.showPairing) { state.phone.showPairing = false; render(); return; }
       closeSettings();
@@ -1695,21 +2086,9 @@
       const b = e.target.closest('.seg-btn');
       if (b && !b.disabled && b.dataset.bg) saveSettings({ background: b.dataset.bg });
     });
-    els.providerClaudeToggle.addEventListener('change', (e) => saveSettings({ providers: { claude: e.target.checked } }));
     els.providerCodexToggle.addEventListener('change', (e) => saveSettings({ providers: { codex: e.target.checked } }));
-    els.claudeSourceSelect.addEventListener('change', async (e) => {
-      await saveSettings({ claudeSource: e.target.value });
-      if (e.target.value === 'claude_web') loadOrgs();
-      doRefresh();
-    });
-    els.claudeWebLoginBtn.addEventListener('click', claudeWebLogin);
-    els.claudeWebLogoutBtn.addEventListener('click', claudeWebLogout);
-    els.claudeOrgSelect.addEventListener('change', async (e) => {
-      const id = e.target.value;
-      await safeInvoke('claudeWebSelectOrg', id);
-      state.settings.claudeOrganizationId = id;
-      doRefresh();
-    });
+    // Claude account blocks bind their own controls (createAccountBlock).
+    els.addAccountBtn.addEventListener('click', addAccount);
     els.tokenAutoRefreshToggle.addEventListener('change', (e) => saveSettings({ tokenAutoRefresh: e.target.checked }));
     els.trayStatsSelect.addEventListener('change', (e) => {
       const patch = { trayStats: e.target.value };
@@ -1778,8 +2157,10 @@
       renderTitleBar();
       armSpinnerSafety();
     });
-    safeCall('onClaudeWebSessionExpired', () => {
-      state.webStatus = 'claude.ai session expired — log in again';
+    safeCall('onClaudeWebSessionExpired', (payload) => {
+      // { accountId }; a payload without one is account 1 (the only claude.ai session before accounts).
+      const id = payload && typeof payload.accountId === 'string' ? payload.accountId : 'claude';
+      setWebStatus(id, 'claude.ai session expired — log in again');
       doRefresh();
     });
     safeCall('onPhoneSyncUpdated', (st) => {
@@ -1805,9 +2186,8 @@
       'mainView', 'compactBtn', 'headersRow', 'providers', 'graphCard', 'legend', 'usageChart', 'chartEmpty',
       'compactView', 'compactRows', 'expandBtn', 'settingsView', 'doneBtn', 'autoStartCol', 'autoStartToggle',
       'autoStartHint', 'hideFromTaskbarToggle', 'alwaysOnTopToggle', 'usageAlertsToggle', 'compactModeToggle',
-      'themeSeg', 'backgroundSeg', 'backgroundHint', 'backgroundClearHint', 'providerClaudeToggle', 'providerCodexToggle',
-      'claudeSourceSelect', 'claudeWebLoginBtn', 'claudeWebLogoutBtn', 'claudeOrgSelect', 'claudeWebStatus',
-      'tokenAutoRefreshToggle', 'trayStatsSelect', 'warnThreshold', 'dangerThreshold', 'thresholdHint',
+      'themeSeg', 'backgroundSeg', 'backgroundHint', 'backgroundClearHint', 'providerCodexToggle',
+      'claudeAccounts', 'addAccountBtn', 'accountsMacHint', 'tokenAutoRefreshToggle', 'trayStatsSelect', 'warnThreshold', 'dangerThreshold', 'thresholdHint',
       'timeFormatSelect', 'dateFormatSelect', 'refreshIntervalSelect', 'versionLabel',
       'phoneSyncToggle', 'phoneStatusLine', 'phoneRelayUrl', 'phoneTestBtn', 'phoneRelayHint', 'phonePairBtn',
       'phoneRepairBtn', 'phoneUnpairBtn', 'phonePushBtn', 'phoneUnpairConfirm', 'phoneUnpairYesBtn', 'phoneUnpairNoBtn',

@@ -2,17 +2,25 @@
 
 /**
  * claude.js — Claude provider via Claude Code credentials:
- *   ~/.claude/.credentials.json (claudeAiOauth) → GET https://api.anthropic.com/api/oauth/usage
+ *   <config folder>/.credentials.json (claudeAiOauth) → GET https://api.anthropic.com/api/oauth/usage
  *                                                (+ /api/oauth/profile at most once per hour,
  *                                                 + /api/oauth/organizations/<org>/prepaid/credits at most
  *                                                   once per 5 min when the spend panel is open / first fill)
  *
+ *   createClaudeCodeProvider({ id = 'claude', name = 'Claude', configDir = '', credentialStore = 'file' | 'keychain',
+ *                              keychain = require('./keychain'), platform = process.platform })
+ *     → { id, name, source: 'claude_code' | 'claude_keychain',
+ *         fetchSnapshot({ settings, fetch, now, log, lastGood, paths, timeoutMs }) → Promise<ProviderSnapshot>,
+ *         resetState(), _state() }
+ *       One instance per Claude account. `configDir` is the folder as typed ('' = CLAUDE_CONFIG_DIR, else ~/.claude;
+ *       keychain.resolveConfigDir). `name` may also be a function, so a relabelled account's messages stay current.
+ *
  *   module.exports = { id: 'claude', name: 'Claude', source: 'claude_code',
- *                      fetchSnapshot({ settings, fetch, now, log, lastGood, paths, timeoutMs }) → Promise<ProviderSnapshot>,
- *                      resetState(), getUserAgent(), setCliVersion(v), … }
+ *                      fetchSnapshot, resetState, _state          (a default instance: createClaudeCodeProvider())
+ *                      createClaudeCodeProvider, getUserAgent(), setCliVersion(v), … }
  *
  * fetchSnapshot NEVER throws. Test hooks: `paths.credentialsPath`, `paths.lockPath`, `lockOptions`, injected
- * `fetch` / `now`, `setCliVersion()` (skips running `claude --version`).
+ * `fetch` / `now`, `setCliVersion()` (skips running `claude --version`), an injected `keychain` / `platform`.
  *
  * The rules below come from research-claude.md (§1.3, §1.8, §1.9, §2.1–2.4, §8.5) and are binding:
  *
@@ -31,22 +39,31 @@
  *   401        can arrive before local expiresAt: re-read the file → retry once if the token changed → else
  *              refresh (rules above) → retry once → else auth_required.
  *   403        scope problem (setup-token) → auth_required http_403; no retry until the credentials change.
+ *   Keychain   (`credentialStore: 'keychain'`, macOS only) READ-ONLY: the tokens come from Claude Code's Keychain
+ *              item (keychain.js) and are NEVER refreshed or written. The widget cannot write that item the way
+ *              Claude Code does, and a refresh it could not persist would spend the single-use refresh token and
+ *              sign that folder out. A lapsed token, or a 401 whose re-read shows the same token, → token_expired /
+ *              http_401 "waiting for Claude Code to refresh it" (stale with last good, else error — never
+ *              auth_required: opening the folder in Claude Code fixes it). A changed token after a 401 is retried
+ *              once. No item → auth_required no_credentials; a Keychain read error → network / internal.
  *
- * Module state (per process): request floor, rate-limit park, refresh back-off / spacing, 403 park, profile
- * cache, prepaid-credits cache, detected CLI version. Nothing here ever logs a token.
+ * Instance state (per account): request floor + last result, rate-limit park, refresh back-off / spacing / file
+ * signature, 403 park, profile cache, prepaid-credits cache. Only the detected CLI version is per process. Nothing
+ * here ever logs a token.
  */
 
-const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const fsp = require('node:fs/promises');
 const { exec } = require('node:child_process');
 const tokens = require('./tokens');
+const keychainStore = require('./keychain');
 const { normalizeClaude } = require('./normalize');
 
-const id = 'claude';
-const name = 'Claude';
-const source = 'claude_code';
+const DEFAULT_ID = 'claude';
+const DEFAULT_NAME = 'Claude';
+const SOURCE_FILE = 'claude_code';
+const SOURCE_KEYCHAIN = 'claude_keychain';
 
 const API_BASE = 'https://api.anthropic.com';
 const USAGE_URL = `${API_BASE}/api/oauth/usage`;
@@ -79,6 +96,17 @@ const USAGE_PAYLOAD_KEYS = ['five_hour', 'seven_day', 'seven_day_oauth_apps', 's
 const SIGN_IN_EXPIRED = 'Claude Code sign-in expired - run claude to sign in again';
 const SCOPE_MESSAGE = 'Claude token lacks the user:profile scope (setup-token credentials cannot read usage) - run claude and log in again';
 const WAITING_PREFIX = 'Claude token expired - waiting for Claude Code to refresh it';
+const KEYCHAIN_MACOS_ONLY = 'The Keychain source is only available on macOS';
+
+/** Keychain store: the token lapsed or was rejected, and only Claude Code may refresh it. */
+function keychainWaitingMessage(name) {
+  return `${WAITING_PREFIX} (open ${name} in Claude Code)`;
+}
+/** Keychain store: no item for the folder (never signed in there, or /logout). `configDir` as typed. */
+function keychainMissingMessage(configDir) {
+  const folder = String(configDir || '').trim() || '~/.claude';
+  return `No Claude Code login in the Keychain for ${folder} - open it in Claude Code and run /login`;
+}
 
 // ---------------------------------------------------------------------------
 // User-Agent (research §1.3): look like Claude Code, version detected once per process
@@ -129,7 +157,7 @@ function setCliVersion(version) {
 const USER_AGENT_FALLBACK = userAgentFor(CLI_VERSION_FALLBACK);
 
 // ---------------------------------------------------------------------------
-// Module state
+// Instance state
 // ---------------------------------------------------------------------------
 
 function freshState() {
@@ -145,47 +173,57 @@ function freshState() {
     creditsCache: { orgUuid: null, fetchedAt: 0, payload: null },
   };
 }
-let state = freshState();
-
-/** Test hook — clears every per-process guard except the detected CLI version. */
-function resetState() {
-  state = freshState();
-}
 
 // ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
 
-function defaultConfigDir() {
-  return process.env.CLAUDE_CONFIG_DIR && process.env.CLAUDE_CONFIG_DIR.trim()
-    ? process.env.CLAUDE_CONFIG_DIR.trim()
-    : path.join(os.homedir(), '.claude');
-}
 function defaultCredentialsPath() {
-  return path.join(defaultConfigDir(), '.credentials.json');
+  return path.join(keychainStore.resolveConfigDir(''), '.credentials.json');
+}
+function credentialsPathFor(configDir) {
+  return path.join(keychainStore.resolveConfigDir(configDir), '.credentials.json');
 }
 function lockPathFor(credentialsPath) {
   return path.join(path.dirname(credentialsPath), tokens.CLAUDE_LOCK_NAME);
 }
 
-/** Short hash so a token never sits in module state / debug dumps. */
+/** Short hash so a token never sits in instance state / debug dumps. */
 function tokenKey(token) {
   return crypto.createHash('sha256').update(String(token == null ? '' : token)).digest('hex').slice(0, 16);
+}
+
+/** §4 identity hash: sha256(uuid) hex, first 16 — the raw uuid never leaves the provider. */
+function identityHash(uuid) {
+  return typeof uuid === 'string' && uuid ? crypto.createHash('sha256').update(uuid).digest('hex').slice(0, 16) : null;
+}
+
+/** §4 identity from the cached /api/oauth/profile payload (null without one) — what dedupe compares accounts by. */
+function identityFromProfile(profile) {
+  if (!profile || typeof profile !== 'object') return null;
+  const account = profile.account && typeof profile.account === 'object' ? profile.account : null;
+  const org = profile.organization && typeof profile.organization === 'object' ? profile.organization : null;
+  const type = org ? org.organization_type : null;
+  return {
+    account: identityHash(account && account.uuid),
+    org: identityHash(org && org.uuid),
+    personalOrg: typeof type === 'string' ? !/team|enterprise/i.test(type) : null,
+  };
 }
 
 /** Local wall-clock "HH:MM" for user-facing retry times / Retry-After parsing — shared with the Codex provider. */
 const { hhmm, retryAfterMs } = tokens;
 
-function makeSnapshot({ status, error = null, plan = null, account = null, updatedAt = 0, windows = [], extra = null, raw = null, skipNextCycle = false }) {
-  const snap = { id, name, status, error, source, plan, account, updatedAt, windows, extra, credits: null, raw: raw || {} };
+function makeSnapshot(self, { status, error = null, plan = null, account = null, updatedAt = 0, windows = [], extra = null, identity = null, raw = null, skipNextCycle = false }) {
+  const snap = { id: self.id, name: self.name, status, error, source: self.source, plan, account, updatedAt, windows, extra, credits: null, identity, raw: raw || {} };
   if (skipNextCycle) snap.skipNextCycle = true;
   return snap;
 }
 
-function failure(code, message, { lastGood, authRequired = false, raw = null, skipNextCycle = false }) {
+function failure(code, message, { self, lastGood, authRequired = false, raw = null, skipNextCycle = false }) {
   const hasLastGood = Boolean(lastGood && Array.isArray(lastGood.windows) && lastGood.windows.length);
   const status = authRequired ? 'auth_required' : hasLastGood ? 'stale' : 'error';
-  return makeSnapshot({
+  return makeSnapshot(self, {
     status,
     error: { code, message },
     plan: hasLastGood ? lastGood.plan : null,
@@ -193,6 +231,7 @@ function failure(code, message, { lastGood, authRequired = false, raw = null, sk
     updatedAt: hasLastGood ? lastGood.updatedAt : 0,
     windows: hasLastGood ? lastGood.windows : [],
     extra: hasLastGood ? lastGood.extra : null,
+    identity: hasLastGood && lastGood.identity ? lastGood.identity : null,
     raw,
     skipNextCycle,
   });
@@ -236,6 +275,21 @@ async function readCredentials(credentialsPath) {
   return { creds, oauth: oauthOf(creds), mtimeMs };
 }
 
+/** Keychain store: Claude Code's item for the folder. Throws keychain.readCredentials' errors (err.code). */
+async function readKeychainCredentials(self) {
+  const { creds } = await self.keychain.readCredentials(self.configDir);
+  return { creds, oauth: oauthOf(creds), mtimeMs: null };
+}
+
+/** Keychain store: a failed read is never a sign-in problem unless the item is simply not there. */
+function keychainReadFailure(e, ctx) {
+  const code = e && e.code;
+  if (code === 'not_found') return failure('no_credentials', keychainMissingMessage(ctx.self.configDir), { ...ctx, authRequired: true });
+  if (code === 'parse') return failure('parse', 'The Claude Code Keychain item is not valid JSON', ctx);
+  if (e && e.timedOut) return failure('network', 'Reading the Claude Code login from the Keychain timed out', ctx);
+  return failure('internal', `Cannot read the Claude Code login from the Keychain (${(e && e.message) || 'error'})`, ctx);
+}
+
 function debugLog(log, message) {
   if (log && typeof log.debug === 'function') log.debug(message);
 }
@@ -253,7 +307,7 @@ function getUsage(fetch, accessToken, userAgent, timeoutMs) {
  * (403 for setup tokens, 429, 5xx, timeout) keeps the previous values and is not retried for 5 min — never once per
  * poll, which would hit the endpoint every 60 s while it is failing.
  */
-async function getProfile({ fetch, accessToken, userAgent, now, log, timeoutMs }) {
+async function getProfile(state, { fetch, accessToken, userAgent, now, log, timeoutMs }) {
   const key = tokenKey(accessToken);
   const nowMs = now();
   const cache = state.profileCache;
@@ -279,17 +333,17 @@ async function getProfile({ fetch, accessToken, userAgent, now, log, timeoutMs }
 }
 
 /**
- * Prepaid credits over OAuth (research §1.7). Fetched at most once per 5 min and only when the Claude expand
- * panel is open, the compact spend row is open, or nothing has been fetched yet (first fill). Failures are
- * non-fatal: the previous payload is kept and the failure only logged at debug level.
+ * Prepaid credits over OAuth (research §1.7). Fetched at most once per 5 min and only when THIS account's expand
+ * panel is open (settings.expandedOpen[providerId]), the compact spend row is open, or nothing has been fetched yet
+ * (first fill). Failures are non-fatal: the previous payload is kept and the failure only logged at debug level.
  */
-async function getCredits({ fetch, accessToken, userAgent, orgUuid, settings, now, log, timeoutMs }) {
+async function getCredits(state, { fetch, accessToken, userAgent, orgUuid, settings, providerId, now, log, timeoutMs }) {
   if (!orgUuid) return state.creditsCache.orgUuid ? state.creditsCache.payload : null;
   const nowMs = now();
   const cache = state.creditsCache;
   const sameOrg = cache.orgUuid === orgUuid;
   const cached = sameOrg ? cache.payload : null;
-  const expanded = Boolean(settings.expandedOpen && settings.expandedOpen.claude === true);
+  const expanded = Boolean(settings.expandedOpen && settings.expandedOpen[providerId] === true);
   const compactSpend = Boolean(settings.compactMode && settings.compactSpendOpen);
   const firstFill = !cached;
   if (!expanded && !compactSpend && !firstFill) return cached;
@@ -315,7 +369,7 @@ async function getCredits({ fetch, accessToken, userAgent, orgUuid, settings, no
 }
 
 // ---------------------------------------------------------------------------
-// Guarded refresh (F1 + F2)
+// Guarded refresh (F1 + F2) — file store only
 // ---------------------------------------------------------------------------
 
 /**
@@ -328,7 +382,7 @@ async function getCredits({ fetch, accessToken, userAgent, orgUuid, settings, no
  *   deferred  → stale, retried next cycle (another process is/was refreshing, or spacing)
  */
 /** Earliest moment a refresh may be attempted: the back-off AND the 10-min spacing must both allow it. */
-function nextRefreshAllowedAt() {
+function nextRefreshAllowedAt(state) {
   const fromBackoff = state.refreshBackoff.state().nextAllowedAt;
   const fromSpacing = state.lastRefreshAttemptAt ? state.lastRefreshAttemptAt + REFRESH_SPACING_MS : 0;
   return Math.max(fromBackoff, fromSpacing);
@@ -337,7 +391,7 @@ function minutesUntil(atMs, nowMs) {
   return Math.max(1, Math.ceil((atMs - nowMs) / 60000));
 }
 
-async function guardedRefresh({ oauth, mtimeMs, credentialsPath, lockPath, lockOptions, fetch, now, log, userAgent, reason }) {
+async function guardedRefresh(state, { oauth, mtimeMs, credentialsPath, lockPath, lockOptions, fetch, now, log, userAgent, reason }) {
   const nowMs = now();
   const backoff = state.refreshBackoff;
   if (backoff.shouldSkip(nowMs)) {
@@ -345,16 +399,16 @@ async function guardedRefresh({ oauth, mtimeMs, credentialsPath, lockPath, lockO
     if (st.permanent) {
       return { ok: false, kind: 'permanent', code: 'refresh_failed', message: 'Claude sign-in expired - run claude to sign in again (refresh token rejected)' };
     }
-    return { ok: false, kind: 'transient', code: 'refresh_failed', message: `Claude token refresh failed; retrying in ${minutesUntil(nextRefreshAllowedAt(), nowMs)} min` };
+    return { ok: false, kind: 'transient', code: 'refresh_failed', message: `Claude token refresh failed; retrying in ${minutesUntil(nextRefreshAllowedAt(state), nowMs)} min` };
   }
   // (c) a refresh token past its own expiry cannot be redeemed — only a new sign-in helps.
   const rtExpiresAt = Number(oauth.refreshTokenExpiresAt);
   if (Number.isFinite(rtExpiresAt) && rtExpiresAt > 0 && nowMs >= rtExpiresAt) {
     return { ok: false, kind: 'permanent', code: 'token_expired', message: `${SIGN_IN_EXPIRED} (refresh token expired)` };
   }
-  // (d) at most one attempt per 10 min from this process.
+  // (d) at most one attempt per 10 min from this account.
   if (state.lastRefreshAttemptAt && nowMs - state.lastRefreshAttemptAt < REFRESH_SPACING_MS) {
-    return { ok: false, kind: 'deferred', code: 'token_expired', message: `${WAITING_PREFIX} (next attempt in ${minutesUntil(nextRefreshAllowedAt(), nowMs)} min)` };
+    return { ok: false, kind: 'deferred', code: 'token_expired', message: `${WAITING_PREFIX} (next attempt in ${minutesUntil(nextRefreshAllowedAt(state), nowMs)} min)` };
   }
   // (e) a file written moments ago means a live Claude Code is (or just was) refreshing.
   if (mtimeMs != null && nowMs - mtimeMs < FRESH_FILE_MS) {
@@ -385,7 +439,7 @@ async function guardedRefresh({ oauth, mtimeMs, credentialsPath, lockPath, lockO
     log(`[claude] refresh token rejected (${r.error && r.error.code}); parking refresh attempts until the credentials change`);
     return { ok: false, kind: 'permanent', code: 'refresh_failed', message: 'Claude sign-in expired - run claude to sign in again' };
   }
-  return { ok: false, kind: 'transient', code: 'refresh_failed', message: `Claude token refresh failed (${r.error && r.error.code}); retrying in ${minutesUntil(nextRefreshAllowedAt(), nowMs)} min` };
+  return { ok: false, kind: 'transient', code: 'refresh_failed', message: `Claude token refresh failed (${r.error && r.error.code}); retrying in ${minutesUntil(nextRefreshAllowedAt(state), nowMs)} min` };
 }
 
 function refreshFailureSnapshot(r, ctx) {
@@ -397,24 +451,21 @@ function refreshFailureSnapshot(r, ctx) {
 // fetchSnapshot
 // ---------------------------------------------------------------------------
 
-async function fetchSnapshot(args = {}) {
-  const snap = await fetchSnapshotInner(args || {});
-  state.lastResult = snap;
-  return snap;
-}
-
-async function fetchSnapshotInner({ settings, fetch = globalThis.fetch, now = Date.now, log = () => {}, lastGood = null, paths, timeoutMs = REQUEST_TIMEOUT_MS, lockOptions = {} } = {}) {
+async function fetchSnapshotInner(self, { settings, fetch = globalThis.fetch, now = Date.now, log = () => {}, lastGood = null, paths, timeoutMs = REQUEST_TIMEOUT_MS, lockOptions = {} } = {}) {
   settings = settings || {}; // default params do not cover an explicit null
   paths = paths || {};
-  const credentialsPath = paths.credentialsPath || defaultCredentialsPath();
+  const { state } = self;
+  const fromKeychain = self.source === SOURCE_KEYCHAIN;
+  const credentialsPath = paths.credentialsPath || credentialsPathFor(self.configDir);
   const lockPath = paths.lockPath || lockPathFor(credentialsPath);
   const autoRefresh = settings.tokenAutoRefresh !== false;
-  const ctx = { lastGood };
+  const ctx = { self, lastGood };
 
   try {
     const nowMs = now();
+    if (fromKeychain && self.platform !== 'darwin') return failure('internal', KEYCHAIN_MACOS_ONLY, ctx);
 
-    // 0a. Per-process request floor (F4). Manual refreshes go through here too.
+    // 0a. Per-account request floor (F4). Manual refreshes go through here too.
     if (state.lastUsageRequestAt && nowMs - state.lastUsageRequestAt < USAGE_FLOOR_MS) {
       debugLog(log, `[claude] inside the ${USAGE_FLOOR_MS / 1000} s request floor (${Math.round((nowMs - state.lastUsageRequestAt) / 1000)} s since the last request) - returning the previous snapshot`);
       if (state.lastResult) {
@@ -430,15 +481,18 @@ async function fetchSnapshotInner({ settings, fetch = globalThis.fetch, now = Da
     }
 
     // 1. Re-read credentials on every poll (Claude Code rotates them itself).
+    const load = fromKeychain ? () => readKeychainCredentials(self) : () => readCredentials(credentialsPath);
     let creds; let oauth; let mtimeMs;
     try {
-      ({ creds, oauth, mtimeMs } = await readCredentials(credentialsPath));
+      ({ creds, oauth, mtimeMs } = await load());
     } catch (e) {
+      if (fromKeychain) return keychainReadFailure(e, ctx);
       if (e && e.code === 'parse') return failure('parse', 'Claude credentials file is not valid JSON', ctx);
       return failure('no_credentials', `Cannot read Claude credentials (${e && e.code || 'error'})`, { ...ctx, authRequired: true });
     }
     if (!creds || !oauth || typeof oauth.accessToken !== 'string' || !oauth.accessToken) {
-      return failure('no_credentials', 'Log in to Claude Code (run `claude`) to see usage', { ...ctx, authRequired: true });
+      const message = fromKeychain ? keychainMissingMessage(self.configDir) : 'Log in to Claude Code (run `claude`) to see usage';
+      return failure('no_credentials', message, { ...ctx, authRequired: true });
     }
     const accessKey = tokenKey(oauth.accessToken);
 
@@ -461,12 +515,14 @@ async function fetchSnapshotInner({ settings, fetch = globalThis.fetch, now = Da
 
     // 2. Expiry (F2): only a token that has actually lapsed (+60 s grace) triggers a refresh. A token that is
     //    merely close to expiry is used as-is — a live Claude Code refreshes 4 min ahead and would race us.
+    //    The Keychain store never refreshes: only Claude Code can write that item back.
     const expiresAt = Number(oauth.expiresAt);
     if (Number.isFinite(expiresAt) && nowMs >= expiresAt + EXPIRY_GRACE_MS) {
+      if (fromKeychain) return failure('token_expired', keychainWaitingMessage(self.name), ctx);
       if (!autoRefresh) {
         return failure('token_expired', 'Claude token expired - enable token auto-refresh or run claude to sign in again', { ...ctx, authRequired: true });
       }
-      const r = await guardedRefresh({ ...refreshArgs, oauth, mtimeMs, reason: 'token lapsed' });
+      const r = await guardedRefresh(state, { ...refreshArgs, oauth, mtimeMs, reason: 'token lapsed' });
       if (!r.ok) return refreshFailureSnapshot(r, ctx);
       oauth = r.oauth;
     }
@@ -485,17 +541,20 @@ async function fetchSnapshotInner({ settings, fetch = globalThis.fetch, now = Da
       return networkFailure(e);
     }
 
-    // 3b. 401 (F5) — may arrive before local expiresAt. Re-read; retry with a changed token; else refresh once.
+    // 3b. 401 (F5) — may arrive before local expiresAt. Re-read; retry with a changed token; else refresh once
+    //     (file store) or wait for Claude Code (Keychain store).
     if (res.status === 401) {
       let again = null;
-      try { again = await readCredentials(credentialsPath); } catch { /* fall through to refresh */ }
+      try { again = await load(); } catch { /* fall through to refresh / waiting */ }
       const fresh = again && again.oauth;
       if (fresh && typeof fresh.accessToken === 'string' && fresh.accessToken && fresh.accessToken !== oauth.accessToken) {
-        log('[claude] 401 but the credentials file changed - retrying with the new token');
+        log(`[claude] 401 but the ${fromKeychain ? 'Keychain item' : 'credentials file'} changed - retrying with the new token`);
         oauth = fresh;
         mtimeMs = again.mtimeMs;
+      } else if (fromKeychain) {
+        return failure('http_401', keychainWaitingMessage(self.name), ctx);
       } else if (autoRefresh) {
-        const r = await guardedRefresh({ ...refreshArgs, oauth, mtimeMs: again ? again.mtimeMs : mtimeMs, reason: 'usage request returned 401' });
+        const r = await guardedRefresh(state, { ...refreshArgs, oauth, mtimeMs: again ? again.mtimeMs : mtimeMs, reason: 'usage request returned 401' });
         if (!r.ok) return refreshFailureSnapshot(r, ctx);
         oauth = r.oauth;
       } else {
@@ -514,7 +573,10 @@ async function fetchSnapshotInner({ settings, fetch = globalThis.fetch, now = Da
     } catch (e) {
       return networkFailure(e);
     }
-    if (res.status === 401) return failure('http_401', SIGN_IN_EXPIRED, { ...ctx, authRequired: true });
+    if (res.status === 401) {
+      if (fromKeychain) return failure('http_401', keychainWaitingMessage(self.name), ctx);
+      return failure('http_401', SIGN_IN_EXPIRED, { ...ctx, authRequired: true });
+    }
     if (res.status === 403) {
       const scopeIssue = /scope|user:profile/i.test(text || '');
       const message = scopeIssue ? SCOPE_MESSAGE : bodyMessage(text, 'Claude denied access to usage (HTTP 403)');
@@ -540,20 +602,21 @@ async function fetchSnapshotInner({ settings, fetch = globalThis.fetch, now = Da
     if (!looksLikeUsage(usage)) return failure('parse', 'Claude returned an unexpected usage payload (no usage fields)', ctx);
     state.rateLimit = { until: 0, step: 0 };
 
-    // 4. Profile (cached hourly) for account name / plan fallback / organization uuid; then prepaid credits.
-    const profile = await getProfile({ fetch, accessToken: oauth.accessToken, userAgent, now, log, timeoutMs });
+    // 4. Profile (cached hourly) for account name / plan fallback / organization uuid / identity; then prepaid credits.
+    const profile = await getProfile(state, { fetch, accessToken: oauth.accessToken, userAgent, now, log, timeoutMs });
     const orgUuid = profile && profile.organization && typeof profile.organization === 'object' && typeof profile.organization.uuid === 'string'
       ? profile.organization.uuid : null;
-    const credits = await getCredits({ fetch, accessToken: oauth.accessToken, userAgent, orgUuid, settings, now, log, timeoutMs });
+    const credits = await getCredits(state, { fetch, accessToken: oauth.accessToken, userAgent, orgUuid, settings, providerId: self.id, now, log, timeoutMs });
 
     const norm = normalizeClaude({ usage, profile, credentials: oauth, prepaid: credits });
-    return makeSnapshot({
+    return makeSnapshot(self, {
       status: 'ok',
       plan: norm.plan,
       account: norm.account,
       updatedAt: now(),
       windows: norm.windows,
       extra: norm.extra,
+      identity: identityFromProfile(profile),
       raw: { usage, profile, credits },
     });
   } catch (e) {
@@ -562,12 +625,53 @@ async function fetchSnapshotInner({ settings, fetch = globalThis.fetch, now = Da
   }
 }
 
+// ---------------------------------------------------------------------------
+// Factory
+// ---------------------------------------------------------------------------
+
+function createClaudeCodeProvider({
+  id = DEFAULT_ID, name = DEFAULT_NAME, configDir = '', credentialStore = 'file', keychain = keychainStore, platform = process.platform,
+} = {}) {
+  const currentName = () => {
+    if (typeof name !== 'function') return name;
+    try { return name() || DEFAULT_NAME; } catch { return DEFAULT_NAME; }
+  };
+  const self = {
+    id,
+    get name() { return currentName(); },
+    source: credentialStore === 'keychain' ? SOURCE_KEYCHAIN : SOURCE_FILE,
+    configDir: typeof configDir === 'string' ? configDir : '',
+    keychain,
+    platform,
+    state: freshState(),
+  };
+  return {
+    id,
+    get name() { return currentName(); },
+    source: self.source,
+    async fetchSnapshot(args = {}) {
+      const snap = await fetchSnapshotInner(self, args || {});
+      self.state.lastResult = snap;
+      return snap;
+    },
+    /** Test hook — clears every guard of this account except the (per-process) detected CLI version. */
+    resetState() {
+      self.state = freshState();
+    },
+    _state: () => self.state,
+  };
+}
+
+// The 1.0.x module surface: account 1 reading ~/.claude (or CLAUDE_CONFIG_DIR) — what every existing caller uses.
+const defaultProvider = createClaudeCodeProvider();
+
 module.exports = {
-  id,
-  name,
-  source,
-  fetchSnapshot,
-  resetState,
+  id: DEFAULT_ID,
+  name: DEFAULT_NAME,
+  source: SOURCE_FILE,
+  fetchSnapshot: (args) => defaultProvider.fetchSnapshot(args),
+  resetState: () => defaultProvider.resetState(),
+  createClaudeCodeProvider,
   // URLs / headers
   USAGE_URL,
   PROFILE_URL,
@@ -582,7 +686,11 @@ module.exports = {
   CLI_VERSION_FALLBACK,
   // paths
   defaultCredentialsPath,
+  credentialsPathFor,
   lockPathFor,
+  // identity (§4)
+  identityHash,
+  identityFromProfile,
   // tunables (exported for tests / docs)
   USAGE_FLOOR_MS,
   EXPIRY_GRACE_MS,
@@ -597,7 +705,11 @@ module.exports = {
   USAGE_PAYLOAD_KEYS,
   SIGN_IN_EXPIRED,
   SCOPE_MESSAGE,
+  WAITING_PREFIX,
+  KEYCHAIN_MACOS_ONLY,
+  keychainWaitingMessage,
+  keychainMissingMessage,
   hhmm,
   // test hook
-  _state: () => state,
+  _state: () => defaultProvider._state(),
 };

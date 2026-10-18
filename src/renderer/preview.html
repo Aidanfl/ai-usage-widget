@@ -107,7 +107,7 @@
           <div class="scol">
             <span class="slabel">Providers</span>
             <div class="scontrol">
-              <label class="toggle-labelled"><span class="toggle"><input type="checkbox" id="providerClaudeToggle" aria-label="Show Claude"><span class="slider"></span></span>Claude</label>
+              <!-- Claude accounts have their own toggles in the "Claude accounts" section below -->
               <label class="toggle-labelled"><span class="toggle"><input type="checkbox" id="providerCodexToggle" aria-label="Show Codex"><span class="slider"></span></span>Codex</label>
             </div>
           </div>
@@ -135,22 +135,6 @@
             </div>
             <span class="shint" id="backgroundHint" hidden>Acrylic and Mica need Windows 11 (22H2+)</span>
             <span class="shint" id="backgroundClearHint" hidden>Clear Acrylic uses dark text</span>
-          </div>
-        </div>
-
-        <div class="srow full">
-          <div class="scol wide">
-            <span class="slabel">Claude source</span>
-            <div class="scontrol">
-              <select class="sselect" id="claudeSourceSelect" aria-label="Claude source">
-                <option value="claude_code">Claude Code login (automatic)</option>
-                <option value="claude_web">claude.ai browser login</option>
-              </select>
-              <button class="small-btn" id="claudeWebLoginBtn" type="button" hidden>Log in</button>
-              <button class="small-btn danger" id="claudeWebLogoutBtn" type="button" hidden>Log out</button>
-              <select class="sselect" id="claudeOrgSelect" aria-label="Claude organisation" hidden></select>
-            </div>
-            <span class="shint web-status" id="claudeWebStatus" hidden></span>
           </div>
         </div>
 
@@ -214,6 +198,21 @@
               <option value="120">Every 2 min</option>
               <option value="300">Every 5 min</option>
             </select>
+          </div>
+        </div>
+
+        <!-- ================= Claude accounts (one block per account, built by app.js) ================= -->
+        <div class="ssection" aria-hidden="true"><span>Claude accounts</span></div>
+
+        <div class="accounts" id="claudeAccounts"></div>
+
+        <div class="srow full">
+          <div class="scol wide">
+            <span class="slabel"></span>
+            <div class="scontrol">
+              <button class="small-btn" id="addAccountBtn" type="button">Add account</button>
+            </div>
+            <span class="shint" id="accountsMacHint" hidden>Recommended on macOS: a claude.ai sign-in per account (the widget never refreshes Claude Code's Keychain tokens)</span>
           </div>
         </div>
 

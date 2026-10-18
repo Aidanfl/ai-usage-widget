@@ -1,9 +1,12 @@
 'use strict';
 // Refresh loop (ARCHITECTURE.md §6 "Scheduler"). One timer; each tick fetches every enabled provider
 // with Promise.allSettled, builds a Snapshot (last-good values marked `stale` when a provider fails),
-// then runs history → tray → alerts → onSnapshot. Nothing in here may throw into the caller.
+// folds duplicate Claude accounts together (the injected `dedupe`), then runs history → tray → alerts →
+// onSnapshot. Nothing in here may throw into the caller.
+//
+// Snapshot = { fetchedAt, providers: { [id]: ProviderSnapshot | null }, duplicates: { [hiddenId]: shownId } }
+// with one key per resolved provider (null = disabled in settings, or shown once under another account).
 
-const PROVIDER_IDS = ['claude', 'codex'];
 const DEFAULT_INTERVAL_S = 60;
 const MIN_INTERVAL_S = 15;
 const MAX_INTERVAL_S = 3600;
@@ -47,6 +50,10 @@ function classifyError(err) {
   return 'internal';
 }
 
+function isMap(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
 function safeMessage(err) {
   const msg = String((err && err.message) || err || 'Unknown error');
   return msg.length > 300 ? `${msg.slice(0, 297)}...` : msg;
@@ -61,6 +68,7 @@ function failureSnapshot(provider, err, code) {
     source: provider.source || null,
     plan: null,
     account: null,
+    identity: null,
     updatedAt: 0,
     windows: [],
     extra: null,
@@ -84,13 +92,16 @@ function toPlain(value) {
   }
 }
 
-function createScheduler({ providers = [], getSettings, onSnapshot, history, tray, alerts, log, now = Date.now, fetch: fetchImpl } = {}) {
+function createScheduler({ providers = [], getSettings, onSnapshot, history, tray, alerts, log, now = Date.now, fetch: fetchImpl, dedupe } = {}) {
   const logger = normalizeLog(log);
   const lastGood = new Map();   // provider id → last ProviderSnapshot with status 'ok'
   // Provider ids whose next *automatic* tick is skipped (§6: HTTP 429 → keep last good, skip next
   // cycle). Providers ask for this with `skipNextCycle: true` on the snapshot they return.
   const skipNext = new Set();
   let lastSnapshot = null;
+  // The last tick's providers BEFORE dedupe: a rate-limited account that is shown once under another
+  // still sits out its next cycle, so its entry is carried from here, not from the deduped snapshot.
+  let lastProviders = {};
   let timer = null;
   let running = false;
   let inFlight = null;
@@ -105,8 +116,8 @@ function createScheduler({ providers = [], getSettings, onSnapshot, history, tra
     }
   }
 
-  // `providers` may be an array or a function returning one, so main.js can swap the Claude
-  // implementation (claude_code vs claude_web) without rebuilding the scheduler.
+  // `providers` may be an array or a function returning one, so main.js can add, remove and swap Claude
+  // accounts (and their sources) without rebuilding the scheduler.
   function resolveProviders() {
     let list;
     try {
@@ -138,6 +149,7 @@ function createScheduler({ providers = [], getSettings, onSnapshot, history, tra
       source: result.source === undefined ? (provider.source || null) : result.source,
       plan: result.plan === undefined ? null : result.plan,
       account: result.account === undefined ? null : result.account,
+      identity: result.identity === undefined ? null : result.identity,
       updatedAt: typeof result.updatedAt === 'number' ? result.updatedAt : 0,
       extra: result.extra === undefined ? null : result.extra,
       credits: result.credits === undefined ? null : result.credits,
@@ -155,14 +167,16 @@ function createScheduler({ providers = [], getSettings, onSnapshot, history, tra
       return plain;
     }
     if (snap.status === 'error' && prevGood) {
+      // The name comes from THIS cycle: an account renamed while it is failing must not keep its old name.
       return toPlain({
         ...prevGood,
+        name: snap.name || prevGood.name,
         status: 'stale',
         error: snap.error || { code: 'network', message: 'Refresh failed; showing last known values' },
       }) || prevGood;
     }
     if (snap.status === 'stale' && snap.windows.length === 0 && prevGood) {
-      return toPlain({ ...prevGood, status: 'stale', error: snap.error || null }) || prevGood;
+      return toPlain({ ...prevGood, name: snap.name || prevGood.name, status: 'stale', error: snap.error || null }) || prevGood;
     }
     return toPlain(snap) || failureSnapshot(provider, new Error('Snapshot could not be serialized'), 'parse');
   }
@@ -194,8 +208,29 @@ function createScheduler({ providers = [], getSettings, onSnapshot, history, tra
     }
   }
 
+  function emptyProviders(list) {
+    const out = {};
+    for (const p of list) out[p.id] = null;
+    return out;
+  }
+
   function emptySnapshot() {
-    return { fetchedAt: now(), providers: { claude: null, codex: null } };
+    return { fetchedAt: now(), providers: emptyProviders(resolveProviders()), duplicates: {} };
+  }
+
+  // A broken dedupe must never cost a tick: every account is then simply shown.
+  function applyDedupe(providersOut) {
+    if (typeof dedupe !== 'function') return { providers: providersOut, duplicates: {} };
+    try {
+      const result = dedupe(providersOut);
+      if (isMap(result && result.providers)) {
+        return { providers: result.providers, duplicates: isMap(result.duplicates) ? result.duplicates : {} };
+      }
+      logger.error('dedupe returned no providers map; showing every account');
+    } catch (err) {
+      logger.error('dedupe failed; showing every account:', safeMessage(err));
+    }
+    return { providers: providersOut, duplicates: {} };
   }
 
   function tick(reason) {
@@ -205,11 +240,12 @@ function createScheduler({ providers = [], getSettings, onSnapshot, history, tra
     }
     inFlight = (async () => {
       const settings = settingsSafe();
-      const enabled = resolveProviders().filter((p) => isEnabled(settings, p.id));
+      const resolved = resolveProviders();
+      const enabled = resolved.filter((p) => isEnabled(settings, p.id));
 
       // A provider that was rate-limited last time sits out one automatic tick and keeps showing its
       // previous (stale) entry. Manual/start/resume ticks always run everything.
-      const previous = lastSnapshot && lastSnapshot.providers ? lastSnapshot.providers : {};
+      const previous = lastProviders;
       const carried = new Map();
       const toRun = [];
       for (const p of enabled) {
@@ -224,8 +260,7 @@ function createScheduler({ providers = [], getSettings, onSnapshot, history, tra
 
       const settled = await Promise.allSettled(toRun.map((p) => runProvider(p, settings)));
 
-      const providersOut = {};
-      for (const id of PROVIDER_IDS) providersOut[id] = null;
+      const providersOut = emptyProviders(resolved);
       settled.forEach((outcome, i) => {
         const provider = toRun[i];
         providersOut[provider.id] = outcome.status === 'fulfilled'
@@ -233,15 +268,17 @@ function createScheduler({ providers = [], getSettings, onSnapshot, history, tra
           : failureSnapshot(provider, outcome.reason);
       });
       for (const [id, snap] of carried) providersOut[id] = snap;
+      lastProviders = providersOut;
 
-      const snapshot = { fetchedAt: now(), providers: providersOut };
+      const { providers: shown, duplicates } = applyDedupe(providersOut);
+      const snapshot = { fetchedAt: now(), providers: shown, duplicates };
       lastSnapshot = snapshot;
 
       safeStep('history', () => history && history.append(snapshot));
       safeStep('tray', () => tray && tray.update(snapshot));
       safeStep('alerts', () => alerts && alerts.evaluate(snapshot, settings));
       safeStep('onSnapshot', () => onSnapshot && onSnapshot(snapshot));
-      logger.debug(`tick (${reason}) done:`, Object.entries(providersOut).map(([id, p]) => `${id}=${p ? p.status : 'off'}`).join(' '));
+      logger.debug(`tick (${reason}) done:`, Object.entries(shown).map(([id, p]) => `${id}=${p ? p.status : (duplicates[id] ? `same as ${duplicates[id]}` : 'off')}`).join(' '));
       return snapshot;
     })()
       .catch((err) => {
@@ -289,8 +326,9 @@ function createScheduler({ providers = [], getSettings, onSnapshot, history, tra
 
   applyInterval(parseInt(settingsSafe().refreshInterval, 10));
 
-  // Drops the last-good memory for one provider id. main.js calls it when the Claude *source*
-  // changes so claude_web never shows claude_code's values as "stale" (or vice versa).
+  // Drops the last-good memory for one provider id. main.js calls it when an account's source or folder
+  // changes (so claude_web never shows claude_code's values as "stale", or vice versa) and when an
+  // account is removed.
   function forgetProvider(id) {
     lastGood.delete(id);
     skipNext.delete(id);

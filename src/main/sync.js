@@ -29,6 +29,12 @@ const REQUEST_TIMEOUT_MS = 15000;
 const HISTORY_DAYS = 7;
 const HISTORY_BUCKET_MS = 30 * 60 * 1000;
 const HISTORY_MAX_SAMPLES = 400;
+// The relay rejects envelopes over 256 KB; base64 of the ciphertext makes ~4/3 of the plaintext, so the
+// plaintext JSON is held to 160 000 chars. Several Claude accounts multiply the history keys, so an
+// oversized payload is rebuilt with coarser buckets (30 → 60 → 120 → 240 min) and, failing that, with
+// no samples at all (series kept). The snapshot itself is never dropped.
+const PAYLOAD_BUDGET_CHARS = 160000;
+const HISTORY_FALLBACK_BUCKETS_MS = Object.freeze([60, 120, 240].map((min) => min * 60 * 1000));
 const QR_OPTIONS = Object.freeze({ margin: 1, width: 220, errorCorrectionLevel: 'M' });
 
 // ---------------------------------------------------------------------------------------------
@@ -174,13 +180,23 @@ function downsampleHistory(samples, { bucketMs = HISTORY_BUCKET_MS, max = HISTOR
   return out.length > max ? out.slice(out.length - max) : out;
 }
 
+// The phone gets the snapshot minus everything it has no use for: `raw` (debug payloads), `identity`
+// (hashed account ids, only for dedupe on the desktop) and `duplicates` (a deduped account is just null).
 function stripRaw(snapshot) {
   const plain = JSON.parse(JSON.stringify(snapshot || { fetchedAt: 0, providers: {} }));
   const providers = plain && plain.providers && typeof plain.providers === 'object' ? plain.providers : {};
   for (const provider of Object.values(providers)) {
-    if (provider && typeof provider === 'object') delete provider.raw;
+    if (provider && typeof provider === 'object') {
+      delete provider.raw;
+      delete provider.identity;
+    }
   }
+  if (plain && typeof plain === 'object') delete plain.duplicates;
   return plain;
+}
+
+function payloadChars(payload) {
+  return JSON.stringify(payload).length;
 }
 
 function buildPhonePayload({ snapshot, history, settings = {}, appVersion = '0.0.0', platform = process.platform, hostname = '', now = Date.now() } = {}) {
@@ -188,7 +204,7 @@ function buildPhonePayload({ snapshot, history, settings = {}, appVersion = '0.0
   const series = (Array.isArray(hist.series) ? hist.series : [])
     .filter((s) => s && typeof s.key === 'string')
     .map((s) => ({ key: s.key, label: typeof s.label === 'string' ? s.label : s.key, color: typeof s.color === 'string' ? s.color : 'slate' }));
-  return {
+  const payload = {
     v: PROTOCOL_VERSION,
     generatedAt: now,
     source: { app: 'ai-usage-widget', version: String(appVersion), platform: String(platform), host: String(hostname || '') },
@@ -203,6 +219,13 @@ function buildPhonePayload({ snapshot, history, settings = {}, appVersion = '0.0
     },
     history: { days: HISTORY_DAYS, samples: downsampleHistory(hist.samples), series },
   };
+  // Over the relay budget (PAYLOAD_BUDGET_CHARS): coarser history buckets until it fits, then no samples.
+  for (const bucketMs of HISTORY_FALLBACK_BUCKETS_MS) {
+    if (payloadChars(payload) <= PAYLOAD_BUDGET_CHARS) return payload;
+    payload.history.samples = downsampleHistory(hist.samples, { bucketMs });
+  }
+  if (payloadChars(payload) > PAYLOAD_BUDGET_CHARS) payload.history.samples = [];
+  return payload;
 }
 
 // Change detection: provider status, each window's integer percent + resetsAt, and the integer extra percent.
@@ -658,4 +681,5 @@ module.exports = {
   REQUEST_TIMEOUT_MS,
   HISTORY_BUCKET_MS,
   HISTORY_MAX_SAMPLES,
+  PAYLOAD_BUDGET_CHARS,
 };

@@ -188,3 +188,54 @@ test('pruneAll trims expired samples and only writes when something changed', ()
   assert.equal(history.pruneAll(), 1);
   assert.equal(writes, 1, 'no rewrite when nothing was pruned');
 });
+
+// ---------------------------------------------------------------------------------------------
+// Several Claude accounts: one key prefix per provider id, labels from the snapshot's display name
+// ---------------------------------------------------------------------------------------------
+test('every Claude account samples under its own id; a hidden (null) or deduped account adds nothing', () => {
+  const h = harness();
+  const providers = {
+    claude: provider('claude', [win('session', 10), win('weekly', 20)], { name: 'Claude 1' }),
+    'claude-2': provider('claude-2', [win('session', 30), win('weekly_fable', 40)], { name: 'Work' }),
+    'claude-3': null, // shown once under another account, or turned off
+    'claude-4': provider('claude-4', [win('weekly', 50)], { name: 'Claude 4', status: 'stale' }),
+    codex: provider('codex', [win('primary', 5)]),
+  };
+  h.history.append({ fetchedAt: T0, providers, duplicates: { 'claude-3': 'claude' } });
+  assert.deepEqual(h.stored[0].v, {
+    'claude.session': 10,
+    'claude.weekly': 20,
+    'claude-2.session': 30,
+    'claude-2.weekly_fable': 40,
+    'codex.primary': 5,
+  });
+});
+
+test('series labels use each account\'s display name; leftovers read "Claude N …" in provider order', () => {
+  const h = harness([
+    { t: T0 - 2000, v: { 'codex.primary': 1, 'claude-3.weekly': 2, 'claude-2.session': 3, 'claude.weekly_opus': 4, 'claude-5.weekly_fable': 5 } },
+  ]);
+  const latest = {
+    fetchedAt: T0,
+    providers: {
+      claude: provider('claude', [win('weekly', 2, { label: 'Weekly Limit', color: 'blue' })], { name: 'Claude 1' }),
+      'claude-2': provider('claude-2', [win('weekly', 3, { label: 'Weekly Limit', color: 'blue' })], { name: 'Work' }),
+      codex: null,
+    },
+    duplicates: {},
+  };
+  assert.deepEqual(h.history.get(7, latest).series, [
+    { key: 'claude.weekly', label: 'Claude 1 Weekly Limit', color: 'blue' },
+    { key: 'claude-2.weekly', label: 'Work Weekly Limit', color: 'blue' },
+    // Leftovers: no current snapshot describes them (an older window, a hidden or removed account).
+    { key: 'claude.weekly_opus', label: 'Claude Weekly Opus', color: 'slate' },
+    { key: 'claude-2.session', label: 'Claude 2 Session', color: 'slate' },
+    { key: 'claude-3.weekly', label: 'Claude 3 Weekly', color: 'slate' },
+    { key: 'claude-5.weekly_fable', label: 'Claude 5 Weekly Fable', color: 'slate' },
+    { key: 'codex.primary', label: 'Codex Primary', color: 'slate' },
+  ]);
+
+  // Before the first tick (no snapshot) every series is a leftover: account 1 still comes first.
+  assert.deepEqual(h.history.get(7, null).series.map((s) => s.key),
+    ['claude.weekly_opus', 'claude-2.session', 'claude-3.weekly', 'claude-5.weekly_fable', 'codex.primary']);
+});

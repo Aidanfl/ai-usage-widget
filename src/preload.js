@@ -33,10 +33,12 @@ contextBridge.exposeInMainWorld('api', {
   refreshNow: () => ipcRenderer.invoke('refresh-now'),
   getHistory: (days) => ipcRenderer.invoke('get-history', { days }),
   getAppInfo: () => ipcRenderer.invoke('get-app-info'),
-  claudeWebLogin: () => ipcRenderer.invoke('claude-web-login'),
-  claudeWebLogout: () => ipcRenderer.invoke('claude-web-logout'),
-  claudeWebOrgs: () => ipcRenderer.invoke('claude-web-orgs'),
-  claudeWebSelectOrg: (id) => ipcRenderer.invoke('claude-web-select-org', { id }),
+  // claude.ai sign-ins are per Claude account. `accountId` is optional ('claude' = account 1 when left
+  // out, so 1.0.x calls keep working); main rejects an id that is not a configured account.
+  claudeWebLogin: (accountId) => ipcRenderer.invoke('claude-web-login', { accountId }),
+  claudeWebLogout: (accountId) => ipcRenderer.invoke('claude-web-logout', { accountId }),
+  claudeWebOrgs: (accountId) => ipcRenderer.invoke('claude-web-orgs', { accountId }),
+  claudeWebSelectOrg: (id, accountId) => ipcRenderer.invoke('claude-web-select-org', { id, accountId }),
   // Phone sync (docs/PHONE-SYNC.md). The pair key never crosses the bridge — only the pairing string/QR.
   phoneSyncStatus: () => ipcRenderer.invoke('phone-sync-status'),
   phoneSyncPairing: () => ipcRenderer.invoke('phone-sync-pairing'),

@@ -5,10 +5,13 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const crypto = require('node:crypto');
+const Module = require('node:module');
 
 const codex = require('../src/main/providers/codex.js');
 const claude = require('../src/main/providers/claude.js');
 const claudeWeb = require('../src/main/providers/claude-web.js');
+const keychain = require('../src/main/providers/keychain.js');
 
 // --- helpers ----------------------------------------------------------------
 
@@ -1269,6 +1272,413 @@ test('claude: fetchSnapshot never throws even with hostile inputs', async () => 
 });
 
 // ---------------------------------------------------------------------------
+// Claude — one provider instance per account (createClaudeCodeProvider)
+// ---------------------------------------------------------------------------
+
+const PROFILE = fixture('claude-profile.json');
+const sha16 = (s) => crypto.createHash('sha256').update(s).digest('hex').slice(0, 16);
+const PROFILE_IDENTITY = { account: sha16(PROFILE.account.uuid), org: sha16(PROFILE.organization.uuid), personalOrg: true };
+const bearerOf = (call) => (call.headers.Authorization || '').replace('Bearer ', '');
+/** claudeRoutes() with a test-specific /profile body. */
+const withProfile = (profile, routes = claudeRoutes()) => (url, init) => (url === claude.PROFILE_URL ? response(200, profile) : routes(url, init));
+
+test('claude: createClaudeCodeProvider — per-account id/name/source; configDir → <folder>/.credentials.json and its refresh lock; the module is account 1', async () => {
+  const dir = tmpDir();
+  writeClaudeCreds(dir, { accessToken: 'sk-ant-oat01-two' });
+  const two = claude.createClaudeCodeProvider({ id: 'claude-2', name: 'Claude 2', configDir: dir });
+  assert.equal(two.id, 'claude-2'); assert.equal(two.name, 'Claude 2'); assert.equal(two.source, 'claude_code');
+  const fetch = fakeFetch(claudeRoutes());
+  const snap = await two.fetchSnapshot({ settings: SETTINGS, fetch, now });
+  assert.equal(snap.status, 'ok');
+  assert.equal(snap.id, 'claude-2'); assert.equal(snap.name, 'Claude 2'); assert.equal(snap.source, 'claude_code');
+  assert.equal(bearerOf(fetch.calls[0]), 'sk-ant-oat01-two', 'the token came from the account folder');
+
+  // The refresh lock is Claude Code's lock IN THAT FOLDER: held there → this account waits; free → refresh +
+  // write-back into the same folder. (A trailing separator in the setting is fine.)
+  const lapsedDir = tmpDir();
+  writeClaudeCreds(lapsedDir, { expiresAt: NOW - 61 * 1000 });
+  const lock = lockDirFor(path.join(lapsedDir, '.credentials.json'));
+  fs.mkdirSync(lock);
+  fs.utimesSync(lock, new Date(NOW), new Date(NOW));
+  const three = claude.createClaudeCodeProvider({ id: 'claude-3', configDir: `${lapsedDir}${path.sep}` });
+  const fetch3 = fakeFetch(claudeRoutes());
+  const held = await three.fetchSnapshot({ settings: SETTINGS, fetch: fetch3, now, lockOptions: NO_WAIT_LOCK });
+  assert.equal(held.error.code, 'token_expired'); assert.match(held.error.message, /refresh lock/);
+  assert.equal(fetch3.calls.length, 0);
+  fs.rmdirSync(lock);
+  const refreshed = await three.fetchSnapshot({ settings: SETTINGS, fetch: fetch3, now, lockOptions: NO_WAIT_LOCK });
+  assert.equal(refreshed.status, 'ok');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(lapsedDir, '.credentials.json'), 'utf8')).claudeAiOauth.accessToken, 'sk-ant-oat01-new', 'written back into the account folder');
+  assert.deepEqual(fs.readdirSync(lapsedDir), ['.credentials.json'], 'lock released');
+
+  // The name may be a function, so a relabelled account's snapshots and messages follow the label.
+  let label = 'Work';
+  const named = claude.createClaudeCodeProvider({ id: 'claude-4', name: () => label, configDir: dir });
+  assert.equal(named.name, 'Work');
+  label = 'Personal';
+  assert.equal(named.name, 'Personal');
+  assert.equal((await named.fetchSnapshot({ settings: SETTINGS, fetch: fakeFetch(claudeRoutes()), now })).name, 'Personal');
+
+  // The module surface is account 1 on Claude Code's default folder.
+  assert.equal(claude.id, 'claude'); assert.equal(claude.name, 'Claude'); assert.equal(claude.source, 'claude_code');
+  const envDir = (process.env.CLAUDE_CONFIG_DIR || '').trim();
+  assert.equal(claude.defaultCredentialsPath(), path.join(envDir ? path.resolve(envDir) : path.join(os.homedir(), '.claude'), '.credentials.json'));
+  assert.equal(claude.credentialsPathFor(dir), path.join(dir, '.credentials.json'));
+  assert.equal(claude.createClaudeCodeProvider().id, 'claude');
+});
+
+test('claude: two accounts never share the request floor, 429 park, profile / credits cache, 403 park or refresh spacing / back-off', async () => {
+  const FAR = NOW + 10 * 3600 * 1000;
+  const dirA = tmpDir(); const dirB = tmpDir();
+  writeClaudeCreds(dirA, { accessToken: 'sk-ant-oat01-aaa', expiresAt: FAR });
+  writeClaudeCreds(dirB, { accessToken: 'sk-ant-oat01-bbb', expiresAt: FAR });
+  const a = claude.createClaudeCodeProvider({ id: 'claude', configDir: dirA });
+  const b = claude.createClaudeCodeProvider({ id: 'claude-2', configDir: dirB });
+  const status = { 'sk-ant-oat01-aaa': 200, 'sk-ant-oat01-bbb': 200 };
+  const SCOPE_403 = { error: { message: "OAuth token does not meet scope requirement 'user:profile'" } };
+  const ORG_B = '00000000-0000-0000-0000-00000000000b';
+  const profileB = { ...PROFILE, organization: { ...PROFILE.organization, uuid: ORG_B } }; // B is in another org
+  const fetch = fakeFetch((url, init) => {
+    const token = bearerOf({ headers: init.headers });
+    const s = status[token] || 200;
+    const routes = claudeRoutes({ usageStatus: s, usageBody: s === 403 ? SCOPE_403 : null });
+    return token === 'sk-ant-oat01-bbb' ? withProfile(profileB, routes)(url, init) : routes(url, init);
+  });
+  const usageBy = (token) => fetch.calls.filter((c) => c.url === claude.USAGE_URL && bearerOf(c) === token).length;
+  const profileBy = (token) => fetch.calls.filter((c) => c.url === claude.PROFILE_URL && bearerOf(c) === token).length;
+  const poll = (p, s) => p.fetchSnapshot({ settings: SETTINGS, fetch, now: later(s) });
+
+  // Floor: B polls a second after A and still makes its own request; each replays only its own result.
+  assert.equal((await poll(a, 0)).status, 'ok');
+  const b1 = await poll(b, 1);
+  assert.equal(b1.status, 'ok'); assert.equal(b1.id, 'claude-2');
+  assert.equal(usageBy('sk-ant-oat01-bbb'), 1, "A's floor does not hold B back");
+  assert.equal((await poll(a, 30)).id, 'claude', "A's replay is A's own snapshot");
+  await poll(b, 31);
+  assert.equal(usageBy('sk-ant-oat01-aaa'), 1); assert.equal(usageBy('sk-ant-oat01-bbb'), 1, 'each account keeps its own 60 s floor');
+
+  // Profile + credits caches: B's fetches did not evict A's (one hourly /profile, one first-fill credits per account).
+  assert.equal(fetch.count(CLAUDE_CREDITS_URL), 1); assert.equal(fetch.count(claude.creditsUrl(ORG_B)), 1);
+  const a2 = await poll(a, 61);
+  assert.equal(usageBy('sk-ant-oat01-aaa'), 2);
+  assert.equal(profileBy('sk-ant-oat01-aaa'), 1, "A's cached profile survived B's");
+  assert.equal(profileBy('sk-ant-oat01-bbb'), 1);
+  assert.equal(fetch.count(CLAUDE_CREDITS_URL), 1, "A's cached credits survived B's (collapsed: no refetch)");
+  assert.equal(a2.extra.balanceMinor, 17481);
+
+  // 429 park: A is rate limited, B keeps polling; A itself stays parked.
+  status['sk-ant-oat01-aaa'] = 429;
+  assert.equal((await poll(a, 122)).error.code, 'http_429');
+  assert.equal((await poll(b, 123)).status, 'ok');
+  assert.equal(usageBy('sk-ant-oat01-bbb'), 2, "A's 429 park does not park B");
+  assert.equal(b._state().rateLimit.until, 0);
+  assert.equal((await poll(a, 190)).error.code, 'http_429');
+  assert.equal(usageBy('sk-ant-oat01-aaa'), 3, 'A is still parked');
+
+  // 403 park: C's scope problem parks C until its credentials change — D's polls (another token) do not lift it.
+  const dirC = tmpDir(); const dirD = tmpDir();
+  writeClaudeCreds(dirC, { accessToken: 'sk-ant-oat01-ccc', expiresAt: FAR });
+  writeClaudeCreds(dirD, { accessToken: 'sk-ant-oat01-ddd', expiresAt: FAR });
+  status['sk-ant-oat01-ccc'] = 403;
+  const c = claude.createClaudeCodeProvider({ id: 'claude-3', configDir: dirC });
+  const d = claude.createClaudeCodeProvider({ id: 'claude-4', configDir: dirD });
+  assert.equal((await poll(c, 0)).error.code, 'http_403');
+  assert.equal((await poll(d, 1)).status, 'ok');
+  assert.equal((await poll(c, 61)).error.code, 'http_403');
+  assert.equal(usageBy('sk-ant-oat01-ccc'), 1, "D's poll did not lift C's 403 park");
+
+  // Refresh spacing + back-off: E's rejected refresh 5 s ago does not defer F's, and F's success (other credentials)
+  // neither lifts E's 24 h park nor its spacing.
+  const dirE = tmpDir(); const dirF = tmpDir();
+  writeClaudeCreds(dirE, { expiresAt: NOW - 61 * 1000, refreshToken: 'sk-ant-ort01-eee' });
+  writeClaudeCreds(dirF, { expiresAt: NOW - 61 * 1000, refreshToken: 'sk-ant-ort01-fff' });
+  const tokenFetch = fakeFetch((url, init) => {
+    if (url.endsWith('/v1/oauth/token')) return JSON.parse(init.body).refresh_token === 'sk-ant-ort01-eee' ? response(400, { error: 'invalid_grant' }) : DEFAULT_REFRESH_REPLY();
+    return claudeRoutes()(url, init);
+  });
+  const tokenCalls = (rt) => tokenFetch.calls.filter((call) => call.url.endsWith('/v1/oauth/token') && call.body.refresh_token === rt).length;
+  const e = claude.createClaudeCodeProvider({ id: 'claude-5', configDir: dirE });
+  const f = claude.createClaudeCodeProvider({ id: 'claude-6', configDir: dirF });
+  assert.equal((await e.fetchSnapshot({ settings: SETTINGS, fetch: tokenFetch, now })).error.code, 'refresh_failed');
+  assert.equal(tokenCalls('sk-ant-ort01-eee'), 1);
+  const fSnap = await f.fetchSnapshot({ settings: SETTINGS, fetch: tokenFetch, now: later(5) });
+  assert.equal(fSnap.status, 'ok', "E's attempt does not count against F's 10-min spacing or back-off");
+  assert.equal(tokenCalls('sk-ant-ort01-fff'), 1);
+  const eSpaced = await e.fetchSnapshot({ settings: SETTINGS, fetch: tokenFetch, now: later(65) });
+  assert.equal(eSpaced.status, 'auth_required'); assert.match(eSpaced.error.message, /refresh token rejected/);
+  const eParked = await e.fetchSnapshot({ settings: SETTINGS, fetch: tokenFetch, now: later(11 * 60) });
+  assert.equal(eParked.error.code, 'refresh_failed');
+  assert.equal(tokenCalls('sk-ant-ort01-eee'), 1, "E stays parked: F's poll did not release E's back-off");
+});
+
+test("claude: prepaid credits follow THIS account's expand panel (settings.expandedOpen[id]), not account 1's", async () => {
+  const dir = tmpDir();
+  writeClaudeCreds(dir, { expiresAt: NOW + 10 * 3600 * 1000 });
+  const two = claude.createClaudeCodeProvider({ id: 'claude-2', configDir: dir });
+  const fetch = fakeFetch(claudeRoutes());
+  const poll = (s, expandedOpen) => two.fetchSnapshot({ settings: { ...SETTINGS, expandedOpen }, fetch, now: later(s) });
+  await poll(0, { claude: false, 'claude-2': false });
+  assert.equal(fetch.count('/prepaid/credits'), 1, 'first fill');
+  await poll(6 * 60, { claude: true, 'claude-2': false });
+  assert.equal(fetch.count('/prepaid/credits'), 1, "account 1's open panel does not fetch account 2's credits");
+  await poll(12 * 60, { claude: false, 'claude-2': true });
+  assert.equal(fetch.count('/prepaid/credits'), 2, "account 2's own open panel does");
+});
+
+test('claude: identity — hashed account/org uuids from the cached profile, personalOrg from organization_type; null without a profile; failures keep last good identity', async () => {
+  const dir = tmpDir();
+  const FAR = NOW + 10 * 3600 * 1000;
+  const credentialsPath = writeClaudeCreds(dir, { expiresAt: FAR });
+  const ok = await claude.fetchSnapshot({ settings: SETTINGS, fetch: fakeFetch(claudeRoutes()), now, paths: { credentialsPath } });
+  assert.deepEqual(ok.identity, PROFILE_IDENTITY);
+  const text = JSON.stringify(ok.identity);
+  assert.ok(!text.includes(PROFILE.account.uuid) && !text.includes(PROFILE.organization.uuid), 'never the raw uuid');
+  assert.equal(claude.identityHash(PROFILE.account.uuid), PROFILE_IDENTITY.account);
+
+  // Failures: built from last good → its identity; without last good → null.
+  const down = fakeFetch(() => new Error('ECONNRESET'));
+  const stale = await claude.fetchSnapshot({ settings: SETTINGS, fetch: down, now: later(61), paths: { credentialsPath }, lastGood: ok });
+  assert.equal(stale.status, 'stale'); assert.deepEqual(stale.identity, PROFILE_IDENTITY);
+  const error = await claude.fetchSnapshot({ settings: SETTINGS, fetch: down, now: later(122), paths: { credentialsPath } });
+  assert.equal(error.status, 'error'); assert.equal(error.identity, null);
+  const noWindows = await claude.fetchSnapshot({ settings: SETTINGS, fetch: down, now: later(183), paths: { credentialsPath }, lastGood: { ...ok, windows: [] } });
+  assert.equal(noWindows.status, 'error'); assert.equal(noWindows.identity, null, 'a last good without windows is not built from');
+
+  // organization_type → personalOrg: team / enterprise → false, any other string → true, missing → null.
+  const identityWith = async (organizationType) => {
+    const organization = { ...PROFILE.organization, organization_type: organizationType };
+    if (organizationType === undefined) delete organization.organization_type;
+    const p = claude.createClaudeCodeProvider({ id: 'claude-3', configDir: dir });
+    return (await p.fetchSnapshot({ settings: SETTINGS, fetch: fakeFetch(withProfile({ ...PROFILE, organization })), now })).identity;
+  };
+  assert.equal((await identityWith('claude_team')).personalOrg, false);
+  assert.equal((await identityWith('claude_enterprise')).personalOrg, false);
+  assert.equal((await identityWith('Team')).personalOrg, false, 'case-insensitive');
+  assert.equal((await identityWith('claude_pro')).personalOrg, true);
+  const untyped = await identityWith(undefined);
+  assert.deepEqual(untyped, { account: PROFILE_IDENTITY.account, org: PROFILE_IDENTITY.org, personalOrg: null });
+  const bare = claude.createClaudeCodeProvider({ configDir: dir });
+  const bareSnap = await bare.fetchSnapshot({ settings: SETTINGS, fetch: fakeFetch(withProfile({ account: { display_name: 'x' } })), now });
+  assert.deepEqual(bareSnap.identity, { account: null, org: null, personalOrg: null }, 'unknown parts stay null (dedupe treats unknown as different)');
+
+  // The profile fetch failed and nothing is cached → no identity (usage itself is still ok) …
+  const fresh = claude.createClaudeCodeProvider({ configDir: dir });
+  let profileStatus = 500;
+  const flaky = fakeFetch((url, init) => claudeRoutes({ profileStatus })(url, init));
+  const noProfile = await fresh.fetchSnapshot({ settings: SETTINGS, fetch: flaky, now });
+  assert.equal(noProfile.status, 'ok'); assert.equal(noProfile.identity, null);
+  // … whereas a later failure for the same token keeps the cached profile, and so the identity.
+  profileStatus = 200;
+  assert.deepEqual((await fresh.fetchSnapshot({ settings: SETTINGS, fetch: flaky, now: later(6 * 60) })).identity, PROFILE_IDENTITY);
+  profileStatus = 500;
+  const kept = await fresh.fetchSnapshot({ settings: SETTINGS, fetch: flaky, now: later(70 * 60) });
+  assert.equal(flaky.count('/api/oauth/profile'), 3, 'the hourly refetch was attempted and failed');
+  assert.deepEqual(kept.identity, PROFILE_IDENTITY);
+});
+
+// ---------------------------------------------------------------------------
+// Claude — read-only Keychain store (credentialStore: 'keychain', macOS)
+// ---------------------------------------------------------------------------
+
+const KC_OAUTH = {
+  accessToken: 'sk-ant-oat01-kc', refreshToken: 'sk-ant-ort01-kc', expiresAt: NOW + 3600 * 1000, refreshTokenExpiresAt: 4133980800000,
+  scopes: ['user:inference', 'user:profile'], subscriptionType: 'max', rateLimitTier: 'default_claude_max_20x',
+};
+const kcItem = (oauth = {}) => ({ creds: { claudeAiOauth: { ...KC_OAUTH, ...oauth } }, service: 'Claude Code-credentials-00000000', stamp: 'stamp' });
+const kcError = (code, extra = {}) => Object.assign(new Error(`fake ${code}`), { code }, extra);
+const WAITING_3 = 'Claude token expired - waiting for Claude Code to refresh it (open Claude 3 in Claude Code)';
+
+/**
+ * Fake keychain module. `set(next)` changes what the next read returns (an item, or an Error to throw). The Proxy
+ * records every property the provider touches, so a test can prove the provider only ever READS.
+ */
+function fakeKeychain(initial = kcItem()) {
+  let current = initial;
+  const reads = [];
+  const touched = new Set();
+  const target = {
+    async readCredentials(configDir) {
+      reads.push(configDir);
+      if (current instanceof Error) throw current;
+      return JSON.parse(JSON.stringify(current));
+    },
+  };
+  const kc = new Proxy(target, { get(t, k) { touched.add(k); return t[k]; } });
+  return { kc, reads, touched, set: (next) => { current = next; } };
+}
+const keychainProvider = (kc, opts = {}) => claude.createClaudeCodeProvider({
+  id: 'claude-3', name: 'Claude 3', configDir: '~/.claude-3', credentialStore: 'keychain', keychain: kc, platform: 'darwin', ...opts,
+});
+
+test("claude keychain: reads Claude Code's Keychain item for the folder → ok, source claude_keychain, identity; never the credentials file", async () => {
+  const { kc, reads } = fakeKeychain();
+  const p = keychainProvider(kc);
+  assert.equal(p.source, 'claude_keychain');
+  const fetch = fakeFetch(claudeRoutes());
+  const missingFile = path.join(tmpDir(), '.credentials.json');
+  const snap = await p.fetchSnapshot({ settings: SETTINGS, fetch, now, paths: { credentialsPath: missingFile } });
+  assert.equal(snap.status, 'ok', 'a missing credentials file is irrelevant to this store');
+  assert.equal(snap.id, 'claude-3'); assert.equal(snap.name, 'Claude 3'); assert.equal(snap.source, 'claude_keychain');
+  assert.equal(snap.plan, 'Max 20x'); assert.equal(snap.account, 'Tester');
+  assert.deepEqual(snap.identity, PROFILE_IDENTITY);
+  assert.deepEqual(reads, ['~/.claude-3'], 'the folder setting as typed (keychain.js resolves it)');
+  assert.deepEqual(fetch.calls.map((c) => c.url), [claude.USAGE_URL, claude.PROFILE_URL, CLAUDE_CREDITS_URL]);
+  assert.ok(fetch.calls.every((c) => bearerOf(c) === 'sk-ant-oat01-kc'));
+
+  // Same etiquette as the file store: inside the 60 s floor not even the Keychain is read again.
+  const again = await p.fetchSnapshot({ settings: SETTINGS, fetch, now: later(30) });
+  assert.equal(again.updatedAt, snap.updatedAt);
+  assert.equal(reads.length, 1); assert.equal(fetch.count('/api/oauth/usage'), 1);
+
+  // A token just inside the 60 s grace is used as-is (only a lapsed one waits).
+  const near = fakeKeychain(kcItem({ expiresAt: NOW - 59 * 1000 }));
+  assert.equal((await keychainProvider(near.kc).fetchSnapshot({ settings: SETTINGS, fetch: fakeFetch(claudeRoutes()), now })).status, 'ok');
+});
+
+test('claude keychain: READ-ONLY — a lapsed token, a 401 and a lapsed refresh token never reach the token endpoint and nothing is written', async () => {
+  const folder = tmpDir(); // the account folder: no credentials file or lock may ever appear in it
+  const lastGood = { plan: 'Max 20x', account: 'p', updatedAt: 9, windows: [{ key: 'session' }], extra: null, identity: PROFILE_IDENTITY };
+  const fetch = fakeFetch(claudeRoutes({ acceptToken: 'never-matches' })); // any request that is made → 401
+  const touchedAll = [];
+  const run = async (item, { settings = SETTINGS, withLastGood = false } = {}) => {
+    const k = fakeKeychain(item);
+    const snap = await keychainProvider(k.kc, { configDir: folder }).fetchSnapshot({ settings, fetch, now, lastGood: withLastGood ? lastGood : null, lockOptions: NO_WAIT_LOCK });
+    touchedAll.push(k.touched);
+    return { snap, reads: k.reads };
+  };
+
+  // Lapsed access token (the grace boundary counts): waiting, no request at all, whatever tokenAutoRefresh says.
+  for (const settings of [SETTINGS, NO_REFRESH]) {
+    const { snap } = await run(kcItem({ expiresAt: NOW - 60 * 1000 }), { settings });
+    assert.equal(snap.status, 'error');
+    assert.deepEqual(snap.error, { code: 'token_expired', message: WAITING_3 });
+  }
+  const { snap: lapsedStale } = await run(kcItem({ expiresAt: NOW - 61 * 1000 }), { withLastGood: true });
+  assert.equal(lapsedStale.status, 'stale', 'never auth_required: Claude Code fixes it the next time the folder is opened');
+  assert.deepEqual(lapsedStale.error, { code: 'token_expired', message: WAITING_3 });
+  assert.deepEqual(lapsedStale.windows, lastGood.windows); assert.deepEqual(lapsedStale.identity, PROFILE_IDENTITY);
+  assert.equal(fetch.calls.length, 0, 'a lapsed token is never sent anywhere');
+
+  // A lapsed refresh token as well: still only waiting (Claude Code asks for /login when opened), no token call.
+  const { snap: rtLapsed } = await run(kcItem({ expiresAt: NOW - 61 * 1000, refreshTokenExpiresAt: NOW - 1 }));
+  assert.equal(rtLapsed.status, 'error');
+  assert.deepEqual(rtLapsed.error, { code: 'token_expired', message: WAITING_3 });
+  assert.equal(fetch.calls.length, 0);
+
+  // 401 with an unchanged item: one re-read, then waiting (http_401) — no refresh, no second usage request.
+  const { snap: rejected, reads } = await run(kcItem());
+  assert.equal(rejected.status, 'error');
+  assert.deepEqual(rejected.error, { code: 'http_401', message: WAITING_3 });
+  assert.deepEqual(reads, [folder, folder], 'the item was re-read once');
+  assert.equal(fetch.count('/api/oauth/usage'), 1);
+  const { snap: rejectedStale } = await run(kcItem({ refreshTokenExpiresAt: NOW - 1 }), { withLastGood: true, settings: NO_REFRESH });
+  assert.equal(rejectedStale.status, 'stale');
+  assert.deepEqual(rejectedStale.error, { code: 'http_401', message: WAITING_3 });
+  assert.equal(fetch.count('/api/oauth/usage'), 2);
+
+  assert.equal(fetch.count('/v1/oauth/token'), 0, 'the token endpoint is never called');
+  assert.deepEqual(fs.readdirSync(folder), [], 'nothing written into the account folder (no credentials file, no lock)');
+  for (const touched of touchedAll) assert.deepEqual([...touched], ['readCredentials'], 'the Keychain module is only ever read');
+});
+
+test('claude keychain: a 401 re-reads the item once — a token Claude Code rotated meanwhile is retried once; still rejected → waiting', async () => {
+  const k = fakeKeychain(kcItem({ accessToken: 'sk-ant-oat01-kc-old' }));
+  const fetch = fakeFetch((url, init) => {
+    if (url === claude.USAGE_URL && bearerOf({ headers: init.headers }) === 'sk-ant-oat01-kc-old') {
+      k.set(kcItem({ accessToken: 'sk-ant-oat01-kc-new' })); // Claude Code refreshed while our request was in flight
+      return response(401, { error: { type: 'authentication_error', message: 'invalid token' } });
+    }
+    return claudeRoutes({ acceptToken: 'sk-ant-oat01-kc-new' })(url, init);
+  });
+  const snap = await keychainProvider(k.kc).fetchSnapshot({ settings: SETTINGS, fetch, now });
+  assert.equal(snap.status, 'ok');
+  assert.deepEqual(fetch.calls.filter((c) => c.url === claude.USAGE_URL).map(bearerOf), ['sk-ant-oat01-kc-old', 'sk-ant-oat01-kc-new']);
+  assert.equal(k.reads.length, 2);
+  assert.equal(fetch.count('/v1/oauth/token'), 0);
+
+  // The rotated token is rejected too → waiting (http_401), never a third request.
+  const k2 = fakeKeychain(kcItem({ accessToken: 'sk-ant-oat01-kc-old' }));
+  const fetch2 = fakeFetch((url, init) => {
+    if (url === claude.USAGE_URL) k2.set(kcItem({ accessToken: 'sk-ant-oat01-kc-new' }));
+    return claudeRoutes({ acceptToken: 'nobody' })(url, init);
+  });
+  const snap2 = await keychainProvider(k2.kc).fetchSnapshot({ settings: SETTINGS, fetch: fetch2, now });
+  assert.equal(snap2.status, 'error');
+  assert.deepEqual(snap2.error, { code: 'http_401', message: WAITING_3 });
+  assert.equal(fetch2.count('/api/oauth/usage'), 2);
+  assert.equal(fetch2.count('/v1/oauth/token'), 0);
+
+  // The re-read itself fails → the same waiting failure.
+  const k3 = fakeKeychain(kcItem());
+  const fetch3 = fakeFetch((url, init) => {
+    if (url === claude.USAGE_URL) k3.set(kcError('keychain_error'));
+    return claudeRoutes({ acceptToken: 'nobody' })(url, init);
+  });
+  const snap3 = await keychainProvider(k3.kc).fetchSnapshot({ settings: SETTINGS, fetch: fetch3, now });
+  assert.deepEqual(snap3.error, { code: 'http_401', message: WAITING_3 });
+  assert.equal(fetch3.count('/api/oauth/usage'), 1);
+});
+
+test('claude keychain: no item → auth_required / no_credentials naming the folder as typed; read errors are never a sign-in prompt', async () => {
+  const fetch = fakeFetch(claudeRoutes());
+  const lastGood = { plan: 'Pro', account: 'p', updatedAt: 9, windows: [{ key: 'session' }], extra: null, identity: PROFILE_IDENTITY };
+  const run = (current, { configDir = '~/.claude-2', withLastGood = false } = {}) => keychainProvider(fakeKeychain(current).kc, { configDir })
+    .fetchSnapshot({ settings: SETTINGS, fetch, now, lastGood: withLastGood ? lastGood : null });
+
+  let snap = await run(kcError('not_found'));
+  assert.equal(snap.status, 'auth_required');
+  assert.deepEqual(snap.error, { code: 'no_credentials', message: 'No Claude Code login in the Keychain for ~/.claude-2 - open it in Claude Code and run /login' });
+  snap = await run(kcError('not_found'), { configDir: '' });
+  assert.equal(snap.error.message, 'No Claude Code login in the Keychain for ~/.claude - open it in Claude Code and run /login', "'' is Claude Code's default folder");
+  snap = await run(kcError('not_found'), { configDir: '/Volumes/Work/.claude-x', withLastGood: true });
+  assert.equal(snap.status, 'auth_required');
+  assert.equal(snap.error.message, 'No Claude Code login in the Keychain for /Volumes/Work/.claude-x - open it in Claude Code and run /login');
+  // An item without a Claude login (only MCP tokens) is "no login" too.
+  snap = await run({ creds: { mcpOAuth: {} }, service: 's', stamp: 'x' });
+  assert.equal(snap.status, 'auth_required'); assert.equal(snap.error.code, 'no_credentials'); assert.match(snap.error.message, /for ~\/\.claude-2 - /);
+
+  // Timeout → network; any other read error → internal; a broken item → parse. Stale with last good, else error.
+  snap = await run(kcError('keychain_error', { timedOut: true }));
+  assert.equal(snap.status, 'error'); assert.equal(snap.error.code, 'network'); assert.match(snap.error.message, /timed out/);
+  snap = await run(kcError('keychain_error', { timedOut: true }), { withLastGood: true });
+  assert.equal(snap.status, 'stale'); assert.equal(snap.error.code, 'network'); assert.deepEqual(snap.identity, PROFILE_IDENTITY);
+  snap = await run(kcError('keychain_error'));
+  assert.equal(snap.status, 'error'); assert.equal(snap.error.code, 'internal'); assert.match(snap.error.message, /Keychain/);
+  snap = await run(kcError('keychain_error'), { withLastGood: true });
+  assert.equal(snap.status, 'stale'); assert.equal(snap.error.code, 'internal');
+  snap = await run(kcError('parse'));
+  assert.equal(snap.status, 'error'); assert.equal(snap.error.code, 'parse');
+  assert.equal(fetch.calls.length, 0);
+});
+
+test('claude keychain: macOS only — elsewhere an internal error without touching the Keychain or the network', async () => {
+  const { kc, reads } = fakeKeychain();
+  const fetch = fakeFetch(claudeRoutes());
+  for (const platform of ['win32', 'linux']) {
+    const snap = await keychainProvider(kc, { platform }).fetchSnapshot({ settings: SETTINGS, fetch, now });
+    assert.equal(snap.status, 'error');
+    assert.deepEqual(snap.error, { code: 'internal', message: 'The Keychain source is only available on macOS' });
+    assert.equal(snap.source, 'claude_keychain');
+  }
+  assert.equal(reads.length, 0); assert.equal(fetch.calls.length, 0);
+  assert.equal((await keychainProvider(kc).fetchSnapshot({ settings: SETTINGS, fetch, now })).status, 'ok', 'darwin reads it');
+});
+
+test('claude keychain: a 403 scope park holds until the Keychain token changes (this store has no file mtime)', async () => {
+  const k = fakeKeychain(kcItem());
+  const p = keychainProvider(k.kc);
+  const fetch = fakeFetch(claudeRoutes({ usageStatus: 403, usageBody: { error: { message: "OAuth token does not meet scope requirement 'user:profile'" } } }));
+  let snap = await p.fetchSnapshot({ settings: SETTINGS, fetch, now });
+  assert.equal(snap.status, 'auth_required'); assert.equal(snap.error.code, 'http_403');
+  snap = await p.fetchSnapshot({ settings: SETTINGS, fetch, now: later(61) });
+  assert.equal(snap.error.code, 'http_403');
+  assert.equal(fetch.count('/api/oauth/usage'), 1, 'parked while the token is unchanged');
+  k.set(kcItem({ accessToken: 'sk-ant-oat01-kc-rescoped' }));
+  await p.fetchSnapshot({ settings: SETTINGS, fetch, now: later(122) });
+  assert.equal(fetch.count('/api/oauth/usage'), 2, 'a new token is tried');
+});
+
+// ---------------------------------------------------------------------------
 // Claude web (claude.ai session) — pure parts + injected window fetch
 // ---------------------------------------------------------------------------
 
@@ -1391,4 +1801,224 @@ test('claude-web: settings.claudeOrganizationId is the org fallback; dead sessio
   assert.deepEqual(claudeWeb.getSession(), { sessionKey: false, organizationId: null, organizations: [] });
   await claudeWeb.selectOrg('org-2');
   assert.equal(claudeWeb.getSession().organizationId, 'org-2');
+});
+
+// ---------------------------------------------------------------------------
+// Claude web — one instance per account (createClaudeWebProvider)
+// ---------------------------------------------------------------------------
+
+const webUsage = async (urls) => urls.map(() => ({ ok: true, value: fixture('claude-usage.json') }));
+const orgsReply = (orgs) => async () => [{ ok: true, value: orgs }];
+
+test('claude-web: createClaudeWebProvider — account 1 keeps persist:claude-web, every other account its own partition; fetches carry it', async () => {
+  assert.equal(claudeWeb.partition, 'persist:claude-web', 'the module instance keeps the 1.0.x sign-in');
+  assert.equal(claudeWeb.createClaudeWebProvider().partition, 'persist:claude-web');
+  assert.equal(claudeWeb.createClaudeWebProvider({ id: 'claude' }).partition, 'persist:claude-web');
+  assert.equal(claudeWeb.createClaudeWebProvider({ id: 'claude-4', partition: 'persist:custom' }).partition, 'persist:custom');
+  const two = claudeWeb.createClaudeWebProvider({ id: 'claude-2', name: 'Claude 2' });
+  assert.equal(two.partition, 'persist:claude-web-claude-2');
+  assert.equal(claudeWeb.createClaudeWebProvider({ id: 'claude-6' }).partition, 'persist:claude-web-claude-6');
+  assert.equal(two.id, 'claude-2'); assert.equal(two.name, 'Claude 2'); assert.equal(two.source, 'claude_web');
+  for (const fn of ['fetchSnapshot', 'setSession', 'getSession', 'login', 'logout', 'listOrgs', 'selectOrg', 'resetState']) assert.equal(typeof two[fn], 'function', fn);
+
+  two.setSession({ sessionKey: 'sk-ant-sid01-FAKE-2', organizationId: 'org-2' });
+  const partitions = [];
+  const snap = await two.fetchSnapshot({ settings: SETTINGS, now, fetchJson: async (urls, opts) => { partitions.push(opts.partition); return webUsage(urls); } });
+  assert.equal(snap.status, 'ok'); assert.equal(snap.id, 'claude-2'); assert.equal(snap.name, 'Claude 2');
+  await two.listOrgs({ fetchJson: async (urls, opts) => { partitions.push(opts.partition); return orgsReply([{ uuid: 'org-2', name: 'Two', capabilities: ['chat'] }])(); } });
+  assert.deepEqual(partitions, ['persist:claude-web-claude-2', 'persist:claude-web-claude-2'], 'usage and the org listing both');
+  let label = 'Work';
+  const named = claudeWeb.createClaudeWebProvider({ id: 'claude-3', name: () => label });
+  label = 'Personal';
+  assert.equal(named.name, 'Personal');
+});
+
+test('claude-web: two accounts never share a session, org, org cache or request floor', async () => {
+  const a = claudeWeb.createClaudeWebProvider({ id: 'claude-2' });
+  const b = claudeWeb.createClaudeWebProvider({ id: 'claude-3' });
+  const urlsSeen = [];
+  const fetchJson = async (urls) => { urlsSeen.push(urls[0]); return webUsage(urls); };
+
+  a.setSession({ sessionKey: 'sk-ant-sid01-FAKE-A', organizationId: 'org-a' });
+  const bLoggedOut = await b.fetchSnapshot({ settings: SETTINGS, now, fetchJson });
+  assert.equal(bLoggedOut.status, 'auth_required', "A's sign-in is not B's"); assert.equal(bLoggedOut.error.code, 'no_credentials');
+  assert.equal(claudeWeb.getSession().sessionKey, false, 'nor the module (account 1) instance');
+
+  // Floor: B polls a second after A and still loads its own org; each keeps its own 60 s floor.
+  b.setSession({ sessionKey: 'sk-ant-sid01-FAKE-B', organizationId: 'org-b' });
+  assert.equal((await a.fetchSnapshot({ settings: SETTINGS, now, fetchJson })).status, 'ok');
+  assert.equal((await b.fetchSnapshot({ settings: SETTINGS, now: later(1), fetchJson })).status, 'ok');
+  assert.deepEqual(urlsSeen, ['https://claude.ai/api/organizations/org-a/usage', 'https://claude.ai/api/organizations/org-b/usage'], "A's floor does not replay A's result for B");
+  await a.fetchSnapshot({ settings: SETTINGS, now: later(30), fetchJson });
+  await b.fetchSnapshot({ settings: SETTINGS, now: later(31), fetchJson });
+  assert.equal(urlsSeen.length, 2);
+
+  // Org selection and the org cache are per account; selectOrg clears only its own floor.
+  await a.selectOrg('org-a2');
+  assert.equal(b.getSession().organizationId, 'org-b');
+  await a.listOrgs({ fetchJson: orgsReply([{ uuid: 'org-a2', name: 'A2', capabilities: ['chat'] }]) });
+  assert.deepEqual(a.getSession().organizations.map((o) => o.id), ['org-a2']);
+  assert.deepEqual(b.getSession().organizations, []);
+  await a.fetchSnapshot({ settings: SETTINGS, now: later(32), fetchJson });
+  await b.fetchSnapshot({ settings: SETTINGS, now: later(33), fetchJson });
+  assert.deepEqual(urlsSeen.slice(2), ['https://claude.ai/api/organizations/org-a2/usage'], "A's new org is polled at once; B is still inside its floor");
+
+  // Logging A out leaves B signed in.
+  await a.logout();
+  assert.equal(a.getSession().sessionKey, false);
+  assert.deepEqual(b.getSession(), { sessionKey: true, organizationId: 'org-b', organizations: [] });
+});
+
+test("claude-web: extended endpoints follow THIS account's expand panel (settings.expandedOpen[id])", async () => {
+  const two = claudeWeb.createClaudeWebProvider({ id: 'claude-2' });
+  two.setSession({ sessionKey: 'sk-ant-sid01-FAKE', organizationId: 'org-2' });
+  const seen = [];
+  const fetchJson = async (urls) => { seen.push(urls.length); return webUsage(urls); };
+  await two.fetchSnapshot({ settings: { ...SETTINGS, expandedOpen: { claude: true, 'claude-2': false } }, now, fetchJson });
+  await two.fetchSnapshot({ settings: { ...SETTINGS, expandedOpen: { claude: false, 'claude-2': true } }, now: later(60), fetchJson });
+  assert.deepEqual(seen, [1, 3], "account 1's panel does not fetch account 2's spend; its own does");
+});
+
+test('claude-web: identity — the selected org hashed, personalOrg from raven_type / capabilities (null for an org not in the cache); failures keep last good identity', async () => {
+  const p = claudeWeb.createClaudeWebProvider({ id: 'claude-2' });
+  p.setSession({ sessionKey: 'sk-ant-sid01-FAKE', organizationId: 'org-personal' });
+  const first = await p.fetchSnapshot({ settings: SETTINGS, now, fetchJson: webUsage });
+  assert.deepEqual(first.identity, { account: null, org: sha16('org-personal'), personalOrg: null }, 'org list not loaded yet → unknown');
+  assert.equal(claudeWeb.identityHash('org-personal'), sha16('org-personal'));
+
+  await p.listOrgs({ fetchJson: orgsReply([
+    { uuid: 'org-personal', name: 'Personal', capabilities: ['chat', 'claude_max'], raven_type: null },
+    { uuid: 'org-team', name: 'Team', capabilities: ['chat', 'raven'], raven_type: 'team' },
+    { uuid: 'org-raven', name: 'Raven', capabilities: ['chat', 'raven'] },
+    { uuid: 'org-ent', name: 'Ent', capabilities: ['chat'], raven_type: 'enterprise' },
+  ]) });
+  const identityFor = async (org, s) => { await p.selectOrg(org); return (await p.fetchSnapshot({ settings: SETTINGS, now: later(s), fetchJson: webUsage })).identity; };
+  const personal = await identityFor('org-personal', 1);
+  assert.deepEqual(personal, { account: null, org: sha16('org-personal'), personalOrg: true });
+  assert.ok(!JSON.stringify(personal).includes('org-personal'), 'never the raw uuid');
+  assert.equal((await identityFor('org-team', 2)).personalOrg, false);
+  assert.equal((await identityFor('org-raven', 3)).personalOrg, false, "a 'raven' capability alone marks a Team org");
+  assert.equal((await identityFor('org-ent', 4)).personalOrg, false, 'any raven_type');
+  assert.deepEqual(await identityFor('org-unknown', 5), { account: null, org: sha16('org-unknown'), personalOrg: null });
+
+  // Failures: built from last good → its identity; otherwise null.
+  await p.selectOrg('org-personal');
+  const lastGood = { plan: null, account: null, updatedAt: 3, windows: [{ key: 'session' }], extra: null, identity: personal };
+  const dead = await p.fetchSnapshot({ settings: SETTINGS, now: later(6), lastGood, fetchJson: async () => [{ ok: false, code: 'CloudflareBlocked', message: 'Just a moment' }] });
+  assert.equal(dead.status, 'auth_required'); assert.deepEqual(dead.identity, personal);
+  await p.selectOrg('org-personal');
+  const timeout = await p.fetchSnapshot({ settings: SETTINGS, now: later(7), fetchJson: async () => [{ ok: false, code: 'Timeout', message: 'Request timeout' }] });
+  assert.equal(timeout.status, 'error'); assert.equal(timeout.identity, null);
+});
+
+test("claude-web: org fallback — the account's own org → getOrganizationId() → settings.claudeOrganizationId for account 1 only", async () => {
+  const urls = [];
+  const fetchJson = async (u) => { urls.push(u[0]); return webUsage(u); };
+  const legacy = { ...SETTINGS, claudeOrganizationId: 'org-legacy' };
+
+  const two = claudeWeb.createClaudeWebProvider({ id: 'claude-2' });
+  two.setSession({ sessionKey: 'sk-ant-sid01-FAKE' });
+  const snap = await two.fetchSnapshot({ settings: legacy, now, fetchJson });
+  assert.equal(snap.status, 'auth_required', "account 1's legacy org key is not account 2's");
+  assert.equal(urls.length, 0);
+
+  const fromCaller = claudeWeb.createClaudeWebProvider({ id: 'claude-2', getOrganizationId: () => 'org-caller' });
+  fromCaller.setSession({ sessionKey: 'sk-ant-sid01-FAKE' });
+  await fromCaller.fetchSnapshot({ settings: legacy, now, fetchJson });
+  fromCaller.setSession({ sessionKey: 'sk-ant-sid01-FAKE', organizationId: 'org-own' });
+  await fromCaller.fetchSnapshot({ settings: legacy, now: later(1), fetchJson });
+  const throwing = claudeWeb.createClaudeWebProvider({ id: 'claude-3', getOrganizationId: () => { throw new Error('boom'); } });
+  throwing.setSession({ sessionKey: 'sk-ant-sid01-FAKE' });
+  assert.equal((await throwing.fetchSnapshot({ settings: legacy, now, fetchJson })).error.code, 'no_credentials', 'a throwing fallback is no org');
+
+  const one = claudeWeb.createClaudeWebProvider({ id: 'claude', getOrganizationId: () => null });
+  one.setSession({ sessionKey: 'sk-ant-sid01-FAKE' });
+  await one.fetchSnapshot({ settings: legacy, now, fetchJson });
+  assert.deepEqual(urls, [
+    'https://claude.ai/api/organizations/org-caller/usage',
+    'https://claude.ai/api/organizations/org-own/usage',
+    'https://claude.ai/api/organizations/org-legacy/usage',
+  ], 'caller fallback; then the instance org wins; account 1 still falls back to claudeOrganizationId');
+});
+
+/**
+ * Runs fn(rec) with a stand-in for Electron (BrowserWindow + session.fromPartition) in require.cache, recording
+ * windows, partitions and cookie / storage operations. The hidden fetch window "loads" every URL as usage JSON.
+ */
+async function withFakeElectron(fn) {
+  const rec = { windows: [], partitions: [], cookies: [], cleared: [] };
+  class BrowserWindow {
+    constructor(opts) {
+      this.opts = opts; this.title = opts.title; this.events = {}; this.destroyed = false;
+      const events = {};
+      this.webContents = {
+        events,
+        on: (ev, cb) => { events[ev] = cb; },
+        setUserAgent() {}, setWindowOpenHandler() {},
+        executeJavaScript: async () => JSON.stringify(fixture('claude-usage.json')),
+      };
+      rec.windows.push(this);
+    }
+    loadURL(url) { this.url = url; const cb = this.webContents.events['did-finish-load']; if (cb) setImmediate(cb); return Promise.resolve(); }
+    on(ev, cb) { this.events[ev] = cb; }
+    setTitle(t) { this.title = t; }
+    isDestroyed() { return this.destroyed; }
+    destroy() { this.destroyed = true; }
+    close() { if (this.destroyed) return; this.destroyed = true; if (this.events.closed) this.events.closed(); }
+  }
+  const session = {
+    fromPartition(partition) {
+      rec.partitions.push(partition);
+      return {
+        cookies: {
+          set: async (c) => { rec.cookies.push({ partition, op: 'set', name: c.name }); },
+          remove: async (_url, cookieName) => { rec.cookies.push({ partition, op: 'remove', name: cookieName }); },
+          get: async () => [{ name: 'sessionKey' }, { name: 'cf_clearance' }],
+          on() {}, removeListener() {},
+        },
+        clearStorageData: async () => { rec.cleared.push(partition); },
+      };
+    },
+  };
+  const electronPath = require.resolve('electron');
+  const saved = require.cache[electronPath];
+  const stub = new Module(electronPath);
+  stub.filename = electronPath; stub.loaded = true; stub.exports = { BrowserWindow, session };
+  require.cache[electronPath] = stub;
+  try {
+    return await fn(rec);
+  } finally {
+    if (saved) require.cache[electronPath] = saved; else delete require.cache[electronPath];
+  }
+}
+
+test("claude-web: login, hidden fetches and logout stay in the account's own partition; the login window names the account", async () => {
+  await withFakeElectron(async (rec) => {
+    const two = claudeWeb.createClaudeWebProvider({ id: 'claude-2', name: 'Claude 2' });
+    const pending = two.login({ timeoutMs: 20 });
+    const loginWin = rec.windows[0];
+    assert.equal(loginWin.opts.webPreferences.partition, 'persist:claude-web-claude-2');
+    assert.equal(loginWin.title, 'Claude Login (Claude 2) - https://claude.ai/login');
+    loginWin.webContents.events['did-navigate'](null, 'https://accounts.google.com/o/oauth2');
+    assert.equal(loginWin.title, 'Claude Login (Claude 2) - https://accounts.google.com/o/oauth2');
+    assert.deepEqual(await pending, { success: false, error: 'Login timed out' });
+
+    two.setSession({ sessionKey: 'sk-ant-sid01-FAKE-2', organizationId: 'org-2' });
+    const snap = await two.fetchSnapshot({ settings: SETTINGS, now });
+    assert.equal(snap.status, 'ok', 'the real hidden-window path, on the stand-in');
+    assert.equal(rec.windows[1].opts.show, false);
+    assert.equal(rec.windows[1].opts.webPreferences.partition, 'persist:claude-web-claude-2');
+    assert.ok(rec.cookies.some((c) => c.op === 'set' && c.name === 'sessionKey'), 'the session cookie was set');
+
+    await two.logout();
+    assert.deepEqual(rec.cleared, ['persist:claude-web-claude-2']);
+    assert.ok(rec.cookies.some((c) => c.op === 'remove' && c.name === 'cf_clearance'), 'every claude.ai cookie removed');
+    assert.deepEqual([...new Set(rec.partitions)], ['persist:claude-web-claude-2'], 'every cookie / storage operation stayed in the account partition');
+
+    // Account 1 (the module instance) stays on the 1.0.x partition.
+    claudeWeb.setSession({ sessionKey: 'sk-ant-sid01-FAKE-1', organizationId: 'org-1' });
+    assert.equal((await claudeWeb.fetchSnapshot({ settings: SETTINGS, now })).status, 'ok');
+    assert.equal(rec.windows[2].opts.webPreferences.partition, 'persist:claude-web');
+    assert.equal(rec.partitions[rec.partitions.length - 1], 'persist:claude-web');
+  });
 });

@@ -1,6 +1,9 @@
 'use strict';
 // Usage history (ARCHITECTURE.md §7). Pure factory: storage (get/set) and the clock are injected so
-// the logic runs in `node --test` without Electron. Samples are `{ t, v: { '<provider>.<windowKey>': pct } }`.
+// the logic runs in `node --test` without Electron. Samples are `{ t, v: { '<provider>.<windowKey>': pct } }`;
+// every Claude account has its own provider id, so account 2's keys are 'claude-2.session', 'claude-2.weekly'.
+
+const { isClaudeId, slotOf, orderProviderIds } = require('./accounts');
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const RETENTION_MS = 8 * DAY_MS;
@@ -56,11 +59,14 @@ function prune(samples, nowMs) {
   return kept;
 }
 
+// Fallback label for a key no current provider describes. A Claude account's default name is 'Claude <slot>'
+// (accounts.accountDisplayName), so 'claude-3.weekly' reads 'Claude 3 Weekly', not 'Claude-3 Weekly'.
 function humanizeKey(key) {
   const [provider, ...rest] = key.split('.');
   const capitalize = (s) => (s ? s.charAt(0).toUpperCase() + s.slice(1) : s);
   const windowPart = rest.join('.').split('_').map(capitalize).join(' ');
-  return `${capitalize(provider)} ${windowPart}`.trim();
+  const providerPart = isClaudeId(provider) && slotOf(provider) > 1 ? `Claude ${slotOf(provider)}` : capitalize(provider);
+  return `${providerPart} ${windowPart}`.trim();
 }
 
 // Series descriptors give the chart names/colours. The latest snapshot is authoritative; keys that
@@ -88,11 +94,19 @@ function buildSeries(latestSnapshot, samples) {
     }
   }
 
-  const leftovers = new Set();
+  // Leftovers grouped in provider order (a plain sort would put 'claude-2.*' before 'claude.*').
+  const leftovers = new Map();
   for (const sample of samples) {
-    for (const key of Object.keys(sample.v)) if (!seen.has(key)) leftovers.add(key);
+    for (const key of Object.keys(sample.v)) {
+      if (seen.has(key)) continue;
+      const providerId = key.split('.')[0];
+      if (!leftovers.has(providerId)) leftovers.set(providerId, new Set());
+      leftovers.get(providerId).add(key);
+    }
   }
-  for (const key of [...leftovers].sort()) push({ key, label: humanizeKey(key), color: 'slate' });
+  for (const providerId of orderProviderIds([...leftovers.keys()])) {
+    for (const key of [...leftovers.get(providerId)].sort()) push({ key, label: humanizeKey(key), color: 'slate' });
+  }
 
   return series;
 }

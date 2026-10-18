@@ -5,6 +5,9 @@
 
 const Store = require('electron-store');
 const { validateRelayUrl } = require('./sync'); // pure; the single source of truth for relay URL rules
+// Pure; every rule about the Claude account list lives there (and is unit-tested there, since this module
+// needs Electron to load).
+const { defaultAccounts, sanitizeAccounts, migrateLegacyAccounts, applyLegacyAccountPatch, pruneAccountFlags } = require('./accounts');
 
 const SETTINGS_DEFAULTS = Object.freeze({
   autoStart: false,
@@ -22,6 +25,10 @@ const SETTINGS_DEFAULTS = Object.freeze({
   graphVisible: false,
   expandedOpen: Object.freeze({ claude: false, codex: false }),
   providers: Object.freeze({ claude: true, codex: true }),
+  // Several Claude accounts (accounts.js). Account 1 keeps the provider id 'claude'; visibility and expand
+  // state of account N live under providers['claude-N'] / expandedOpen['claude-N'] (absent = default).
+  claudeAccounts: Object.freeze(defaultAccounts().map((a) => Object.freeze(a))),
+  // Legacy single-source keys, always mirrored from account 1 by sanitizeSettings (1.0.x readers).
   claudeSource: 'claude_code',
   tokenAutoRefresh: true,
   trayStats: 'off',
@@ -40,13 +47,14 @@ const ENUMS = {
   background: ['acrylic', 'acrylic_clear', 'mica', 'solid'],
   timeFormat: ['12h', '24h'],
   dateFormat: ['date', 'date-day', 'date-day-time'],
-  claudeSource: ['claude_code', 'claude_web'],
+  claudeSource: ['claude_code', 'claude_web', 'claude_keychain'],
   trayStats: ['off', 'claude', 'codex', 'both'],
   refreshInterval: ['15', '30', '60', '120', '300'],
 };
 
 const BOOLEAN_KEYS = ['autoStart', 'hideFromTaskbar', 'alwaysOnTop', 'usageAlerts', 'compactMode', 'graphVisible', 'tokenAutoRefresh', 'phoneSyncEnabled'];
-// Nested { claude: bool, codex: bool } maps — patches merge into them instead of replacing them.
+// Nested { claude: bool, codex: bool, 'claude-2': bool, … } maps — patches merge into them instead of
+// replacing them. Every other key, arrays included (claudeAccounts), is replaced by a patch.
 const NESTED_BOOLEAN_KEYS = ['expandedOpen', 'providers'];
 
 // conf rethrows the SyntaxError from a corrupt config.json (default clearInvalidConfig: false) — and the
@@ -116,6 +124,11 @@ function sanitizeSettings(input, previous = SETTINGS_DEFAULTS) {
     [out.warnThreshold, out.dangerThreshold] = [out.dangerThreshold, out.warnThreshold];
   }
 
+  // Account 1 always exists and comes first; the legacy keys are its mirror, never an independent value.
+  out.claudeAccounts = sanitizeAccounts(out.claudeAccounts, previous.claudeAccounts);
+  out.claudeSource = out.claudeAccounts[0].source;
+  out.claudeOrganizationId = out.claudeAccounts[0].organizationId;
+
   for (const key of NESTED_BOOLEAN_KEYS) {
     const defaults = SETTINGS_DEFAULTS[key];
     const source = isPlainObject(out[key]) ? out[key] : (isPlainObject(previous[key]) ? previous[key] : defaults);
@@ -123,7 +136,8 @@ function sanitizeSettings(input, previous = SETTINGS_DEFAULTS) {
     for (const [id, enabled] of Object.entries({ ...defaults, ...source })) {
       cleaned[id] = typeof enabled === 'boolean' ? enabled : !!defaults[id];
     }
-    out[key] = cleaned;
+    // A removed account must not leave its hidden / expanded flag behind for the next account in that slot.
+    out[key] = pruneAccountFlags(cleaned, out.claudeAccounts);
   }
 
   const pos = out.windowPosition;
@@ -132,10 +146,6 @@ function sanitizeSettings(input, previous = SETTINGS_DEFAULTS) {
   } else {
     out.windowPosition = pos === null ? null : (previous.windowPosition ?? null);
   }
-
-  out.claudeOrganizationId = typeof out.claudeOrganizationId === 'string' && out.claudeOrganizationId
-    ? out.claudeOrganizationId
-    : null;
 
   // Stored normalized (https only, http for localhost, trailing slash stripped, ≤ 512 chars) or '' when
   // invalid — the renderer validates before saving, so '' here means "cleared", never a silent fallback.
@@ -163,13 +173,22 @@ function getSettings() {
   } catch (err) {
     console.error('[store] failed to read settings, using defaults:', err && err.message);
   }
-  return sanitizeSettings(mergeSettings(SETTINGS_DEFAULTS, isPlainObject(stored) ? stored : {}), SETTINGS_DEFAULTS);
+  const raw = isPlainObject(stored) ? stored : {};
+  // 1.0.x configs have no claudeAccounts: the legacy single-source keys become account 1. The migrated list
+  // is the sanitize baseline, so it also stands in for an account 1 (or a field of it) a stored list lost.
+  const merged = mergeSettings(SETTINGS_DEFAULTS, raw);
+  merged.claudeAccounts = raw.claudeAccounts;
+  return sanitizeSettings(merged, { ...SETTINGS_DEFAULTS, claudeAccounts: migrateLegacyAccounts(raw) });
 }
 
 function saveSettings(patch) {
   const current = getSettings();
   const cleanPatch = isPlainObject(patch) ? stripUndefined(patch) : {};
-  const merged = applyCoupling(sanitizeSettings(mergeSettings(current, cleanPatch), current), cleanPatch);
+  const next = mergeSettings(current, cleanPatch);
+  // claudeAccounts in a patch replaces the whole list (mergeSettings); 1.0.x callers that only send
+  // claudeSource / claudeOrganizationId change account 1, and sanitize mirrors account 1 back to those keys.
+  next.claudeAccounts = applyLegacyAccountPatch(next.claudeAccounts, cleanPatch);
+  const merged = applyCoupling(sanitizeSettings(next, current), cleanPatch);
   store.set('settings', merged);
   return merged;
 }

@@ -47,9 +47,11 @@ function bootstrap() {
   const IS_PORTABLE = process.platform === 'win32' && !!process.env.PORTABLE_EXECUTABLE_FILE;
   const EXTERNAL_HOSTS = ['claude.ai', 'anthropic.com', 'chatgpt.com', 'openai.com', 'github.com'];
   const LOGO_PATH = path.join(__dirname, '..', '..', 'assets', 'logo.png');
-  // Top-level key in config.json (next to `settings`) holding the safeStorage-encrypted claude.ai
-  // sessionKey as base64. Kept out of `settings` so it never travels to the renderer.
+  // Top-level keys in config.json (next to `settings`) holding safeStorage-encrypted claude.ai
+  // sessionKeys as base64. Kept out of `settings` so they never travel to the renderer. Account 1 keeps
+  // the 1.0.x key; the other accounts share one map keyed by account id ({ 'claude-2': <base64>, … }).
   const WEB_SESSION_STORE_KEY = 'claudeWebSession';
+  const WEB_SESSIONS_STORE_KEY = 'claudeWebSessions';
   // Same pattern for the phone-sync pair key K (docs/PHONE-SYNC.md): base64 of
   // safeStorage.encryptString(base64(K)). Without safeStorage the key lives in memory for this run only.
   const PHONE_PAIR_KEY_STORE_KEY = 'phonePairKey';
@@ -58,61 +60,218 @@ function bootstrap() {
   let isQuitting = false;        // set on 'before-quit': lets the close handler tell quit from "hide to tray"
   let recreatingWindow = false;  // suppresses window-all-closed while a background change swaps windows
   let compactMode = false;
-  let lastClaudeStatus = null;
 
   // ---------------------------------------------------------------------------------------------
   // Providers. Modules are written by another agent and may not exist yet, so each one is loaded
   // lazily: a missing/broken module yields an `error` ProviderSnapshot instead of crashing startup,
   // and the require is retried on the next tick so the file is picked up once it appears.
   // ---------------------------------------------------------------------------------------------
-  function lazyProvider(relPath, id, name) {
+  function lazyModule(relPath, exportName) {
     let loaded = null;
     let lastLoadError = null;
     let warned = false;
-    const tryLoad = () => {
+    const get = () => {
       if (loaded) return loaded;
       try {
         const mod = require(relPath);
-        if (!mod || typeof mod.fetchSnapshot !== 'function') throw new Error(`${relPath} does not export fetchSnapshot()`);
+        if (!mod || typeof mod[exportName] !== 'function') throw new Error(`${relPath} does not export ${exportName}()`);
         loaded = mod;
         lastLoadError = null;
-        log.info(`provider ${id} loaded from ${relPath}`);
+        log.info(`module loaded from ${relPath}`);
       } catch (err) {
         lastLoadError = err;
         if (!warned) {
           warned = true;
-          log.warn(`provider ${id} unavailable (${relPath}): ${err && err.message}`);
+          log.warn(`module unavailable (${relPath}): ${err && err.message}`);
         }
       }
       return loaded;
     };
-    tryLoad();
+    get();
+    return { relPath, get, lastError: () => lastLoadError };
+  }
+
+  function unavailableSnapshot(id, name, source, message) {
+    return {
+      id, name, status: 'error', error: { code: 'internal', message },
+      source, plan: null, account: null, updatedAt: 0, windows: [], extra: null, credits: null, identity: null, raw: {},
+    };
+  }
+
+  const moduleMissing = (lazy) => {
+    const err = lazy.lastError();
+    return `Provider module not available (${path.basename(lazy.relPath)}): ${err ? err.message : 'unknown'}`;
+  };
+
+  function lazyProvider(relPath, id, name) {
+    const lazy = lazyModule(relPath, 'fetchSnapshot');
     return {
       id,
       name,
-      getModule: tryLoad,
       async fetchSnapshot(context) {
-        const mod = tryLoad();
-        if (mod) return mod.fetchSnapshot(context);
-        return {
-          id, name, status: 'error',
-          error: { code: 'internal', message: `Provider module not available (${path.basename(relPath)}): ${lastLoadError ? lastLoadError.message : 'unknown'}` },
-          source: null, plan: null, account: null, updatedAt: 0, windows: [], extra: null, credits: null, raw: {},
-        };
+        const mod = lazy.get();
+        return mod ? mod.fetchSnapshot(context) : unavailableSnapshot(id, name, null, moduleMissing(lazy));
       },
     };
   }
 
-  const providers = {
-    claude: lazyProvider('./providers/claude.js', 'claude', 'Claude'),
-    claudeWeb: lazyProvider('./providers/claude-web.js', 'claude', 'Claude'),
-    codex: lazyProvider('./providers/codex.js', 'codex', 'Codex'),
+  const codexProvider = lazyProvider('./providers/codex.js', 'codex', 'Codex');
+  const claudeCodeModule = lazyModule('./providers/claude.js', 'createClaudeCodeProvider');
+  const claudeWebModule = lazyModule('./providers/claude-web.js', 'createClaudeWebProvider');
+  // Pure account helpers. store.js needs them too, so they are normally there; without them the widget
+  // still runs (default display names, duplicates not merged) instead of losing the window and tray.
+  const accountsModule = lazyModule('./accounts', 'accountDisplayName');
+
+  const isPlainObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
+  const isClaudeId = (id) => {
+    const lib = accountsModule.get();
+    return lib && typeof lib.isClaudeId === 'function' ? lib.isClaudeId(id) : (id === 'claude' || /^claude-[2-6]$/.test(id));
   };
 
+  // The configured Claude accounts. store.js keeps the list sanitized (≥ 1 entry, account 1 first, slot
+  // order); the fallback mirrors its migration for a settings object that has no list.
+  function accountsIn(settings) {
+    const list = settings && Array.isArray(settings.claudeAccounts)
+      ? settings.claudeAccounts.filter((a) => isPlainObject(a) && typeof a.id === 'string' && isClaudeId(a.id))
+      : [];
+    if (list.length) return list;
+    return [{
+      id: 'claude', label: '', source: (settings && settings.claudeSource) || 'claude_code', configDir: '',
+      organizationId: (settings && settings.claudeOrganizationId) || null,
+    }];
+  }
+
+  // Every Claude ProviderSnapshot.name is this (cards, alerts, history labels, tray and the phone read it).
+  // Never throws: the scheduler reads it again while building a failure snapshot.
+  function accountNameIn(list, id) {
+    const account = list.find((a) => a.id === id);
+    const slot = id === 'claude' ? 1 : id.slice('claude-'.length);
+    const fallback = !account ? `Claude ${slot}` : (account.label || (list.length === 1 ? 'Claude' : `Claude ${slot}`));
+    const lib = account && accountsModule.get();
+    if (!lib) return fallback;
+    try {
+      return lib.accountDisplayName(account, list) || fallback;
+    } catch (err) {
+      return fallback;
+    }
+  }
+
+  // Two sources that turn out to be the same Claude login show once. Pass-through without accounts.js.
+  function dedupeProviders(providersObj) {
+    const lib = accountsModule.get();
+    return lib && typeof lib.dedupeSnapshot === 'function'
+      ? lib.dedupeSnapshot(providersObj)
+      : { providers: providersObj, duplicates: {} };
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Claude account registry: one provider wrapper per configured account, in slot order. A wrapper
+  // owns its provider instance (claude.js / claude-web.js factories, so the request floor, back-offs,
+  // caches and the claude.ai session are all per account) and survives label changes; a change of
+  // source or config folder replaces it, and removing the account disposes of it (reconcileAccounts).
+  // ---------------------------------------------------------------------------------------------
+  let accountList = [];               // the list the registry was last reconciled to; names are read from it
+  let accountWrappers = new Map();    // account id → wrapper, in slot order
+  const lastClaudeStatus = new Map(); // account id → its status in the previous snapshot (session-expiry latch)
+
+  function createAccountWrapper(account) {
+    const { id, source } = account;
+    const configDir = typeof account.configDir === 'string' ? account.configDir : '';
+    const isWeb = source === 'claude_web';
+    const lazy = isWeb ? claudeWebModule : claudeCodeModule;
+    let instance = null;
+    let createError = null;
+    let sessionApplied = false;
+    const wrapper = {
+      id,
+      source,
+      configDir,
+      get name() { return accountNameIn(accountList, id); },
+      existingInstance: () => instance,
+      // The account's provider instance, created on first use (null while its module is unavailable).
+      // A claude.ai instance gets its stored session the first time it is asked for once the app is
+      // ready (safeStorage): at startup, after a switch to claude_web, or when the module turns up late.
+      getInstance() {
+        if (!instance) {
+          const mod = lazy.get();
+          if (!mod) return null;
+          try {
+            instance = isWeb
+              ? mod.createClaudeWebProvider({ id, name: () => wrapper.name, getOrganizationId: () => organizationIdOf(id) })
+              : mod.createClaudeCodeProvider({ id, name: () => wrapper.name, configDir, credentialStore: source === 'claude_keychain' ? 'keychain' : 'file' });
+            createError = null;
+          } catch (err) {
+            if (!createError) log.error(`setting up Claude account ${id} failed:`, err && err.message);
+            createError = err || new Error('unknown error');
+            return null;
+          }
+        }
+        if (isWeb && !sessionApplied && app.isReady()) {
+          sessionApplied = true;
+          applyStoredWebSession(id, instance);
+        }
+        return instance;
+      },
+      async fetchSnapshot(context) {
+        const inst = wrapper.getInstance();
+        const snap = inst
+          ? await inst.fetchSnapshot(context)
+          : unavailableSnapshot(id, wrapper.name, source, createError ? `Could not set up this account: ${createError.message}` : moduleMissing(lazy));
+        // Stamped after the await, on a copy (an instance may hand back its cached floor result): a label
+        // edited mid-fetch shows at once, and the name the instance was created with never leaks out.
+        return isPlainObject(snap) ? { ...snap, id, name: wrapper.name } : snap;
+      },
+    };
+    return wrapper;
+  }
+
+  // A wrapper that is still the registry's entry for its account (not removed, not switched since).
+  const isCurrent = (wrapper) => accountWrappers.get(wrapper.id) === wrapper;
+
+  function forgetAccount(id) {
+    lastClaudeStatus.delete(id);
+    try {
+      scheduler.forgetProvider(id);
+    } catch (err) {
+      log.error(`forgetting Claude account ${id} failed:`, err && err.message);
+    }
+  }
+
+  // Never throws (it runs inside the settings side effects and at startup).
+  function reconcileAccounts(list) {
+    const previous = accountWrappers;
+    const next = new Map();
+    accountList = list.slice();
+    for (const account of accountList) {
+      const current = previous.get(account.id);
+      const configDir = typeof account.configDir === 'string' ? account.configDir : '';
+      if (current && current.source === account.source && current.configDir === configDir) {
+        next.set(account.id, current); // same login, perhaps a new label: names are read live
+        continue;
+      }
+      next.set(account.id, createAccountWrapper(account));
+      // Another source or folder is another login: its predecessor's values must never show as "stale"
+      // and the expiry latch starts over. Also run for a new id, so a slot reused after a removal can
+      // never inherit a last-good value that a tick in flight wrote back after the removal.
+      forgetAccount(account.id);
+      if (current) log.info(`Claude account ${account.id} now reads ${account.source}`);
+    }
+    accountWrappers = next;
+    for (const [id, wrapper] of previous) {
+      if (!next.has(id)) disposeAccount(wrapper);
+    }
+  }
+
+  // A removed account leaves nothing behind: last-good values, expiry latch, stored claude.ai session and
+  // the partition's claude.ai cookies, so a new account in the same slot starts signed out.
+  function disposeAccount(wrapper) {
+    forgetAccount(wrapper.id);
+    signOutWebAccount(wrapper); // never rejects; the stored session is gone before it returns
+    log.info(`Claude account ${wrapper.id} removed`);
+  }
+
   function resolveProviders() {
-    const settings = getSettings();
-    const claude = settings.claudeSource === 'claude_web' ? providers.claudeWeb : providers.claude;
-    return [claude, providers.codex];
+    return [...accountWrappers.values(), codexProvider];
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -165,6 +324,7 @@ function bootstrap() {
     history,
     tray,
     alerts,
+    dedupe: dedupeProviders,
     log: createLogger('scheduler'),
     now: Date.now,
     onSnapshot: (snapshot) => {
@@ -178,6 +338,9 @@ function bootstrap() {
       }
     },
   });
+
+  // The registry needs the scheduler (forgetProvider); the scheduler only asks for providers on a tick.
+  reconcileAccounts(accountsIn(getSettings()));
 
   // ---------------------------------------------------------------------------------------------
   // Helpers
@@ -234,15 +397,22 @@ function bootstrap() {
     return compactMode ? windowing.COMPACT_WIDTH : windowing.WIDGET_WIDTH;
   }
 
-  // The claude_web provider signals a dead session by flipping to auth_required; the renderer gets a
-  // dedicated event so it can drop back to the "Log in" state without diffing snapshots.
+  // A claude_web account signals a dead session by flipping to auth_required; the renderer gets a
+  // dedicated event naming the account so it can drop that account back to the "Log in" state without
+  // diffing snapshots. Latched per account: only the transition fires, never an already-dead session.
   function detectWebSessionExpiry(snapshot) {
-    const claude = snapshot && snapshot.providers ? snapshot.providers.claude : null;
-    const status = claude ? claude.status : null;
-    if (getSettings().claudeSource === 'claude_web' && status === 'auth_required' && lastClaudeStatus && lastClaudeStatus !== 'auth_required') {
-      broadcast('claude-web-session-expired');
+    const providersObj = snapshot && isPlainObject(snapshot.providers) ? snapshot.providers : {};
+    const duplicates = snapshot && isPlainObject(snapshot.duplicates) ? snapshot.duplicates : {};
+    for (const wrapper of accountWrappers.values()) {
+      const entry = providersObj[wrapper.id];
+      // An account hidden as a duplicate was ok or stale underneath, so it still arms the latch.
+      const status = entry ? entry.status : (duplicates[wrapper.id] ? 'duplicate' : null);
+      const before = lastClaudeStatus.get(wrapper.id);
+      if (wrapper.source === 'claude_web' && status === 'auth_required' && before && before !== 'auth_required') {
+        broadcast('claude-web-session-expired', { accountId: wrapper.id });
+      }
+      lastClaudeStatus.set(wrapper.id, status);
     }
-    lastClaudeStatus = status;
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -381,6 +551,15 @@ function bootstrap() {
     const changed = (key) => JSON.stringify(prev[key]) !== JSON.stringify(next[key]);
     const win = liveWindow();
 
+    // Claude accounts first, so the registry follows the stored list even when a window or tray step
+    // below throws. This subsumes 1.0.x's claudeSource branch (claudeSource mirrors account 1). Adding
+    // or removing an account can rename account 1 ('Claude' ↔ 'Claude 1'), which the tray menu shows.
+    const accountsChanged = changed('claudeAccounts');
+    const prevAccounts = accountsIn(prev);
+    const nextAccounts = accountsIn(next);
+    const accountOneRenamed = accountsChanged && accountNameIn(prevAccounts, 'claude') !== accountNameIn(nextAccounts, 'claude');
+    if (accountsChanged) reconcileAccounts(nextAccounts);
+
     if (changed('autoStart')) applyLoginItem(next.autoStart);
     if (changed('hideFromTaskbar')) applyHideFromTaskbar(win, next.hideFromTaskbar);
     if (win && changed('alwaysOnTop') && process.platform === 'darwin' && typeof win.setVisibleOnAllWorkspaces === 'function') {
@@ -389,7 +568,7 @@ function bootstrap() {
     if (win && changed('alwaysOnTop')) win.setAlwaysOnTop(!!next.alwaysOnTop, 'floating');
     if (changed('refreshInterval')) scheduler.applyInterval(parseInt(next.refreshInterval, 10));
 
-    if (changed('trayStats') || changed('providers')) {
+    if (changed('trayStats') || changed('providers') || accountOneRenamed) {
       tray.rebuild();
     } else if (changed('warnThreshold') || changed('dangerThreshold') || changed('timeFormat')) {
       tray.update(scheduler.getLastSnapshot());
@@ -397,16 +576,7 @@ function bootstrap() {
 
     if (changed('compactMode')) applyCompactWidth(!!next.compactMode);
 
-    if (changed('claudeSource')) {
-      // The two Claude sources share the provider id; drop the old source's last-good values and
-      // the expiry latch so the switch never shows "stale" data from the other source or fires a
-      // spurious session-expired event.
-      scheduler.forgetProvider('claude');
-      lastClaudeStatus = null;
-      if (next.claudeSource === 'claude_web') loadWebSession();
-    }
-
-    if (changed('providers') || changed('claudeSource') || changed('tokenAutoRefresh') || changed('claudeOrganizationId')) {
+    if (changed('providers') || accountsChanged || changed('tokenAutoRefresh') || changed('claudeOrganizationId')) {
       scheduler.refreshNow();
     }
 
@@ -452,87 +622,194 @@ function bootstrap() {
   }
 
   // ---------------------------------------------------------------------------------------------
-  // claude.ai web session (optional provider, providers/claude-web.js). The module keeps the
-  // sessionKey in memory only; main.js owns persistence: safeStorage-encrypted in config.json,
-  // restored with setSession() at startup and whenever the source switches to claude_web.
+  // claude.ai web sessions (providers/claude-web.js, one instance and one partition per claude_web
+  // account). An instance keeps its sessionKey in memory only; main.js owns persistence:
+  // safeStorage-encrypted in config.json per account, handed back with setSession() at startup and
+  // whenever an account switches to claude_web (createAccountWrapper → getInstance).
   // ---------------------------------------------------------------------------------------------
   const webLog = createLogger('claude-web');
 
-  function webMethod(names) {
-    const mod = providers.claudeWeb.getModule();
-    if (!mod) return null;
-    for (const name of names) if (typeof mod[name] === 'function') return mod[name].bind(mod);
+  function instanceMethod(instance, names) {
+    if (!instance) return null;
+    for (const name of names) if (typeof instance[name] === 'function') return instance[name].bind(instance);
     return null;
   }
 
-  function readStoredWebSessionKey() {
+  function readSessionBlob(accountId) {
+    if (accountId === 'claude') return store.get(WEB_SESSION_STORE_KEY, null);
+    const map = store.get(WEB_SESSIONS_STORE_KEY, null);
+    return isPlainObject(map) && Object.prototype.hasOwnProperty.call(map, accountId) ? map[accountId] : null;
+  }
+
+  function writeSessionBlob(accountId, blob) {
+    if (accountId === 'claude') {
+      if (blob) store.set(WEB_SESSION_STORE_KEY, blob);
+      else store.delete(WEB_SESSION_STORE_KEY);
+      return;
+    }
+    const stored = store.get(WEB_SESSIONS_STORE_KEY, null);
+    const map = isPlainObject(stored) ? { ...stored } : {};
+    if (blob) map[accountId] = blob;
+    else delete map[accountId];
+    if (Object.keys(map).length) store.set(WEB_SESSIONS_STORE_KEY, map);
+    else store.delete(WEB_SESSIONS_STORE_KEY);
+  }
+
+  function hasStoredWebSession(accountId) {
+    try {
+      const blob = readSessionBlob(accountId);
+      return typeof blob === 'string' && blob.length > 0;
+    } catch (err) {
+      return false;
+    }
+  }
+
+  function readStoredWebSessionKey(accountId) {
     let encoded = null;
     try {
-      encoded = store.get(WEB_SESSION_STORE_KEY, null);
+      encoded = readSessionBlob(accountId);
     } catch (err) {
-      log.error('reading the stored claude.ai session failed:', err && err.message);
+      log.error(`reading the stored claude.ai session (${accountId}) failed:`, err && err.message);
       return null;
     }
     if (typeof encoded !== 'string' || !encoded) return null;
     try {
       if (!safeStorage.isEncryptionAvailable()) {
-        log.warn('safeStorage is unavailable; the stored claude.ai session cannot be decrypted — log in again');
+        log.warn(`safeStorage is unavailable; the stored claude.ai session (${accountId}) cannot be decrypted — log in again`);
         return null;
       }
       return safeStorage.decryptString(Buffer.from(encoded, 'base64')) || null;
     } catch (err) {
-      log.warn('stored claude.ai session could not be decrypted (different user/machine?); log in again');
+      log.warn(`stored claude.ai session (${accountId}) could not be decrypted (different user/machine?); log in again`);
       return null;
     }
   }
 
   // Never logs or stores the key in clear text. Without safeStorage the session lives in memory only.
-  function persistWebSessionKey(sessionKey) {
+  function persistWebSessionKey(accountId, sessionKey) {
     try {
       if (!sessionKey) {
-        store.delete(WEB_SESSION_STORE_KEY);
+        writeSessionBlob(accountId, null);
         return;
       }
       if (!safeStorage.isEncryptionAvailable()) {
-        log.warn('safeStorage is unavailable; claude.ai session is kept for this run only');
+        log.warn(`safeStorage is unavailable; the claude.ai session (${accountId}) is kept for this run only`);
         return;
       }
-      store.set(WEB_SESSION_STORE_KEY, safeStorage.encryptString(String(sessionKey)).toString('base64'));
+      writeSessionBlob(accountId, safeStorage.encryptString(String(sessionKey)).toString('base64'));
     } catch (err) {
-      log.error('persisting the claude.ai session failed:', err && err.message);
+      log.error(`persisting the claude.ai session (${accountId}) failed:`, err && err.message);
     }
   }
 
-  // Hands the persisted session to the provider module. Safe to call repeatedly.
-  function loadWebSession() {
-    const setSession = webMethod(['setSession']);
+  // Hands one account's persisted session to its instance (createAccountWrapper calls it once per instance).
+  function applyStoredWebSession(accountId, instance) {
+    const setSession = instanceMethod(instance, ['setSession']);
     if (!setSession) return;
     try {
-      const sessionKey = readStoredWebSessionKey();
-      setSession({ sessionKey, organizationId: getSettings().claudeOrganizationId });
-      if (sessionKey) log.info('claude.ai web session restored');
+      const sessionKey = readStoredWebSessionKey(accountId);
+      setSession({ sessionKey, organizationId: organizationIdOf(accountId) });
+      if (sessionKey) log.info(`claude.ai web session restored (${accountId})`);
     } catch (err) {
-      log.error('restoring the claude.ai session failed:', err && err.message);
+      log.error(`restoring the claude.ai session (${accountId}) failed:`, err && err.message);
     }
   }
 
-  async function claudeWebLogin() {
-    const login = webMethod(['login']);
+  // Startup, once safeStorage is usable: every claude_web account gets its stored session before the
+  // first tick. A stored session whose account no longer exists is dropped first, so an account added
+  // later in that slot can never come up signed in as whoever used the slot before.
+  function restoreWebSessions() {
+    try {
+      const stored = store.get(WEB_SESSIONS_STORE_KEY, null);
+      if (isPlainObject(stored)) {
+        for (const accountId of Object.keys(stored)) {
+          if (!accountWrappers.has(accountId)) persistWebSessionKey(accountId, null);
+        }
+      }
+    } catch (err) {
+      log.error('pruning stored claude.ai sessions failed:', err && err.message);
+    }
+    for (const wrapper of accountWrappers.values()) {
+      if (wrapper.source === 'claude_web') wrapper.getInstance();
+    }
+  }
+
+  function organizationIdOf(accountId) {
+    const account = accountsIn(getSettings()).find((a) => a.id === accountId);
+    return account && typeof account.organizationId === 'string' && account.organizationId ? account.organizationId : null;
+  }
+
+  // The full stored list with one account's organization replaced (every writer sends the full list).
+  function withAccountOrganization(accountId, organizationId) {
+    return accountsIn(getSettings()).map((a) => (a.id === accountId ? { ...a, organizationId } : a));
+  }
+
+  // Signs one account out of claude.ai: its stored session, its instance's in-memory session and the
+  // partition's claude.ai cookies. An account that is not (or no longer) a claude_web one but still has a
+  // stored session from an earlier switch is signed out through a throwaway instance on the same
+  // partition. The stored session goes synchronously, before the first await. Never throws.
+  async function signOutWebAccount(wrapper) {
+    const { id } = wrapper;
+    const signedInBefore = wrapper.source === 'claude_web' || hasStoredWebSession(id);
+    persistWebSessionKey(id, null);
+    if (!signedInBefore) return;
+    try {
+      let instance = wrapper.source === 'claude_web' ? wrapper.existingInstance() : null;
+      if (!instance) {
+        const mod = claudeWebModule.get();
+        instance = mod ? mod.createClaudeWebProvider({ id, name: wrapper.name }) : null;
+      }
+      const logout = instanceMethod(instance, ['logout']);
+      if (logout) await logout();
+    } catch (err) {
+      log.error(`claude web logout (${id}) failed:`, err && err.message);
+    }
+  }
+
+  // The account a claude.ai IPC call is about: `{ accountId }`, absent = account 1 (1.0.x callers). Only a
+  // configured account resolves; an unknown, removed or malformed id gets null and the call fails rather
+  // than act on some other account.
+  function webAccountFor(arg) {
+    const accountId = isPlainObject(arg) && arg.accountId !== undefined ? arg.accountId : 'claude';
+    if (typeof accountId !== 'string') return null;
+    if (!accountsIn(getSettings()).some((a) => a.id === accountId)) return null;
+    return accountWrappers.get(accountId) || null;
+  }
+
+  async function claudeWebLogin(arg) {
+    const wrapper = webAccountFor(arg);
+    if (!wrapper) return { success: false, error: 'Unknown Claude account' };
+    if (wrapper.source !== 'claude_web') return { success: false, error: `${wrapper.name} is not set to a claude.ai sign-in` };
+    const login = instanceMethod(wrapper.getInstance(), ['login']);
     if (!login) return { success: false, error: 'Claude web login is not available in this build' };
+    const { id } = wrapper;
     try {
       const result = await login({
         log: webLog,
+        // Persisted for THIS account only, and only while it is still configured as this claude.ai
+        // account: a login window left open while the account was removed or switched leaves nothing.
         onSessionKey: (sessionKey, { organizationId } = {}) => {
-          persistWebSessionKey(sessionKey);
-          if (organizationId) saveSettings({ claudeOrganizationId: organizationId });
+          if (!isCurrent(wrapper)) return;
+          persistWebSessionKey(id, sessionKey);
+          if (organizationId) {
+            try {
+              saveSettings({ claudeAccounts: withAccountOrganization(id, organizationId) });
+            } catch (err) {
+              log.error(`saving the claude.ai organization (${id}) failed:`, err && err.message);
+            }
+          }
         },
       });
       const ok = result === true || (result && result.success !== false);
+      if (ok && !isCurrent(wrapper)) {
+        log.info(`claude.ai login for ${id} finished after the account changed; discarded`);
+        if (!accountsIn(getSettings()).some((a) => a.id === id)) signOutWebAccount(wrapper);
+        return { success: false, error: 'The account changed during sign-in' };
+      }
       if (ok) {
-        lastClaudeStatus = null;
-        scheduler.forgetProvider('claude');
+        forgetAccount(id);
         scheduler.refreshNow();
-        broadcast('settings-updated', getSettings()); // claudeOrganizationId may have changed
+        broadcast('settings-updated', getSettings()); // this account's organizationId may have changed
       }
       return result && typeof result === 'object' ? result : { success: !!ok };
     } catch (err) {
@@ -540,21 +817,22 @@ function bootstrap() {
     }
   }
 
-  async function claudeWebLogout() {
-    const logout = webMethod(['logout']);
-    if (logout) {
-      try { await logout(); } catch (err) { log.error('claude web logout failed:', err && err.message); }
-    }
-    persistWebSessionKey(null);
-    lastClaudeStatus = null;
-    scheduler.forgetProvider('claude');
-    if (getSettings().claudeOrganizationId) handleSaveSettings({ claudeOrganizationId: null }); // also refreshes
+  async function claudeWebLogout(arg) {
+    const wrapper = webAccountFor(arg);
+    if (!wrapper) return false;
+    const { id } = wrapper;
+    await signOutWebAccount(wrapper);
+    forgetAccount(id);
+    if (organizationIdOf(id)) handleSaveSettings({ claudeAccounts: withAccountOrganization(id, null) }); // also refreshes
     else scheduler.refreshNow();
     return true;
   }
 
-  async function claudeWebOrgs() {
-    const list = webMethod(['listOrgs', 'listOrganizations']);
+  async function claudeWebOrgs(arg) {
+    const wrapper = webAccountFor(arg);
+    const list = wrapper && wrapper.source === 'claude_web'
+      ? instanceMethod(wrapper.getInstance(), ['listOrgs', 'listOrganizations'])
+      : null;
     if (!list) return [];
     try {
       const orgs = await list({ log: webLog });
@@ -567,12 +845,16 @@ function bootstrap() {
     }
   }
 
-  async function claudeWebSelectOrg(id) {
-    if (typeof id !== 'string' || !id) return false;
-    const select = webMethod(['selectOrg', 'selectOrganization']);
+  async function claudeWebSelectOrg(arg) {
+    const orgId = unwrap(arg, 'id');
+    if (typeof orgId !== 'string' || !orgId) return false;
+    const wrapper = webAccountFor(arg);
+    if (!wrapper || wrapper.source !== 'claude_web') return false;
+    const select = instanceMethod(wrapper.getInstance(), ['selectOrg', 'selectOrganization']);
     try {
-      if (select) await select(id);
-      handleSaveSettings({ claudeOrganizationId: id }); // side effect: refreshNow()
+      if (select) await select(orgId);
+      if (!isCurrent(wrapper)) return false;
+      handleSaveSettings({ claudeAccounts: withAccountOrganization(wrapper.id, orgId) }); // side effect: refreshNow()
       return true;
     } catch (err) {
       log.error('claude web org select failed:', err && err.message);
@@ -688,10 +970,11 @@ function bootstrap() {
     isPortable: IS_PORTABLE,
     background: windowing.getAppliedBackground(liveWindow()),
   }));
-  handle('claude-web-login', () => claudeWebLogin());
-  handle('claude-web-logout', () => claudeWebLogout());
-  handle('claude-web-orgs', () => claudeWebOrgs());
-  handle('claude-web-select-org', (_event, arg) => claudeWebSelectOrg(unwrap(arg, 'id')));
+  // claude.ai sign-ins take `{ accountId }` (default account 1); select-org also takes `{ id }`.
+  handle('claude-web-login', (_event, arg) => claudeWebLogin(arg));
+  handle('claude-web-logout', (_event, arg) => claudeWebLogout(arg));
+  handle('claude-web-orgs', (_event, arg) => claudeWebOrgs(arg));
+  handle('claude-web-select-org', (_event, arg) => claudeWebSelectOrg(arg));
   // Phone sync (§8 / docs/PHONE-SYNC.md). K never leaves the main process; the renderer only sees the
   // pairing string + QR data URL.
   handle('phone-sync-status', () => phoneSync.getStatus());
@@ -757,8 +1040,8 @@ function bootstrap() {
       log.error('history prune failed:', err && err.message);
     }
 
-    // safeStorage needs a ready app; restore the claude.ai session before the first tick.
-    loadWebSession();
+    // safeStorage needs a ready app; restore every account's claude.ai session before the first tick.
+    restoreWebSessions();
     // Same for the phone pair key (the first tick's snapshot is the first push when sync is on).
     phoneSync.load();
 
