@@ -1728,12 +1728,14 @@ test('claude-web: usage only when collapsed; extended endpoints when expanded; a
       if (u.endsWith('/usage')) return { ok: true, value: fixture('claude-usage.json') };
       if (u.endsWith('/overage_spend_limit')) return { ok: false, code: 'UnexpectedHTML', message: '<html>500' }; // the original's logout bug
       if (u.endsWith('/prepaid/credits')) return { ok: true, value: { amount: 1234, currency: 'USD', tranches: [{ remaining_amount_minor_units: 1234, expires_at: '2027-01-01T00:00:00Z' }], next_expires_at: '2027-01-01T00:00:00Z' } };
+      if (u.endsWith('/api/organizations')) return { ok: true, value: [{ uuid: 'org-1', name: 'Org', capabilities: ['chat'], raven_type: null }] };
       return { ok: false, code: 'LoadFailed', message: 'x' };
     });
   };
   let snap = await claudeWeb.fetchSnapshot({ settings: SETTINGS, now, fetchJson });
   assert.equal(snap.status, 'ok');
-  assert.deepEqual(seen[0], ['https://claude.ai/api/organizations/org-1/usage']);
+  assert.deepEqual(seen[0], ['https://claude.ai/api/organizations/org-1/usage', 'https://claude.ai/api/organizations'],
+    "the session's first poll also loads its org list (once)");
   assert.deepEqual(snap.windows.map((w) => w.key), ['session', 'weekly', 'weekly_fable']);
   assert.equal(snap.extra.balanceMinor, null);
 
@@ -1873,7 +1875,10 @@ test("claude-web: extended endpoints follow THIS account's expand panel (setting
   const two = claudeWeb.createClaudeWebProvider({ id: 'claude-2' });
   two.setSession({ sessionKey: 'sk-ant-sid01-FAKE', organizationId: 'org-2' });
   const seen = [];
-  const fetchJson = async (urls) => { seen.push(urls.length); return webUsage(urls); };
+  const fetchJson = async (urls) => {
+    seen.push(urls.filter((u) => !u.endsWith('/api/organizations')).length);
+    return urls.map((u) => (u.endsWith('/api/organizations') ? { ok: true, value: FAKE_WEB_ORGS } : { ok: true, value: fixture('claude-usage.json') }));
+  };
   await two.fetchSnapshot({ settings: { ...SETTINGS, expandedOpen: { claude: true, 'claude-2': false } }, now, fetchJson });
   await two.fetchSnapshot({ settings: { ...SETTINGS, expandedOpen: { claude: false, 'claude-2': true } }, now: later(60), fetchJson });
   assert.deepEqual(seen, [1, 3], "account 1's panel does not fetch account 2's spend; its own does");
@@ -1945,17 +1950,25 @@ test("claude-web: org fallback — the account's own org → getOrganizationId()
  * Runs fn(rec) with a stand-in for Electron (BrowserWindow + session.fromPartition) in require.cache, recording
  * windows, partitions and cookie / storage operations. The hidden fetch window "loads" every URL as usage JSON.
  */
+const FAKE_WEB_ORGS = [{ uuid: 'org-2', name: 'Personal', capabilities: ['chat', 'claude_max'], raven_type: null }];
+
 async function withFakeElectron(fn) {
-  const rec = { windows: [], partitions: [], cookies: [], cleared: [] };
+  const rec = { windows: [], partitions: [], cookies: [], cleared: [], clearedOpts: [], cacheCleared: [], listeners: {} };
+  // Cookie 'changed' as Electron fires it: on every set (removed = false) and remove (removed = true).
+  rec.emitCookie = (partition, value, removed = false) => {
+    for (const cb of [...(rec.listeners[partition] || [])]) cb({}, { name: 'sessionKey', value, domain: '.claude.ai' }, 'explicit', removed);
+  };
   class BrowserWindow {
     constructor(opts) {
+      if (rec.throwOnWindow) throw new Error('window could not be created');
       this.opts = opts; this.title = opts.title; this.events = {}; this.destroyed = false;
       const events = {};
+      const win = this;
       this.webContents = {
         events,
         on: (ev, cb) => { events[ev] = cb; },
         setUserAgent() {}, setWindowOpenHandler() {},
-        executeJavaScript: async () => JSON.stringify(fixture('claude-usage.json')),
+        executeJavaScript: async () => JSON.stringify(/\/api\/organizations$/.test(win.url || '') ? FAKE_WEB_ORGS : fixture('claude-usage.json')),
       };
       rec.windows.push(this);
     }
@@ -1971,12 +1984,14 @@ async function withFakeElectron(fn) {
       rec.partitions.push(partition);
       return {
         cookies: {
-          set: async (c) => { rec.cookies.push({ partition, op: 'set', name: c.name }); },
+          set: async (c) => { rec.cookies.push({ partition, op: 'set', name: c.name, value: c.value }); rec.emitCookie(partition, c.value); },
           remove: async (_url, cookieName) => { rec.cookies.push({ partition, op: 'remove', name: cookieName }); },
           get: async () => [{ name: 'sessionKey' }, { name: 'cf_clearance' }],
-          on() {}, removeListener() {},
+          on: (ev, cb) => { if (ev === 'changed') (rec.listeners[partition] = rec.listeners[partition] || []).push(cb); },
+          removeListener: (ev, cb) => { rec.listeners[partition] = (rec.listeners[partition] || []).filter((x) => x !== cb); },
         },
-        clearStorageData: async () => { rec.cleared.push(partition); },
+        clearStorageData: async (opts) => { rec.cleared.push(partition); rec.clearedOpts.push(opts === undefined ? null : opts); },
+        clearCache: async () => { rec.cacheCleared.push(partition); },
       };
     },
   };
@@ -2020,5 +2035,102 @@ test("claude-web: login, hidden fetches and logout stay in the account's own par
     assert.equal((await claudeWeb.fetchSnapshot({ settings: SETTINGS, now })).status, 'ok');
     assert.equal(rec.windows[2].opts.webPreferences.partition, 'persist:claude-web');
     assert.equal(rec.partitions[rec.partitions.length - 1], 'persist:claude-web');
+  });
+});
+
+test('claude-web: a session restored at startup loads its org list on its first poll (personalOrg known at once), retries a failed one after 15 min, then stops', async () => {
+  const p = claudeWeb.createClaudeWebProvider({ id: 'claude-3' });
+  p.setSession({ sessionKey: 'sk-ant-sid01-FAKE', organizationId: 'org-2' }); // what main.js does at startup: no org list
+  const seen = [];
+  let orgsOk = false;
+  const fetchJson = async (urls) => {
+    seen.push(urls.map((u) => u.replace('https://claude.ai', '')));
+    return urls.map((u) => {
+      if (!u.endsWith('/api/organizations')) return { ok: true, value: fixture('claude-usage.json') };
+      return orgsOk ? { ok: true, value: FAKE_WEB_ORGS } : { ok: false, code: 'Timeout', message: 'Request timeout' };
+    });
+  };
+  const failed = await p.fetchSnapshot({ settings: SETTINGS, now, fetchJson });
+  assert.equal(failed.status, 'ok', 'a failing org list never fails the usage');
+  assert.equal(failed.identity.personalOrg, null);
+  orgsOk = true;
+  const quiet = await p.fetchSnapshot({ settings: SETTINGS, now: later(60), fetchJson });
+  assert.equal(quiet.identity.personalOrg, null, 'a failed org list is not retried on every poll (a dead session would load it forever)');
+  const second = await p.fetchSnapshot({ settings: SETTINGS, now: later(15 * 60), fetchJson });
+  assert.equal(second.identity.personalOrg, true, 'a duplicate of a personal account can be hidden again right after a restart');
+  await p.fetchSnapshot({ settings: SETTINGS, now: later(16 * 60), fetchJson });
+  assert.deepEqual(seen, [
+    ['/api/organizations/org-2/usage', '/api/organizations'],
+    ['/api/organizations/org-2/usage'],
+    ['/api/organizations/org-2/usage', '/api/organizations'],
+    ['/api/organizations/org-2/usage'],
+  ]);
+});
+
+test('claude-web: a poll that was in flight when the session changed never fills the new session\'s request floor', async () => {
+  const p = claudeWeb.createClaudeWebProvider({ id: 'claude-2' });
+  p.setSession({ sessionKey: 'sk-ant-sid01-OLD', organizationId: 'org-2' });
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  let calls = 0;
+  const slow = async (urls) => { calls += 1; await gate; return webUsage(urls); };
+  const inFlight = p.fetchSnapshot({ settings: SETTINGS, now, fetchJson: slow });
+  p.setSession({ sessionKey: 'sk-ant-sid01-NEW', organizationId: 'org-2' });
+  release();
+  await inFlight;
+  await p.fetchSnapshot({ settings: SETTINGS, now, fetchJson: async (urls) => { calls += 1; return webUsage(urls); } });
+  assert.equal(calls, 2, 'the new session polls for real instead of replaying the old session\'s result');
+});
+
+test('claude-web: a poll or an org list during a sign-in never puts the old session back as the "new" login; a cancelled sign-in keeps the old key', async () => {
+  await withFakeElectron(async (rec) => {
+    const two = claudeWeb.createClaudeWebProvider({ id: 'claude-2', name: 'Claude 2' });
+    two.setSession({ sessionKey: 'sk-ant-sid01-OLD', organizationId: 'org-2' }); // the dead key of an expired session
+    const pending = two.login({ timeoutMs: 40 });
+    const loginWin = rec.windows[0];
+    const snap = await two.fetchSnapshot({ settings: SETTINGS, now }); // the scheduler ticks mid-sign-in
+    assert.equal(snap.status, 'auth_required');
+    await assert.rejects(two.listOrgs({}), /Missing credentials/); // Settings opened mid-sign-in
+    assert.ok(!rec.cookies.some((c) => c.op === 'set' && c.value === 'sk-ant-sid01-OLD'), 'the old key is never set as the cookie again');
+    rec.emitCookie('persist:claude-web-claude-2', 'sk-ant-sid01-OLD'); // and if something else puts it back …
+    assert.equal(loginWin.destroyed, false, '… it is not taken for the new login: the window stays open');
+    assert.deepEqual(await pending, { success: false, error: 'Login timed out' });
+    assert.equal(two.getSession().sessionKey, true, 'a cancelled sign-in gives the old key back');
+  });
+});
+
+test('claude-web: a real sign-in in the window is taken; wipe() clears the whole partition (every origin, the cache)', async () => {
+  await withFakeElectron(async (rec) => {
+    const two = claudeWeb.createClaudeWebProvider({ id: 'claude-2', name: 'Claude 2' });
+    two.setSession({ sessionKey: 'sk-ant-sid01-OLD', organizationId: 'org-2' });
+    const keys = [];
+    const pending = two.login({ timeoutMs: 1000, onSessionKey: (k) => { keys.push(k); } });
+    rec.emitCookie('persist:claude-web-claude-2', 'sk-ant-sid01-NEW');
+    const r = await pending;
+    assert.equal(r.success, true);
+    assert.equal(r.organizationId, 'org-2');
+    assert.deepEqual(keys, ['sk-ant-sid01-NEW']);
+    assert.equal(rec.windows[0].destroyed, true, 'the login window closed');
+
+    await two.wipe();
+    assert.equal(two.getSession().sessionKey, false);
+    assert.deepEqual(rec.clearedOpts, [null], 'clearStorageData with no origin filter: Google / Apple sign-in cookies go too');
+    assert.deepEqual(rec.cacheCleared, ['persist:claude-web-claude-2']);
+  });
+});
+
+test('claude-web: a sign-in that cannot even open its window keeps the old key; a log-out during a sign-in is not undone by cancelling it', async () => {
+  await withFakeElectron(async (rec) => {
+    const two = claudeWeb.createClaudeWebProvider({ id: 'claude-2', name: 'Claude 2' });
+    two.setSession({ sessionKey: 'sk-ant-sid01-OLD', organizationId: 'org-2' });
+    rec.throwOnWindow = true;
+    await assert.rejects(two.login({ timeoutMs: 40 }));
+    assert.equal(two.getSession().sessionKey, true, 'the key was never dropped');
+    rec.throwOnWindow = false;
+
+    const pending = two.login({ timeoutMs: 40 });
+    await two.logout(); // Log out pressed while the sign-in window is still open
+    assert.deepEqual(await pending, { success: false, error: 'Login timed out' });
+    assert.equal(two.getSession().sessionKey, false, 'the cancelled sign-in does not bring the logged-out key back');
   });
 });

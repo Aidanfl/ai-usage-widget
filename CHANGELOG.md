@@ -34,8 +34,11 @@ never signed out.
   on macOS, **Claude Code's Keychain login, read-only** (never refreshed or written; a lapsed token shows "waiting for
   Claude Code to refresh it"). With more than one account each card shows the account name under its label.
 - **The same account is shown once.** Two entries that resolve to the same account (the account id from
-  `/api/oauth/profile`, or the same personal claude.ai organisation) collapse into the first; the other's settings
-  block says so. Team organisations are never merged on the organisation alone.
+  `/api/oauth/profile` within the same organisation, or the same personal claude.ai organisation) collapse into the
+  lower slot; the other's settings block says so. When the lower slot's data is stale (a lapsed read-only Keychain
+  login, a rate-limit back-off) its card shows the twin's fresh numbers, so nothing freezes and nothing flickers.
+  Team organisations are never merged on the organisation alone, and one login on a personal plan and a team seat is
+  two usage pools.
 - **The phone gets every account.** Account 1 still travels as `claude`, the others as `claude-2` ... `claude-6` with
   their labels as names, so the 1.0.x iPhone app lists them in its dashboard without an update. **iPhone app 1.1.0**
   orders them before Codex with Claude's mark and fits up to four accounts in the home-screen widgets.
@@ -52,6 +55,12 @@ never signed out.
 - The phone payload drops the per-account identity hashes, and its history is re-bucketed (30 -> 60 -> 120 -> 240
   minutes) when needed to stay under the relay's 256 KB limit: four accounts with seven days of 2-minute samples
   measured 178,915 characters at 30-minute buckets and 93,853 at 60.
+- **The window keeps its bottom on screen.** When more accounts, the graph or Settings make it taller than the space
+  below it, it moves up just enough and returns to where you put it when it shrinks; content taller than the whole
+  screen scrolls.
+- **Removing an account leaves nothing behind:** its claude.ai sign-in and the whole browser partition (Google /
+  Apple sign-in included), its history lines and its alert state, so an account later added in the same slot
+  starts clean.
 - Settings keep `claudeSource` / `claudeOrganizationId` as a copy of account 1 so a 1.0.x build reading the same
   config still works; a 1.0.x config becomes account 1 automatically, keeping its claude.ai sign-in.
 

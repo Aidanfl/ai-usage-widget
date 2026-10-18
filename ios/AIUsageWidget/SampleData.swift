@@ -209,13 +209,14 @@ enum SampleData {
             t += 30 * 60_000
             i += 1
         }
+        // The desktop's own label format (history.js buildSeries): "<name> <window label>", no separator.
         let history = History(days: 7, samples: samples, series: [
-            HistorySeries(key: "claude.session", label: "Claude 1 · Current Session", color: "purple"),
-            HistorySeries(key: "claude.weekly", label: "Claude 1 · Weekly Limit", color: "blue"),
-            HistorySeries(key: "claude-2.session", label: "Claude 2 · Current Session", color: "purple"),
-            HistorySeries(key: "claude-2.weekly", label: "Claude 2 · Weekly Limit", color: "blue"),
-            HistorySeries(key: "claude-3.weekly", label: "Work · Weekly Limit", color: "blue"),
-            HistorySeries(key: "codex.secondary", label: "Codex · Weekly Limit", color: "teal"),
+            HistorySeries(key: "claude.session", label: "Claude 1 Current Session", color: "purple"),
+            HistorySeries(key: "claude.weekly", label: "Claude 1 Weekly Limit", color: "blue"),
+            HistorySeries(key: "claude-2.session", label: "Claude 2 Current Session", color: "purple"),
+            HistorySeries(key: "claude-2.weekly", label: "Claude 2 Weekly Limit", color: "blue"),
+            HistorySeries(key: "claude-3.weekly", label: "Work Weekly Limit", color: "blue"),
+            HistorySeries(key: "codex.secondary", label: "Codex Weekly Limit", color: "teal"),
         ])
 
         return PhonePayload(v: 1,

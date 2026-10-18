@@ -239,3 +239,20 @@ test('series labels use each account\'s display name; leftovers read "Claude N â
   assert.deepEqual(h.history.get(7, null).series.map((s) => s.key),
     ['claude.weekly_opus', 'claude-2.session', 'claude-3.weekly', 'claude-5.weekly_fable', 'codex.primary']);
 });
+
+test('forgetProvider drops one provider\'s keys from every stored sample (a removed account), keeps the rest, drops emptied samples', () => {
+  let stored = [
+    { t: T0, v: { 'claude.session': 10, 'claude-2.session': 50, 'claude-2.weekly': 90 } },
+    { t: T0 + 1, v: { 'claude-2.weekly': 91 } },
+    { t: T0 + 2, v: { 'claude-20.weekly': 5, codex: 1 } }, // a prefix match must be on the whole id
+  ];
+  const writes = [];
+  const h = createHistory({ get: () => stored, set: (s) => { writes.push(s); stored = s; }, now: () => T0 + 3 });
+  assert.equal(h.forgetProvider('claude-2'), true);
+  assert.deepEqual(stored, [
+    { t: T0, v: { 'claude.session': 10 } },
+    { t: T0 + 2, v: { 'claude-20.weekly': 5, codex: 1 } },
+  ]);
+  assert.equal(h.forgetProvider('claude-2'), false, 'nothing left to drop â†’ no write');
+  assert.equal(writes.length, 1);
+});

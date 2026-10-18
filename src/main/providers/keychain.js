@@ -11,12 +11,15 @@
  *   serviceName(dir) → 'Claude Code-credentials-<sha256(NFC(dir)) first 8 hex>'
  *   serviceCandidates(configDir, { env, home }) → service names to try, in order
  *   readCredentials(configDir, { execFile, env, home, timeoutMs }) → Promise<{ creds, service, stamp }>
- *       rejects with err.code 'not_found' | 'parse' | 'keychain_error' (err.timedOut on a timeout)
+ *       reads every candidate, the latest-expiring token wins; rejects with err.code 'not_found' | 'parse' |
+ *       'keychain_error' (err.timedOut on a timeout)
  *
  * Item naming (verified in the Claude Code 2.1.302 binary): service `Claude Code-credentials`, plus
- * `-<sha256(configDir.normalize('NFC')).hex.slice(0, 8)>` whenever Claude Code was started WITH CLAUDE_CONFIG_DIR —
- * even when that names ~/.claude itself — account = $USER. A folder that resolves to ~/.claude can therefore hold
- * either name; both are tried, the unsuffixed one first.
+ * `-<sha256(CLAUDE_CONFIG_DIR.normalize('NFC')).hex.slice(0, 8)>` whenever Claude Code was started WITH
+ * CLAUDE_CONFIG_DIR — even when that names ~/.claude itself — account = $USER. Claude Code hashes the variable
+ * EXACTLY as set (no resolve, no trailing-slash strip), so a folder is tried as typed (~ expanded, as a shell would),
+ * then tidied, then tidied with a trailing separator. A folder that resolves to ~/.claude can hold either name; the
+ * unsuffixed one is tried first.
  *
  * Nothing here writes to the Keychain, and nothing here logs or quotes `security`'s output: it is the token.
  * Reading through /usr/bin/security does not raise a Keychain prompt (the item's ACL trusts that binary).
@@ -61,6 +64,13 @@ function shortHash(text, length) {
   return crypto.createHash('sha256').update(String(text)).digest('hex').slice(0, length);
 }
 
+/** '~', '~/…' and '~\…' expanded the way a shell would before setting CLAUDE_CONFIG_DIR; nothing else changed. */
+function expandTilde(dir, home) {
+  if (dir === '~') return home;
+  if (dir.startsWith('~/') || dir.startsWith('~\\')) return String(home).replace(/[\\/]+$/, '') + dir.slice(1);
+  return dir;
+}
+
 /** The suffixed item name Claude Code uses for a folder it was started in with CLAUDE_CONFIG_DIR. */
 function serviceName(dir) {
   return `${SERVICE_BASE}-${shortHash(String(dir).normalize('NFC'), 8)}`;
@@ -68,24 +78,32 @@ function serviceName(dir) {
 
 /**
  * Item names to try for a folder setting, most likely first:
- *   ''                      → the unsuffixed default item (preceded by the CLAUDE_CONFIG_DIR item when that env is set,
- *                             since a Claude Code started from the same environment would use it)
- *   a folder = <home>/.claude → unsuffixed, then suffixed (the folder can be reached either way)
- *   any other folder        → suffixed only
+ *   ''                      → the unsuffixed default item; with CLAUDE_CONFIG_DIR set in the widget's environment,
+ *                             that variable's item(s) INSTEAD (a Claude Code started from the same environment uses it,
+ *                             and the unsuffixed item would be a different login shown under this account's name)
+ *   a folder = <home>/.claude → unsuffixed, then the suffixed forms (the folder can be reached either way)
+ *   any other folder        → the suffixed forms only: as typed, tidied, tidied + trailing separator
  */
 function serviceCandidates(configDir, { env = process.env, home = os.homedir() } = {}) {
   const typed = typeof configDir === 'string' ? configDir.trim() : '';
   const out = [];
   const add = (svc) => { if (!out.includes(svc)) out.push(svc); };
   if (!typed) {
-    const fromEnv = env && typeof env.CLAUDE_CONFIG_DIR === 'string' ? env.CLAUDE_CONFIG_DIR.trim() : '';
-    if (fromEnv) add(serviceName(resolveConfigDir(fromEnv, { env, home })));
+    // Claude Code treats an empty variable as unset; any other value is hashed exactly as set.
+    const fromEnv = env && typeof env.CLAUDE_CONFIG_DIR === 'string' ? env.CLAUDE_CONFIG_DIR : '';
+    if (fromEnv) {
+      add(serviceName(fromEnv));
+      if (fromEnv.trim()) add(serviceName(resolveConfigDir(fromEnv, { env, home })));
+      return out;
+    }
     add(SERVICE_BASE);
     return out;
   }
   const dir = resolveConfigDir(typed, { env, home });
   if (dir === resolveConfigDir(path.join(home, '.claude'), { env, home })) add(SERVICE_BASE);
+  add(serviceName(expandTilde(typed, home)));
   add(serviceName(dir));
+  add(serviceName(dir + path.sep));
   return out;
 }
 
@@ -137,19 +155,27 @@ function findPassword(execFile, service, timeoutMs) {
 }
 
 /**
- * Claude Code's stored credentials for a folder setting: tries serviceCandidates() in order, a missing item (exit 44)
- * falls through to the next. `stamp` is a short hash of the access token, for change detection without keeping the
- * token around.
+ * Claude Code's stored credentials for a folder setting. Every serviceCandidates() item is read (a missing one,
+ * exit 44, is skipped) and the one whose token expires LAST wins: an item left behind by an older launch (with or
+ * without a trailing slash, with or without CLAUDE_CONFIG_DIR) must not shadow the login Claude Code keeps fresh.
+ * Ties keep the candidate order. `stamp` is a short hash of the access token, for change detection without keeping
+ * the token around. A Keychain error (timeout, `security` failing) rejects at once.
  */
 async function readCredentials(configDir, { execFile = nodeExecFile, env = process.env, home = os.homedir(), timeoutMs = READ_TIMEOUT_MS } = {}) {
+  let best = null;
+  let unparseable = false;
   for (const service of serviceCandidates(configDir, { env, home })) {
     const r = await findPassword(execFile, service, timeoutMs);
     if (!r.found) continue;
     const creds = parseItem(r.stdout);
-    if (!creds) throw keychainError('parse', 'The Claude Code Keychain item is not valid JSON');
+    if (!creds) { unparseable = true; continue; }
     const oauth = creds.claudeAiOauth && typeof creds.claudeAiOauth === 'object' ? creds.claudeAiOauth : null;
-    return { creds, service, stamp: shortHash(oauth && oauth.accessToken ? oauth.accessToken : '', 16) };
+    const expiresAt = Number(oauth && oauth.expiresAt);
+    const rank = Number.isFinite(expiresAt) ? expiresAt : -Infinity;
+    if (!best || rank > best.rank) best = { creds, service, oauth, rank };
   }
+  if (best) return { creds: best.creds, service: best.service, stamp: shortHash(best.oauth && best.oauth.accessToken ? best.oauth.accessToken : '', 16) };
+  if (unparseable) throw keychainError('parse', 'The Claude Code Keychain item is not valid JSON');
   throw keychainError('not_found', 'No Claude Code credentials in the Keychain');
 }
 

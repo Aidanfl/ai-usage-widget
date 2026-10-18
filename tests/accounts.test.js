@@ -251,7 +251,9 @@ test('identityHash is the first 16 hex chars of sha256(uuid), never the uuid its
 test('sameAccount matrix: known account ids decide; else the same org only when both say it is personal', () => {
   const cases = [
     // [a identity, b identity, same?, why]
-    [ident(ACC_1, ORG_A, true), ident(ACC_1, ORG_B, false), true, 'same account id, whatever the orgs'],
+    [ident(ACC_1, ORG_A, true), ident(ACC_1, ORG_B, false), false, 'same login in two orgs (personal plan + team seat) is two usage pools'],
+    [ident(ACC_1, ORG_A, true), ident(ACC_1, ORG_A, true), true, 'same login, same org'],
+    [ident(ACC_1, ORG_A, true), ident(ACC_1, null, null), true, 'same login, one org unknown'],
     [ident(ACC_1, ORG_A, true), ident(ACC_2, ORG_A, true), false, 'different account ids win over a shared personal org'],
     [ident(null, ORG_A, true), ident(ACC_1, ORG_A, true), true, 'one account unknown (claude_web), same personal org'],
     [ident(null, ORG_A, true), ident(null, ORG_A, true), true, 'both unknown, same personal org'],
@@ -277,6 +279,28 @@ test('sameAccount only compares data the user is looking at: ok and stale, never
     assert.equal(sameAccount(snap('claude', id, { status }), snap('claude-2', id)), false, `${status} (first)`);
   }
   assert.equal(sameAccount(null, snap('claude', id)), false);
+});
+
+test('dedupeSnapshot: a STALE lower slot shows its fresh twin\'s numbers under its own id and name — one card, never frozen, never flickering', () => {
+  const same = ident(ACC_1, ORG_A, true);
+  // Account 1 reads a read-only Keychain login that lapsed (stale, last good 40%); account 2 is a live claude.ai sign-in
+  // to the same person at 95%. Account 1's card must show 95% (alerts, history, phone), and account 2 stays hidden.
+  const stale = snap('claude', same, { status: 'stale', name: 'Mac default', windows: [{ key: 'weekly', percent: 40 }] });
+  const fresh = snap('claude-2', same, { name: 'Claude 2', windows: [{ key: 'weekly', percent: 95 }] });
+  const r = dedupeSnapshot({ claude: stale, 'claude-2': fresh });
+  assert.deepEqual(r.duplicates, { 'claude-2': 'claude' }, 'still one card: no pop-in while one source is rate-limited');
+  assert.equal(r.providers['claude-2'], null);
+  assert.equal(r.providers.claude.status, 'ok');
+  assert.equal(r.providers.claude.windows[0].percent, 95, 'the fresh numbers');
+  assert.equal(r.providers.claude.id, 'claude', "the lower slot's id: its history key and alert latches stay put");
+  assert.equal(r.providers.claude.name, 'Mac default', "and its name");
+  assert.equal(stale.status, 'stale', 'input not mutated');
+  // The other branches merge as before: ok hides a later stale, stale hides a later stale, ok hides a later ok.
+  for (const [first, second] of [['ok', 'stale'], ['stale', 'stale'], ['ok', 'ok']]) {
+    const m = dedupeSnapshot({ claude: snap('claude', same, { status: first }), 'claude-2': snap('claude-2', same, { status: second }) });
+    assert.deepEqual(m.duplicates, { 'claude-2': 'claude' }, `${first} then ${second}`);
+    assert.equal(m.providers.claude.status, first, `${first} then ${second}: the lower slot keeps its own data`);
+  }
 });
 
 test('dedupeSnapshot: a later duplicate becomes null and points at the lowest visible slot; others untouched', () => {

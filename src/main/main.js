@@ -217,6 +217,11 @@ function bootstrap() {
         const snap = inst
           ? await inst.fetchSnapshot(context)
           : unavailableSnapshot(id, wrapper.name, source, createError ? `Could not set up this account: ${createError.message}` : moduleMissing(lazy));
+        // A source or folder change (or a removal) while this fetch was in flight: the result belongs to a login
+        // the account no longer uses, so it must not reach the card, dedupe, alerts or the phone as this account.
+        if (!isCurrent(wrapper)) {
+          return unavailableSnapshot(id, wrapper.name, source, 'Switching to the new settings - refreshing');
+        }
         // Stamped after the await, on a copy (an instance may hand back its cached floor result): a label
         // edited mid-fetch shows at once, and the name the instance was created with never leaks out.
         return isPlainObject(snap) ? { ...snap, id, name: wrapper.name } : snap;
@@ -262,11 +267,14 @@ function bootstrap() {
     }
   }
 
-  // A removed account leaves nothing behind: last-good values, expiry latch, stored claude.ai session and
-  // the partition's claude.ai cookies, so a new account in the same slot starts signed out.
+  // A removed account leaves nothing behind: last-good values, expiry latch, alert latches, history series,
+  // stored claude.ai session and the whole browser partition (claude.ai and SSO cookies), so a new account in
+  // the same slot starts signed out and with no one else's usage drawn under its name.
   function disposeAccount(wrapper) {
     forgetAccount(wrapper.id);
-    signOutWebAccount(wrapper); // never rejects; the stored session is gone before it returns
+    try { alerts.forget(wrapper.id); } catch (err) { log.error(`forgetting alerts of ${wrapper.id} failed:`, err && err.message); }
+    try { history.forgetProvider(wrapper.id); } catch (err) { log.error(`forgetting history of ${wrapper.id} failed:`, err && err.message); }
+    signOutWebAccount(wrapper, { wipe: true }); // never rejects; the stored session is gone before it returns
     log.info(`Claude account ${wrapper.id} removed`);
   }
 
@@ -488,7 +496,8 @@ function bootstrap() {
     const win = liveWindow();
     const h = Math.round(Number(height));
     if (!win || !Number.isFinite(h) || h < 40 || h > 3000) return;
-    windowing.applyContentSize(win, currentWidth(), h, log);
+    const fit = typeof windowing.keepBottomOnScreen === 'function' ? windowing.keepBottomOnScreen(win, h) : h;
+    windowing.applyContentSize(win, currentWidth(), fit, log);
     log.debug(`resize-window ${h} → content ${win.getContentSize().join('x')}, bounds ${JSON.stringify(win.getBounds())}`);
   }
 
@@ -577,7 +586,10 @@ function bootstrap() {
     if (changed('compactMode')) applyCompactWidth(!!next.compactMode);
 
     if (changed('providers') || accountsChanged || changed('tokenAutoRefresh') || changed('claudeOrganizationId')) {
-      scheduler.refreshNow();
+      // A refresh asked for while a tick is in flight joins that tick, which started before this change;
+      // after an account change the new login must be fetched now, not a full interval later.
+      if (accountsChanged && scheduler.isRefreshing()) scheduler.refreshNow().then(() => scheduler.refreshNow());
+      else scheduler.refreshNow();
     }
 
     // Compared on the resolved value, so acrylic ↔ acrylic_clear (same material, different theme/tint)
@@ -748,7 +760,7 @@ function bootstrap() {
   // partition's claude.ai cookies. An account that is not (or no longer) a claude_web one but still has a
   // stored session from an earlier switch is signed out through a throwaway instance on the same
   // partition. The stored session goes synchronously, before the first await. Never throws.
-  async function signOutWebAccount(wrapper) {
+  async function signOutWebAccount(wrapper, { wipe = false } = {}) {
     const { id } = wrapper;
     const signedInBefore = wrapper.source === 'claude_web' || hasStoredWebSession(id);
     persistWebSessionKey(id, null);
@@ -759,7 +771,8 @@ function bootstrap() {
         const mod = claudeWebModule.get();
         instance = mod ? mod.createClaudeWebProvider({ id, name: wrapper.name }) : null;
       }
-      const logout = instanceMethod(instance, ['logout']);
+      // Removal wipes the whole partition (SSO cookies too); a plain log-out only signs out of claude.ai.
+      const logout = instanceMethod(instance, wipe ? ['wipe', 'logout'] : ['logout']);
       if (logout) await logout();
     } catch (err) {
       log.error(`claude web logout (${id}) failed:`, err && err.message);
@@ -803,7 +816,7 @@ function bootstrap() {
       const ok = result === true || (result && result.success !== false);
       if (ok && !isCurrent(wrapper)) {
         log.info(`claude.ai login for ${id} finished after the account changed; discarded`);
-        if (!accountsIn(getSettings()).some((a) => a.id === id)) signOutWebAccount(wrapper);
+        if (!accountsIn(getSettings()).some((a) => a.id === id)) signOutWebAccount(wrapper, { wipe: true });
         return { success: false, error: 'The account changed during sign-in' };
       }
       if (ok) {

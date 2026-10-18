@@ -82,10 +82,12 @@ test('keychain: service naming matches Claude Code — "Claude Code-credentials"
 
 test('keychain: serviceCandidates — the literal item for /Users/aidan/.claude-1, typed or via CLAUDE_CONFIG_DIR', { skip: process.platform === 'win32' && 'POSIX home folder' }, () => {
   const opts = { env: NO_ENV, home: '/Users/aidan' };
-  assert.deepEqual(keychain.serviceCandidates('~/.claude-1', opts), ['Claude Code-credentials-61b6c2d5']);
-  assert.deepEqual(keychain.serviceCandidates('/Users/aidan/.claude-1/', opts), ['Claude Code-credentials-61b6c2d5']);
+  assert.deepEqual(keychain.serviceCandidates('~/.claude-1', opts), ['Claude Code-credentials-61b6c2d5', 'Claude Code-credentials-8d7999ed'],
+    'then the form a Claude Code started with a trailing slash (CLAUDE_CONFIG_DIR=…/.claude-1/) uses');
+  // Claude Code hashes CLAUDE_CONFIG_DIR exactly as set, so a folder typed with its trailing slash is tried as typed first.
+  assert.deepEqual(keychain.serviceCandidates('/Users/aidan/.claude-1/', opts), ['Claude Code-credentials-8d7999ed', 'Claude Code-credentials-61b6c2d5']);
   assert.deepEqual(keychain.serviceCandidates('', { env: { CLAUDE_CONFIG_DIR: '/Users/aidan/.claude-1' }, home: '/Users/aidan' }),
-    ['Claude Code-credentials-61b6c2d5', 'Claude Code-credentials']);
+    ['Claude Code-credentials-61b6c2d5'], "'' with the env set: that folder's item only, never the default login's");
 });
 
 test('keychain: serviceCandidates — default, env set, explicit ~/.claude (both, unsuffixed first), any other folder, trailing slash', () => {
@@ -94,20 +96,26 @@ test('keychain: serviceCandidates — default, env set, explicit ~/.claude (both
 
   assert.deepEqual(c(''), [BASE], "'' without CLAUDE_CONFIG_DIR → the unsuffixed item only");
   const envDir = path.join(HOME, 'cfg');
-  assert.deepEqual(c('', { CLAUDE_CONFIG_DIR: envDir }), [suffixed(envDir), BASE], "'' with CLAUDE_CONFIG_DIR → its item first, then the default");
-  assert.deepEqual(c('', { CLAUDE_CONFIG_DIR: `${envDir}${path.sep}` }), [suffixed(envDir), BASE], 'env folder resolved before hashing');
+  assert.deepEqual(c('', { CLAUDE_CONFIG_DIR: envDir }), [suffixed(envDir)], "'' with CLAUDE_CONFIG_DIR → its item only (the unsuffixed one is another login)");
+  assert.deepEqual(c('', { CLAUDE_CONFIG_DIR: `${envDir}${path.sep}` }), [suffixed(`${envDir}${path.sep}`), suffixed(envDir)], 'the env value as set first, then tidied');
+  assert.deepEqual(c('', { CLAUDE_CONFIG_DIR: '' }), [BASE], 'an empty variable counts as unset, as in Claude Code');
 
   // A Claude Code started WITH CLAUDE_CONFIG_DIR pointing at ~/.claude uses the suffixed name; without, the plain one.
-  assert.deepEqual(c('~/.claude'), [BASE, suffixed(DEFAULT_DIR)]);
-  assert.deepEqual(c(DEFAULT_DIR), [BASE, suffixed(DEFAULT_DIR)]);
-  assert.deepEqual(c(`${DEFAULT_DIR}${path.sep}`), [BASE, suffixed(DEFAULT_DIR)], 'trailing separator stripped before comparing / hashing');
+  assert.deepEqual(c('~/.claude'), [BASE, suffixed(DEFAULT_DIR), suffixed(`${DEFAULT_DIR}${path.sep}`)]);
+  assert.deepEqual(c(DEFAULT_DIR), [BASE, suffixed(DEFAULT_DIR), suffixed(`${DEFAULT_DIR}${path.sep}`)]);
+  assert.deepEqual(c(`${DEFAULT_DIR}${path.sep}`), [BASE, suffixed(`${DEFAULT_DIR}${path.sep}`), suffixed(DEFAULT_DIR)],
+    'a trailing separator still counts as ~/.claude, and is hashed as typed first');
   assert.notEqual(suffixed(DEFAULT_DIR), BASE);
 
   const other = path.join(HOME, '.claude-2');
-  assert.deepEqual(c('~/.claude-2'), [suffixed(other)], 'any other folder → its suffixed item only');
-  assert.deepEqual(c(other), [suffixed(other)]);
-  assert.deepEqual(c(`${other}${path.sep}`), [suffixed(other)]);
-  assert.deepEqual(c('~/.claude-2', { CLAUDE_CONFIG_DIR: envDir }), [suffixed(other)], 'a typed folder ignores the env');
+  const withSep = suffixed(`${other}${path.sep}`);
+  assert.deepEqual(c('~/.claude-2'), [suffixed(other), withSep], 'any other folder → its suffixed forms only, never the default');
+  assert.deepEqual(c(other), [suffixed(other), withSep]);
+  assert.deepEqual(c(`${other}${path.sep}`), [withSep, suffixed(other)]);
+  const untidy = [HOME, 'x', '..', '.claude-2'].join(path.sep); // path.join would tidy it
+  assert.deepEqual(c(untidy), [suffixed(untidy), suffixed(other), withSep],
+    'an untidy path is hashed as typed, then tidied');
+  assert.deepEqual(c('~/.claude-2', { CLAUDE_CONFIG_DIR: envDir }), [suffixed(other), withSep], 'a typed folder ignores the env');
   assert.notEqual(c('~/.claude-2')[0], c('~/.claude-3')[0], 'different folders, different items');
 });
 
@@ -116,8 +124,8 @@ test('keychain: serviceCandidates hashes the NFC form — an NFD-typed folder fi
   const nfd = path.join(HOME, 'Cafe\u0301-claude');
   assert.notEqual(nfc, nfd, 'the fixture really differs byte-wise');
   const expected = `${BASE}-${crypto.createHash('sha256').update(nfc).digest('hex').slice(0, 8)}`;
-  assert.deepEqual(keychain.serviceCandidates(nfd, { env: NO_ENV, home: HOME }), [expected]);
-  assert.deepEqual(keychain.serviceCandidates(nfc, { env: NO_ENV, home: HOME }), [expected]);
+  assert.equal(keychain.serviceCandidates(nfd, { env: NO_ENV, home: HOME })[0], expected);
+  assert.equal(keychain.serviceCandidates(nfc, { env: NO_ENV, home: HOME })[0], expected);
   assert.equal(keychain.serviceName(nfd), expected);
   assert.notEqual(expected, `${BASE}-${crypto.createHash('sha256').update(nfd).digest('hex').slice(0, 8)}`, 'hashing the raw NFD bytes would miss the item');
 });
@@ -156,31 +164,32 @@ test('keychain: exit 44 (not found) falls through to the next candidate; all mis
   let execFile = fakeExecFile({ [suffixed(DEFAULT_DIR)]: JSON.stringify(ITEM) });
   const r = await keychain.readCredentials('~/.claude', { execFile, env: NO_ENV, home: HOME });
   assert.equal(r.service, suffixed(DEFAULT_DIR));
-  assert.deepEqual(execFile.services(), [BASE, suffixed(DEFAULT_DIR)], 'tried in order');
+  assert.deepEqual(execFile.services(), [BASE, suffixed(DEFAULT_DIR), suffixed(`${DEFAULT_DIR}${path.sep}`)], 'every candidate read, in order');
 
-  // '' with CLAUDE_CONFIG_DIR set: its item is missing → the default item is used.
+  // '' with CLAUDE_CONFIG_DIR set: its item is missing → not_found. The default item belongs to a Claude Code started
+  // WITHOUT the variable — another login, which must never be shown under this account's name.
   const envDir = path.join(HOME, 'cfg');
   execFile = fakeExecFile({ [BASE]: JSON.stringify(ITEM) });
-  const r2 = await keychain.readCredentials('', { execFile, env: { CLAUDE_CONFIG_DIR: envDir }, home: HOME });
-  assert.equal(r2.service, BASE);
-  assert.deepEqual(execFile.services(), [suffixed(envDir), BASE]);
+  await assert.rejects(keychain.readCredentials('', { execFile, env: { CLAUDE_CONFIG_DIR: envDir }, home: HOME }), (e) => e.code === 'not_found');
+  assert.deepEqual(execFile.services(), [suffixed(envDir)], 'the default item is never read');
 
   execFile = fakeExecFile({});
   await assert.rejects(keychain.readCredentials('~/.claude', { execFile, env: NO_ENV, home: HOME }), (e) => e.code === 'not_found');
-  assert.equal(execFile.calls.length, 2, 'every candidate tried before giving up');
+  assert.equal(execFile.calls.length, 3, 'every candidate tried before giving up (unsuffixed, then both suffixed forms)');
   await assert.rejects(keychain.readCredentials('~/.claude-2', { execFile: fakeExecFile({}), env: NO_ENV, home: HOME }), { code: 'not_found' });
 });
 
-test('keychain: unparseable item → parse (output never quoted, no further candidates); hex output is decoded', async () => {
+test('keychain: unparseable item → parse when no other candidate is good (output never quoted); hex output is decoded', async () => {
   const DEFAULT_DIR = path.join(HOME, '.claude');
   const garbage = '{"claudeAiOauth":{"accessToken":sk-ant-oat01-SECRET';
-  const execFile = fakeExecFile({ [BASE]: garbage, [suffixed(DEFAULT_DIR)]: JSON.stringify(ITEM) });
+  const both = await keychain.readCredentials('~/.claude', { execFile: fakeExecFile({ [BASE]: garbage, [suffixed(DEFAULT_DIR)]: JSON.stringify(ITEM) }), env: NO_ENV, home: HOME });
+  assert.equal(both.service, suffixed(DEFAULT_DIR), 'a broken leftover item does not hide a good one');
+  const execFile = fakeExecFile({ [BASE]: garbage });
   await assert.rejects(keychain.readCredentials('~/.claude', { execFile, env: NO_ENV, home: HOME }), (e) => {
     assert.equal(e.code, 'parse');
     assert.ok(!/SECRET|sk-ant/.test(e.message), 'the item text is never quoted');
     return true;
   });
-  assert.equal(execFile.calls.length, 1, 'a broken item is reported, not skipped');
   await assert.rejects(keychain.readCredentials('', { execFile: fakeExecFile({ [BASE]: '[1,2]' }), env: NO_ENV, home: HOME }), { code: 'parse' }, 'a non-object is not credentials');
 
   // `security -w` prints non-printable data as hex — Claude Code writes the item with `-X <hex>`.
@@ -221,4 +230,19 @@ test('keychain: timeout / other failures → keychain_error, never not_found, no
     (e) => e.code === 'keychain_error' && e.message === 'security could not run (ENOENT)');
   const throwing = () => { throw Object.assign(new Error('spawn EAGAIN'), { code: 'EAGAIN' }); };
   await assert.rejects(keychain.readCredentials('', { execFile: throwing, env: NO_ENV, home: HOME }), (e) => e.code === 'keychain_error' && /EAGAIN/.test(e.message));
+});
+
+test('keychain: several items for one folder → the token that expires LAST wins, whatever the candidate order (an abandoned item never shadows the live one)', async () => {
+  const work = path.join(HOME, '.claude-work');
+  const withSlash = `${work}${path.sep}`;
+  const item = (token, expiresAt) => JSON.stringify({ claudeAiOauth: { ...ITEM.claudeAiOauth, accessToken: token, expiresAt } });
+  // Typed with the slash: the slash item is tried first, but it is the abandoned one.
+  let r = await keychain.readCredentials(withSlash, { execFile: fakeExecFile({ [suffixed(withSlash)]: item('sk-ant-oat01-OLD-FAKE', 1000), [suffixed(work)]: item('sk-ant-oat01-LIVE-FAKE', 9000) }), env: NO_ENV, home: HOME });
+  assert.equal(r.service, suffixed(work));
+  // The other way round.
+  r = await keychain.readCredentials(work, { execFile: fakeExecFile({ [suffixed(work)]: item('sk-ant-oat01-OLD-FAKE', 1000), [suffixed(withSlash)]: item('sk-ant-oat01-LIVE-FAKE', 9000) }), env: NO_ENV, home: HOME });
+  assert.equal(r.service, suffixed(withSlash));
+  // A tie keeps the candidate order.
+  r = await keychain.readCredentials(work, { execFile: fakeExecFile({ [suffixed(work)]: item('sk-ant-oat01-A-FAKE', 5000), [suffixed(withSlash)]: item('sk-ant-oat01-B-FAKE', 5000) }), env: NO_ENV, home: HOME });
+  assert.equal(r.service, suffixed(work));
 });

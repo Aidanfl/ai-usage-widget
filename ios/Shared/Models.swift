@@ -416,7 +416,7 @@ extension CodexCredits {
 
 struct HistorySeries: Codable, Equatable {
     var key: String?        // 'claude.session' / 'claude-2.weekly' (<providerId>.<windowKey>)
-    var label: String?      // 'Claude · Current Session'
+    var label: String?      // '<name> <window label>': 'Claude Current Session', 'Work Weekly Limit'; a leftover 'Claude 3 Weekly'
     var color: String?      // series colour token
 }
 

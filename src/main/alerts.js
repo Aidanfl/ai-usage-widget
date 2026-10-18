@@ -170,12 +170,20 @@ function createAlertEngine({ notify, now = Date.now } = {}) {
     return fired;
   }
 
+  // One provider's state only (a removed Claude account): a new account later taking the same id starts
+  // seeded-silent again and never sees the removed account's latches as its own rollover.
+  function forget(providerId) {
+    const prefix = `${providerId}.`;
+    for (const key of [...windowStates.keys()]) if (key.startsWith(prefix)) windowStates.delete(key);
+    seededProviders.delete(providerId);
+  }
+
   function reset() {
     windowStates.clear();
     seededProviders.clear();
   }
 
-  return { evaluate, reset };
+  return { evaluate, reset, forget };
 }
 
 module.exports = { createAlertEngine, formatResetTime };

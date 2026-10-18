@@ -64,6 +64,9 @@ const LOGIN_TIMEOUT_MS = 10 * 60 * 1000;
 // account regardless of settings.refreshInterval or manual refreshes — a poll inside the floor returns the previous
 // snapshot unchanged. The original widget's observed cadence against claude.ai was exactly 60 s (research §8.6).
 const USAGE_FLOOR_MS = 60 * 1000;
+// The org list rides along with a session's first poll (dedupe needs to know whether its org is personal); a
+// failed or dead-session attempt is retried no sooner than this, so a signed-out account costs one load a minute.
+const ORGS_RETRY_MS = 15 * 60 * 1000;
 
 /** Body signatures that mean "you are not logged in / Cloudflare stopped us" (order matters). */
 const BLOCKED_SIGNATURES = [
@@ -80,8 +83,8 @@ function partitionFor(id) {
 }
 
 // Instance state: the session, the org cache and the request floor. main.js owns persistence.
-const freshFloor = () => ({ at: 0, result: null });
-const freshState = () => ({ sessionKey: null, organizationId: null, organizations: [], floor: freshFloor() });
+const freshFloor = () => ({ at: 0, result: null, key: null }); // key: the session the result belongs to
+const freshState = () => ({ sessionKey: null, organizationId: null, organizations: [], floor: freshFloor(), orgsRetryAt: 0 });
 
 // ---------------------------------------------------------------------------
 // Electron access (lazy)
@@ -305,6 +308,7 @@ function createClaudeWebProvider({ id = DEFAULT_ID, name = DEFAULT_NAME, partiti
     state.sessionKey = sessionKey || null;
     state.organizationId = organizationId || null;
     state.floor = freshFloor(); // a new session/org must not replay the previous session's snapshot
+    state.orgsRetryAt = 0;      // and loads its org list on its first poll
   }
 
   function getSession() {
@@ -354,6 +358,15 @@ function createClaudeWebProvider({ id = DEFAULT_ID, name = DEFAULT_NAME, partiti
       });
       loginWin.webContents.setUserAgent(chromeUserAgent());
 
+      // The key this account held (usually a dead one — Sign in is offered on auth_required) is dropped for the
+      // length of the sign-in, once the window exists: a poll or an org list would otherwise set it as the
+      // partition's cookie again, and the listener below would take that for the new login (closing the window
+      // mid-sign-in). A cancelled sign-in gets it back — unless the account was logged out or wiped meanwhile.
+      const loginState = state;
+      const previousKey = state.sessionKey;
+      state.sessionKey = null;
+      state.floor = freshFloor();
+
       const isAllowed = (url) => {
         try {
           const host = new URL(url).hostname;
@@ -377,11 +390,13 @@ function createClaudeWebProvider({ id = DEFAULT_ID, name = DEFAULT_NAME, partiti
         done = true;
         cleanup();
         try { if (!loginWin.isDestroyed()) loginWin.close(); } catch { /* ignore */ }
+        if (state === loginState && !state.sessionKey && previousKey) state.sessionKey = previousKey;
         resolve(result);
       };
 
       const onCookieChanged = async (_event, cookie, _cause, removed) => {
         if (done || removed || cookie.name !== 'sessionKey' || !cookie.domain || !cookie.domain.includes('claude.ai') || !cookie.value) return;
+        if (previousKey && cookie.value === previousKey) return; // the old session put back, not a sign-in
         done = true; // claim before the awaits below so a second cookie event cannot double-resolve
         cleanup();
         try { if (!loginWin.isDestroyed()) loginWin.close(); } catch { /* ignore */ }
@@ -425,6 +440,21 @@ function createClaudeWebProvider({ id = DEFAULT_ID, name = DEFAULT_NAME, partiti
     return true;
   }
 
+  /**
+   * Removal of the account: everything in its partition goes — every origin's cookies and storage (the Google /
+   * Apple / Microsoft sign-in too) and the HTTP cache — so an account that later takes this slot starts with a
+   * clean browser, not the removed person's SSO session.
+   */
+  async function wipe() {
+    state = freshState();
+    try {
+      const ses = webSession(partition);
+      await ses.clearStorageData().catch(() => {});
+      await ses.clearCache().catch(() => {});
+    } catch { /* electron unavailable (tests) — state is cleared regardless */ }
+    return true;
+  }
+
   // -------------------------------------------------------------------------
   // Snapshot
   // -------------------------------------------------------------------------
@@ -440,11 +470,12 @@ function createClaudeWebProvider({ id = DEFAULT_ID, name = DEFAULT_NAME, partiti
       }
       // Request floor: manual refreshes and short refreshInterval settings go through here too.
       const nowMs = now();
-      if (state.floor.result && nowMs - state.floor.at < USAGE_FLOOR_MS) {
+      if (state.floor.result && state.floor.key === sessionKey && nowMs - state.floor.at < USAGE_FLOOR_MS) {
         if (typeof log.debug === 'function') log.debug(`[claude-web] inside the ${USAGE_FLOOR_MS / 1000} s request floor - returning the previous snapshot`);
         return state.floor.result;
       }
-      const remember = (snap) => { state.floor = { at: nowMs, result: snap }; return snap; };
+      // A poll still in flight when the session changes (a sign-in, a log-out) must not fill the new session's floor.
+      const remember = (snap) => { if (state.sessionKey === sessionKey) state.floor = { at: nowMs, result: snap, key: sessionKey }; return snap; };
       if (fetchJson === fetchJsonViaWindow) await setSessionCookie(partition, sessionKey);
 
       const expanded = Boolean(settings.expandedOpen && settings.expandedOpen[id]);
@@ -454,6 +485,14 @@ function createClaudeWebProvider({ id = DEFAULT_ID, name = DEFAULT_NAME, partiti
       const base = `${CLAUDE_ORIGIN}/api/organizations/${encodeURIComponent(organizationId)}`;
       const urls = [`${base}/usage`];
       if (extended) urls.push(`${base}/overage_spend_limit`, `${base}/prepaid/credits`);
+      // A session restored at startup has no org list yet (only a sign-in or Settings loads it). Without it the
+      // identity cannot say whether the org is personal, and dedupe would show a duplicate twice after every restart,
+      // so the first poll of a session loads it in the same hidden window.
+      let orgsIndex = -1;
+      if (!state.organizations.length && nowMs >= state.orgsRetryAt) {
+        orgsIndex = urls.push(`${CLAUDE_ORIGIN}/api/organizations`) - 1;
+        state.orgsRetryAt = nowMs + ORGS_RETRY_MS; // cleared for good once the list arrives (organizations non-empty)
+      }
 
       const results = await fetchJson(urls, { log, partition });
       const usageRes = results[0];
@@ -467,6 +506,10 @@ function createClaudeWebProvider({ id = DEFAULT_ID, name = DEFAULT_NAME, partiti
       if (extended) {
         if (results[1] && results[1].ok) overage = results[1].value; else log(`[claude-web] overage endpoint skipped: ${results[1] && results[1].code}`);
         if (results[2] && results[2].ok) prepaid = results[2].value; else log(`[claude-web] prepaid endpoint skipped: ${results[2] && results[2].code}`);
+      }
+      if (orgsIndex >= 0 && results[orgsIndex] && results[orgsIndex].ok && state.sessionKey === sessionKey) {
+        const orgs = mapOrgs(results[orgsIndex].value);
+        if (orgs.length) state.organizations = orgs;
       }
       const orgEntry = state.organizations.find((o) => o.id === organizationId);
       const org = orgEntry ? orgEntry.raw : null;
@@ -488,7 +531,7 @@ function createClaudeWebProvider({ id = DEFAULT_ID, name = DEFAULT_NAME, partiti
     source,
     partition,
     fetchSnapshot,
-    setSession, getSession, login, logout, listOrgs, selectOrg,
+    setSession, getSession, login, logout, wipe, listOrgs, selectOrg,
     /** Test hook. */
     resetState() { state = freshState(); },
   };

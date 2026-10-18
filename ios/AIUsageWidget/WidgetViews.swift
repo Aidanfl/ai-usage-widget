@@ -75,6 +75,16 @@ struct UsageWidgetModel {
         return "\(shortName(for: provider)) \(row.windowTag)"
     }
 
+    /// Single-account mode: the one Claude account's short name when the desktop calls it anything but
+    /// the bare "Claude" — "PERS" for an account labelled "Personal", "C3" when account 3 is the only one
+    /// visible of several. Its full compact labels ("PERSONAL 5H", "CLAUDE 3 5H") overflow the lock
+    /// screen's 58pt and truncate to the same text on every row. nil for "Claude" (every 1.0.x desktop,
+    /// and an unlabelled lone account), which keeps "CLAUDE 5H".
+    var singleAccountShortName: String? {
+        guard !isMultiAccount, let c = claude, c.displayName != "Claude" else { return nil }
+        return AccountShortNames.derive(c.displayName) ?? "C\(ProviderIds.claudeSlot(c.providerId) ?? 1)"
+    }
+
     func rows(for provider: ProviderSnapshot) -> [UsageWidgetRow] {
         let name = provider.displayName
         // Four accounts would otherwise all say "CLAUDE 5H"; the short name is what tells them apart
@@ -1247,7 +1257,16 @@ struct AccessoryRectangularView: View {
         if let c = model.claude { out.append(contentsOf: model.rows(for: c).prefix(2)) }
         if let x = model.codex, let first = model.rows(for: x).first { out.append(first) }
         if out.isEmpty { out = Array(model.allRows.prefix(3)) }
-        return out.prefix(3).map { Line(label: $0.compactLabel, row: $0, note: nil) }
+        // A lone account named other than "Claude" is labelled the way the multi path labels it ("PERS 5H",
+        // "C3 7D"), so the window half survives the 58pt and the two bars stay told apart.
+        let claudeTag = model.singleAccountShortName
+        let claudeId = model.claude?.providerId
+        return out.prefix(3).map { row in
+            if let tag = claudeTag, row.providerId == claudeId {
+                return Line(label: "\(tag) \(row.windowTag)", row: row, note: nil)
+            }
+            return Line(label: row.compactLabel, row: row, note: nil)
+        }
     }
 
     var body: some View {

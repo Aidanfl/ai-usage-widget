@@ -154,6 +154,36 @@ function ensureOnScreen(win, onMove, scr = defaultScreen()) {
   return true;
 }
 
+// A widget that grows (several Claude accounts, the graph, Settings) must not run off the bottom of its display:
+// the window moves up just enough, never above the work area, and comes back DOWN to where the user put it when it
+// shrinks again. `anchorY` is the user's spot (taken again whenever the window is somewhere this code did not put
+// it, i.e. after a drag); `placedY` is where this code last placed it. Returns the height that fits — the renderer
+// scrolls its cards when its content is taller than the whole work area. A minimized window is left alone
+// (setPosition is dropped). Nothing is persisted here: the 'move' handler saves the anchor, not the shifted spot.
+const anchorY = new WeakMap();
+const placedY = new WeakMap();
+
+function keepBottomOnScreen(win, height, scr = defaultScreen()) {
+  if (!win || win.isDestroyed() || win.isMinimized()) return height;
+  const b = win.getBounds();
+  const display = scr && typeof scr.getDisplayMatching === 'function' ? scr.getDisplayMatching(b) : null;
+  const wa = display && display.workArea;
+  if (!wa || !(wa.height > 0)) return height;
+  if (!anchorY.has(win) || placedY.get(win) !== b.y) anchorY.set(win, b.y);
+  const fit = Math.min(height, wa.height);
+  const y = Math.max(wa.y, Math.min(anchorY.get(win), wa.y + wa.height - fit));
+  placedY.set(win, y);
+  if (y !== b.y) win.setPosition(b.x, y);
+  return fit;
+}
+
+/** The position to save: the user's spot while the window sits where keepBottomOnScreen shifted it. */
+function persistedPosition(win) {
+  const b = win.getBounds();
+  const shifted = anchorY.has(win) && placedY.get(win) === b.y;
+  return { x: b.x, y: shifted ? anchorY.get(win) : b.y };
+}
+
 // Electron's isVisible() is true for a fully off-screen window; the tray toggle needs the truth.
 function isWindowShownOnScreen(win, scr = defaultScreen()) {
   if (!win || win.isDestroyed()) return false;
@@ -317,8 +347,7 @@ function createMainWindow({ settings = {}, savedPosition = null, onClose, onClos
     moveTimer = setTimeout(() => {
       moveTimer = null;
       if (win.isDestroyed()) return;
-      const b = win.getBounds();
-      if (typeof onMove === 'function') onMove({ x: b.x, y: b.y });
+      if (typeof onMove === 'function') onMove(persistedPosition(win));
     }, 300);
   });
 
@@ -379,6 +408,8 @@ module.exports = {
   getCenteredPosition,
   widthFor,
   ensureOnScreen,
+  keepBottomOnScreen,
+  persistedPosition,
   isWindowShownOnScreen,
   showMainWindowSmart,
   getAppliedBackground,

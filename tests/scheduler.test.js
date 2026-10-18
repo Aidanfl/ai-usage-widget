@@ -356,3 +356,60 @@ test('an account renamed while it is failing shows its NEW name on the stale car
   assert.equal(viaStale.status, 'stale');
   assert.equal(viaStale.name, 'Work', 'stale-without-windows branch keeps the fresh name');
 });
+
+test('a provider forgotten while its fetch is in flight (account switched login) neither keeps that result as last good nor shows old values as stale', async () => {
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const oldLogin = { ...okSnapshot('claude-2', 70), name: 'Claude 2', skipNextCycle: true };
+  let phase = 'first';
+  const p = scriptedProvider('claude-2', [
+    okSnapshot('claude-2', 20),                                   // tick 1: the old login's good values
+    async () => { await gate; return oldLogin; },                 // tick 2: in flight across the switch (+ a 429 hint)
+    () => ({ ...errorSnapshot('claude-2'), status: 'error' }),    // tick 3: the new login fails
+  ]);
+  const { scheduler } = harness([p], { getSettings: () => ({ ...SETTINGS, providers: { 'claude-2': true } }) });
+  await scheduler.refreshNow();
+  const tick2 = scheduler.refreshNow();
+  scheduler.forgetProvider('claude-2'); // main.js: source / folder changed mid-fetch
+  release();
+  phase = 'released';
+  await tick2;
+  const tick3 = (await scheduler.refreshNow()).providers['claude-2'];
+  assert.equal(phase, 'released');
+  assert.equal(tick3.status, 'error', 'no last good survives from either the forgotten value or the in-flight one');
+  assert.deepEqual(tick3.windows, []);
+  assert.equal(p.calls, 3, "the old login's 429 hint did not make the new login sit out a cycle");
+});
+
+test('an account forgotten or removed while ANOTHER provider is still loading is not published: placeholder for a switch, gone for a removal', async () => {
+  // claude-2 answers at once; codex is slow. The account changes in between — the case the per-fetch check cannot see.
+  let releaseCodex;
+  const codexGate = new Promise((r) => { releaseCodex = r; });
+  const two = scriptedProvider('claude-2', [{ ...okSnapshot('claude-2', 85), name: 'Person X', identity: { account: 'aaaa', org: null, personalOrg: null } }]);
+  const three = scriptedProvider('claude-3', [{ ...okSnapshot('claude-3', 40), name: 'Claude 3' }]);
+  const codex = scriptedProvider('codex', [async () => { await codexGate; return okSnapshot('codex', 5); }]);
+  let list = [two, three, codex];
+  const appended = [];
+  const evaluated = [];
+  const { scheduler } = harness(() => list, {
+    getSettings: () => ({ ...SETTINGS, providers: { 'claude-2': true, 'claude-3': true, codex: true } }),
+    history: { append: (s) => appended.push(s) },
+    alerts: { evaluate: (s) => evaluated.push(s) },
+  });
+  const tick = scheduler.refreshNow();
+  await new Promise((r) => setImmediate(r));
+  scheduler.forgetProvider('claude-2');          // claude-2 switched to another login
+  scheduler.forgetProvider('claude-3');          // claude-3 removed …
+  list = [two, codex];                           // … so it no longer resolves
+  releaseCodex();
+  const snap = await tick;
+  assert.equal(snap.providers['claude-2'].status, 'error', 'the old login is not published as this account');
+  assert.deepEqual(snap.providers['claude-2'].windows, []);
+  assert.equal(snap.providers['claude-2'].identity, null);
+  assert.ok(!('claude-3' in snap.providers), 'a removed account drops out of the snapshot');
+  assert.equal(snap.providers.codex.status, 'ok');
+  for (const s of [...appended, ...evaluated]) {
+    assert.ok(!(s.providers['claude-2'] && s.providers['claude-2'].windows.length), 'history / alerts never see the old login');
+    assert.ok(!s.providers['claude-3'], 'nor the removed account');
+  }
+});

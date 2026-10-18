@@ -95,6 +95,7 @@ function toPlain(value) {
 function createScheduler({ providers = [], getSettings, onSnapshot, history, tray, alerts, log, now = Date.now, fetch: fetchImpl, dedupe } = {}) {
   const logger = normalizeLog(log);
   const lastGood = new Map();   // provider id → last ProviderSnapshot with status 'ok'
+  const generations = new Map(); // provider id → bumped by forgetProvider, so a fetch in flight can tell it was forgotten
   // Provider ids whose next *automatic* tick is skipped (§6: HTTP 429 → keep last good, skip next
   // cycle). Providers ask for this with `skipNextCycle: true` on the snapshot they return.
   const skipNext = new Set();
@@ -159,7 +160,10 @@ function createScheduler({ providers = [], getSettings, onSnapshot, history, tra
 
   // Applies the last-good policy: a failed cycle with previous data becomes `stale` carrying the old
   // windows; auth_required passes through untouched (the renderer must show the sign-in state).
-  function finalize(provider, snap, prevGood) {
+  function finalize(provider, snap, prevGood, forgotten = false) {
+    // Forgotten mid-fetch (main.js switched this account to another login): the result belongs to the old
+    // login, so it is never kept as last good, and the old last-good values are not dressed up as stale.
+    if (forgotten) return toPlain(snap) || failureSnapshot(provider, new Error('Snapshot could not be serialized'), 'parse');
     if (snap.status === 'ok') {
       if (!snap.updatedAt) snap.updatedAt = now();
       const plain = toPlain(snap) || snap;
@@ -183,6 +187,7 @@ function createScheduler({ providers = [], getSettings, onSnapshot, history, tra
 
   async function runProvider(provider, settings) {
     const prevGood = lastGood.get(provider.id) || null;
+    const generation = generations.get(provider.id) || 0;
     const context = {
       settings,
       fetch: fetchImpl || globalThis.fetch,
@@ -197,7 +202,12 @@ function createScheduler({ providers = [], getSettings, onSnapshot, history, tra
       logger.warn(`[${provider.id}] fetchSnapshot threw:`, safeMessage(err));
       result = failureSnapshot(provider, err);
     }
-    return finalize(provider, coerce(provider, result), prevGood);
+    const forgotten = (generations.get(provider.id) || 0) !== generation;
+    if (forgotten && result && typeof result === 'object') {
+      const { skipNextCycle, ...rest } = result; // the old login's 429 hint must not park the new one
+      result = rest;
+    }
+    return finalize(provider, coerce(provider, result), prevGood, forgotten);
   }
 
   function safeStep(name, fn) {
@@ -242,6 +252,7 @@ function createScheduler({ providers = [], getSettings, onSnapshot, history, tra
       const settings = settingsSafe();
       const resolved = resolveProviders();
       const enabled = resolved.filter((p) => isEnabled(settings, p.id));
+      const startGeneration = new Map(resolved.map((p) => [p.id, generations.get(p.id) || 0]));
 
       // A provider that was rate-limited last time sits out one automatic tick and keeps showing its
       // previous (stale) entry. Manual/start/resume ticks always run everything.
@@ -260,14 +271,23 @@ function createScheduler({ providers = [], getSettings, onSnapshot, history, tra
 
       const settled = await Promise.allSettled(toRun.map((p) => runProvider(p, settings)));
 
-      const providersOut = emptyProviders(resolved);
+      // Checked again at publish time, after the slowest provider: an account removed while the others were
+      // still loading drops out, and one forgotten (switched to another login) shows a value-less placeholder —
+      // what it fetched belongs to a login it no longer uses, so it must not reach history, alerts or the phone.
+      const current = new Set(resolveProviders().map((p) => p.id));
+      const forgottenNow = (id) => (generations.get(id) || 0) !== startGeneration.get(id);
+      const publish = (provider, snap) => {
+        if (!current.has(provider.id)) return;
+        providersOut[provider.id] = forgottenNow(provider.id)
+          ? failureSnapshot(provider, new Error('Switching to the new settings - refreshing'), 'internal')
+          : snap;
+      };
+      const providersOut = emptyProviders(resolved.filter((p) => current.has(p.id)));
       settled.forEach((outcome, i) => {
         const provider = toRun[i];
-        providersOut[provider.id] = outcome.status === 'fulfilled'
-          ? outcome.value
-          : failureSnapshot(provider, outcome.reason);
+        publish(provider, outcome.status === 'fulfilled' ? outcome.value : failureSnapshot(provider, outcome.reason));
       });
-      for (const [id, snap] of carried) providersOut[id] = snap;
+      for (const [id, snap] of carried) publish(resolved.find((p) => p.id === id), snap);
       lastProviders = providersOut;
 
       const { providers: shown, duplicates } = applyDedupe(providersOut);
@@ -332,6 +352,7 @@ function createScheduler({ providers = [], getSettings, onSnapshot, history, tra
   function forgetProvider(id) {
     lastGood.delete(id);
     skipNext.delete(id);
+    generations.set(id, (generations.get(id) || 0) + 1);
   }
 
   return {

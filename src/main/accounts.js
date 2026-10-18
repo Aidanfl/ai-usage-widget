@@ -220,18 +220,25 @@ function comparable(snapshot) {
 }
 
 // Conservative on purpose: a false merge hides a real account, a false split only shows one twice. So
-// anything unknown is "different". Two known account ids decide on their own; otherwise the same org
-// only proves the same account when both sides say it is a personal org (a team org holds many people).
+// anything unknown is "different". Two known account ids decide, unless their orgs are known to differ: usage
+// is per organisation, so one login on a personal plan and on a team seat is two usage pools. Otherwise the
+// same org only proves the same account when both sides say it is a personal org (a team org holds many people).
 function sameAccount(a, b) {
   if (!comparable(a) || !comparable(b)) return false;
   const x = a.identity;
   const y = b.identity;
-  if (known(x.account) && known(y.account)) return x.account === y.account;
+  if (known(x.account) && known(y.account)) {
+    return x.account === y.account && !(known(x.org) && known(y.org) && x.org !== y.org);
+  }
   return known(x.org) && known(y.org) && x.org === y.org && x.personalOrg === true && y.personalOrg === true;
 }
 
-// Walks the Claude ids in slot order; a later account that matches an earlier visible one is shown once
-// (the lowest slot keeps it). Non-Claude ids pass through untouched; the input is not mutated.
+// Walks the Claude ids in slot order; a later account that matches an earlier visible one is shown once:
+// the lowest slot keeps the card (its id, name, history line and alert latches stay put). When that card is
+// stale and the twin is fresh — a lapsed read-only Keychain login next to a live claude.ai sign-in, or a 429
+// back-off — the card shows the twin's fresh numbers under the lower slot's id and name, so nothing freezes at
+// old values and the duplicate never pops in and out (one card, one alert per crossing). Non-Claude ids pass
+// through untouched; the input is not mutated.
 function dedupeSnapshot(providers) {
   const input = isPlainObject(providers) ? providers : {};
   const out = { ...input };
@@ -242,6 +249,10 @@ function dedupeSnapshot(providers) {
     if (!snapshot) continue;
     const twin = visible.find((v) => sameAccount(v.snapshot, snapshot));
     if (twin) {
+      if (twin.snapshot.status === 'stale' && snapshot.status === 'ok') {
+        twin.snapshot = { ...snapshot, id: twin.id, name: twin.snapshot.name };
+        out[twin.id] = twin.snapshot;
+      }
       out[id] = null;
       duplicates[id] = twin.id;
     } else {

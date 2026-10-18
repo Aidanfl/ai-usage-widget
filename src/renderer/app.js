@@ -343,6 +343,24 @@
     els.settingsView.style.maxHeight = state.settingsOpen && avail > 300 ? (avail - SETTINGS_SCREEN_MARGIN) + 'px' : '';
   }
 
+  /**
+   * The main view can outgrow the screen too (four to six accounts with the graph open). main.js moves the window
+   * up to keep its bottom on screen; only content taller than the whole work area is capped, and then the cards
+   * scroll. Below that nothing changes, so the usual widget never gets a scrollbar (or clips its side chevrons).
+   */
+  function capMainHeight() {
+    const view = els.mainView;
+    const avail = window.screen ? window.screen.availHeight : 0;
+    view.style.maxHeight = '';
+    view.style.overflowY = '';
+    if (view.hidden || avail <= 300) return;
+    const max = avail - SETTINGS_SCREEN_MARGIN - (els.titleBar.hidden ? 0 : els.titleBar.offsetHeight);
+    if (view.scrollHeight > max) {
+      view.style.maxHeight = max + 'px';
+      view.style.overflowY = 'auto';
+    }
+  }
+
   function renderTitleBar() {
     setClass(els.refreshBtn, 'spinning', state.refreshing);
     els.refreshBtn.title = state.refreshing ? 'Refreshing…' : 'Refresh';
@@ -1190,10 +1208,14 @@
     }
     const name = nameOf(item.p);
     const multi = multiAccount();
-    setClass(label, 'split', multi);
-    if (multi) {
+    // A single account with its own label ("PERSONAL 5H") is wider than the 58 px cell as well, so it splits too —
+    // only the default "CLAUDE 5H" keeps the 1.0.x single-text label.
+    const acc = F.isClaudeId(pid) ? accountById(pid) : null;
+    const split = multi || !!(acc && acc.label && acc.label.trim());
+    setClass(label, 'split', split);
+    if (split) {
       // Name and window in separate cells: a long account label ellipsizes, its "5H" / "7D" never does.
-      const parts = F.compactLabelParts(compactNameOf(item.p), w, true);
+      const parts = F.compactLabelParts(compactNameOf(item.p), w, multi);
       label.replaceChildren(h('span', { class: 'cbase', text: parts.base }), h('span', { class: 'cwin', text: ' ' + parts.win }));
     } else {
       label.textContent = F.compactLabel(name, w);
@@ -1845,6 +1867,7 @@
     if (force) lastSentHeight = null;
     clearTimeout(resizeTimer);
     resizeTimer = setTimeout(() => {
+      capMainHeight(); // here, not in render(): the graph and late layout change the height after a render
       const height = els.container.offsetHeight;
       if (!height) return;
       if (height !== lastSentHeight) {

@@ -80,32 +80,64 @@ struct HistoryChartView: View {
         return legendLabel(for: series)
     }
 
-    /// Several accounts: the account half of the legend — the provider's name, else the part of the
-    /// desktop's "Claude 3 · Weekly Limit" label before the dot (an account that has since been removed
-    /// or hidden still has seven days of history).
-    private func accountLabel(for series: HistorySeries, providerId: String) -> String {
+    /// "claude-3.weekly" → "claude-3": the provider a series belongs to, and so whose dash it draws.
+    private static func providerId(ofKey key: String) -> String {
+        return key.split(separator: ".", maxSplits: 1, omittingEmptySubsequences: false).first.map { String($0) } ?? ""
+    }
+
+    /// Several accounts: an account's name for the legend — the provider's own, else (an account hidden,
+    /// deduped or removed on the desktop, which still has seven days of history) the desktop's default
+    /// name derived from the id: "Claude 3", or the id itself for anything that is not a Claude account.
+    /// Never the series label: the desktop sends "<name> <window label>" ("Claude 3 Weekly" for a
+    /// leftover), with no separator to split the window off, so labels would give one entry per window.
+    private func accountName(providerId: String) -> String {
         if let p = snapshot?.orderedProviders.first(where: { $0.providerId == providerId }) { return p.displayName }
-        if let l = series.label, let head = l.components(separatedBy: " · ").first, !head.isEmpty { return head }
-        return providerId
+        if let slot = ProviderIds.claudeSlot(providerId) { return "Claude \(slot)" }
+        return providerId.isEmpty ? "?" : providerId
+    }
+
+    /// Several accounts: the account half of the legend, ONE entry per provider id (the line style scale
+    /// maps entry → dash, so the entry must be as unique as the slot). Two accounts the user gave the
+    /// same label each carry their slot ("Work (1)", "Work (2)") instead of sharing an entry and a dash.
+    private func accountLabels(for providerIds: [String]) -> [String: String] {
+        var order: [String] = []
+        for id in providerIds where !order.contains(id) { order.append(id) }
+        let names = order.map { accountName(providerId: $0) }
+        var counts: [String: Int] = [:]
+        for name in names { counts[name, default: 0] += 1 }
+        var used = Set<String>()
+        var out: [String: String] = [:]
+        for (id, name) in zip(order, names) {
+            var label = name
+            if counts[name, default: 0] > 1 {
+                label = ProviderIds.claudeSlot(id).map { "\(name) (\($0))" } ?? "\(name) (\(id))"
+            }
+            // A label that happens to read like another's disambiguated one ("Work (2)") still gets its own.
+            while used.contains(label) { label += " (\(id))" }
+            used.insert(label)
+            out[id] = label
+        }
+        return out
     }
 
     private var seriesInfos: [SeriesInfo] {
         guard let h = history else { return [] }
         let multi = isMultiAccount
+        let series = h.seriesList.compactMap { s in s.key.map { (series: s, key: $0) } }
+        let accounts = multi ? accountLabels(for: series.map { HistoryChartView.providerId(ofKey: $0.key) }) : [:]
         var used = Set<String>()
         var out: [SeriesInfo] = []
-        for s in h.seriesList {
-            guard let key = s.key else { continue }
+        for (s, key) in series {
             var label = legendLabel(for: s)
             if used.contains(label) { label = "\(label) (\(key))" }
             used.insert(label)
-            let providerId = key.split(separator: ".", maxSplits: 1).first.map { String($0) } ?? ""
+            let providerId = HistoryChartView.providerId(ofKey: key)
             let slot = ProviderIds.claudeSlot(providerId) ?? 1
             out.append(SeriesInfo(key: key,
                                   label: label,
                                   color: Theme.seriesColor(s.color),
                                   colorLabel: multi ? colorLabel(for: s, providerId: providerId) : label,
-                                  account: multi ? accountLabel(for: s, providerId: providerId) : "",
+                                  account: accounts[providerId] ?? "",
                                   dash: HistoryChartView.accountDashes[(slot - 1) % HistoryChartView.accountDashes.count]))
         }
         return out

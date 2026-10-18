@@ -246,3 +246,20 @@ test('a window recovering while a sibling is still blocked keeps its latch', () 
   alerts.evaluate(snap(100, 100), SETTINGS);        // session blocked again
   assert.equal(calls.length, 0, 'and no fresh "reached" toast — the latch was never cleared');
 });
+
+test('forget(id) clears one provider: a new account taking that id is seeded silently, never sees the old latches as a rollover', () => {
+  const notes = [];
+  const engine = createAlertEngine({ notify: (title, body) => notes.push(`${title} | ${body}`), now: () => 0 });
+  const settings = { usageAlerts: true, warnThreshold: 75, dangerThreshold: 90 };
+  const blocked = provider('claude-2', [win('weekly', 'Weekly', 'weekly', 100, CYCLE_A, 'blocked')], { name: 'Bob' });
+  const other = provider('claude', [win('weekly', 'Weekly', 'weekly', 95, CYCLE_A)], { name: 'Claude 1' });
+  engine.evaluate({ providers: { claude: other, 'claude-2': blocked } }, settings); // seeds both silently
+  engine.forget('claude-2');
+  // Carol takes slot 2 at 12 % on another cycle: with Bob's latches this would toast "usage available again".
+  const carol = provider('claude-2', [win('weekly', 'Weekly', 'weekly', 12, CYCLE_B)], { name: 'Carol' });
+  engine.evaluate({ providers: { claude: other, 'claude-2': carol } }, settings);
+  assert.deepEqual(notes, [], 'seeded silently again');
+  // Account 1 keeps its own state: its next danger crossing is still deduplicated (no repeat toast).
+  engine.evaluate({ providers: { claude: other, 'claude-2': carol } }, settings);
+  assert.deepEqual(notes, []);
+});

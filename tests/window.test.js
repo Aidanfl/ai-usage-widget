@@ -335,3 +335,35 @@ test('close/closed callbacks reach main.js with the window; restore recentres an
   assert.equal(windowing.getAppliedBackground(win), 'solid');
   assert.equal(windowing.getAppliedBackground(null), null);
 });
+
+test('keepBottomOnScreen: grows past the bottom → moves up just enough; shrinks → back down to the user\'s spot; a drag is the new spot', () => {
+  const second = { workArea: { x: 1920, y: 25, width: 1440, height: 875 } }; // a Mac display with the menu bar
+  const scr = Object.assign(fakeScreen([PRIMARY, second]), { getDisplayMatching: (b) => (b.x >= 1920 ? second : PRIMARY) });
+  const y = (w) => w.getBounds().y;
+
+  const fits = new FakeBrowserWindow({ width: 620, height: 500, x: 100, y: 100 });
+  assert.equal(windowing.keepBottomOnScreen(fits, 900, scr), 900, 'fits below its top → untouched');
+  assert.equal(y(fits), 100);
+
+  const low = new FakeBrowserWindow({ width: 620, height: 150, x: 2000, y: 740 }); // parked on the bottom edge
+  assert.equal(windowing.keepBottomOnScreen(low, 700, scr), 700, 'Settings / the graph opened');
+  assert.equal(y(low), 200, 'moved up so its bottom sits on the work area bottom (25 + 875 - 700)');
+  assert.deepEqual(windowing.persistedPosition(low), { x: 2000, y: 740 }, "the user's spot is what gets saved, not the shifted one");
+  assert.equal(windowing.keepBottomOnScreen(low, 150, scr), 150, 'closed again');
+  assert.equal(y(low), 740, "back down where the user put it (no ratchet towards the top)");
+
+  low.setPosition(2000, 300); // the user drags it
+  windowing.keepBottomOnScreen(low, 700, scr);
+  assert.equal(y(low), 200);
+  windowing.keepBottomOnScreen(low, 150, scr);
+  assert.equal(y(low), 300, 'the drag is the new spot');
+
+  const huge = new FakeBrowserWindow({ width: 620, height: 500, x: 2000, y: 300 });
+  assert.equal(windowing.keepBottomOnScreen(huge, 1226, scr), 875, 'six accounts + graph: capped at the work area');
+  assert.equal(y(huge), 25, 'never above the work area (the menu bar)');
+
+  const min = new FakeBrowserWindow({ width: 620, height: 500, x: 2000, y: 400 });
+  min.minimized = true;
+  assert.equal(windowing.keepBottomOnScreen(min, 700, scr), 700, 'a minimized window is left alone');
+  assert.equal(y(min), 400);
+});

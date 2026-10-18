@@ -143,6 +143,25 @@ function createHistory({ get, set, now = Date.now } = {}) {
     return { samples, series: buildSeries(latestSnapshot, samples) };
   }
 
+  // A removed account's series go with it: an account later taking the same id must not have another
+  // person's last seven days drawn under its name. Samples left with no values are dropped.
+  function forgetProvider(providerId) {
+    const prefix = `${providerId}.`;
+    const samples = load();
+    let changed = false;
+    const kept = [];
+    for (const sample of samples) {
+      const keys = Object.keys(sample.v);
+      if (!keys.some((k) => k.startsWith(prefix))) { kept.push(sample); continue; }
+      changed = true;
+      const v = {};
+      for (const k of keys) if (!k.startsWith(prefix)) v[k] = sample.v[k];
+      if (Object.keys(v).length) kept.push({ t: sample.t, v });
+    }
+    if (changed) set(kept);
+    return changed;
+  }
+
   function pruneAll() {
     const samples = load();
     const kept = prune(samples, now());
@@ -150,7 +169,7 @@ function createHistory({ get, set, now = Date.now } = {}) {
     return kept.length;
   }
 
-  return { append, get: getHistory, pruneAll };
+  return { append, get: getHistory, pruneAll, forgetProvider };
 }
 
 module.exports = {

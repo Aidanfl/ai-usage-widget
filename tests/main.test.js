@@ -69,6 +69,9 @@ async function boot({ accounts = [acct('claude')], settings = {}, config = {}, m
     saves: [],
     created: [],          // every provider instance made by a factory, in order
     forgotten: [],        // scheduler.forgetProvider ids
+    historyForgotten: [], // history.forgetProvider ids
+    alertsForgotten: [],  // alerts.forget ids
+    inFlight: null,       // a promise standing for a scheduler tick in flight (isRefreshing() while set)
     refreshes: 0,
     trayRebuilds: 0,
     sent: [],             // broadcasts to the renderer { channel, payload }
@@ -146,7 +149,7 @@ async function boot({ accounts = [acct('claude')], settings = {}, config = {}, m
   // --- provider factories ---
   const webInstance = (opts) => {
     const inst = {
-      kind: 'web', opts, sessions: [], logouts: 0, logins: 0, selected: [], next: null,
+      kind: 'web', opts, sessions: [], logouts: 0, wipes: 0, logins: 0, selected: [], next: null,
       setSession(session) { inst.sessions.push(clone(session)); },
       async login({ onSessionKey }) {
         inst.logins += 1;
@@ -160,6 +163,11 @@ async function boot({ accounts = [acct('claude')], settings = {}, config = {}, m
         if (inst.logoutFails) throw new Error('partition gone');
         return true;
       },
+      async wipe() {
+        inst.wipes += 1;
+        if (inst.logoutFails) throw new Error('partition gone');
+        return true;
+      },
       async listOrgs() { return [{ id: 'org-a', name: 'Org A', isTeam: false, raw: {} }, { id: 'org-b', name: null, isTeam: true }]; },
       async selectOrg(orgId) { inst.selected.push(orgId); return true; },
       async fetchSnapshot() { return inst.next || okSnapshot('claude', 'Claude', { source: 'claude_web' }); },
@@ -169,7 +177,10 @@ async function boot({ accounts = [acct('claude')], settings = {}, config = {}, m
   };
   const codeInstance = (opts) => {
     if (h.codeFactoryThrows) throw new Error('bad config folder');
-    const inst = { kind: 'code', opts, next: null, async fetchSnapshot() { return inst.next || okSnapshot('claude', 'Claude'); } };
+    const inst = {
+      kind: 'code', opts, next: null, gate: null,
+      async fetchSnapshot() { if (inst.gate) await inst.gate; return inst.next || okSnapshot('claude', 'Claude'); },
+    };
     h.created.push(inst);
     return inst;
   };
@@ -183,8 +194,8 @@ async function boot({ accounts = [acct('claude')], settings = {}, config = {}, m
       showMainWindowSmart() {}, isWindowShownOnScreen: () => true, applyContentSize() {}, getRequestedContentSize: () => null,
       WIDGET_WIDTH: 620, COMPACT_WIDTH: 290, INITIAL_HEIGHT: 400,
     },
-    './history': { createHistory: () => ({ get: () => ({ samples: [], series: [] }), append() {}, pruneAll: () => 0 }) },
-    './alerts': { createAlertEngine: () => ({ evaluate() {}, reset() {} }) },
+    './history': { createHistory: () => ({ get: () => ({ samples: [], series: [] }), append() {}, pruneAll: () => 0, forgetProvider: (id) => { h.historyForgotten.push(id); } }) },
+    './alerts': { createAlertEngine: () => ({ evaluate() {}, reset() {}, forget: (id) => { h.alertsForgotten.push(id); } }) },
     './tray': {
       createTray: () => ({
         update() {}, destroy() {}, hasIcon: () => true,
@@ -201,8 +212,8 @@ async function boot({ accounts = [acct('claude')], settings = {}, config = {}, m
       createScheduler: (opts) => {
         h.schedulerOpts = opts;
         return {
-          start() {}, stop() {}, applyInterval() {}, getLastSnapshot: () => null, isRefreshing: () => false,
-          refreshNow: () => { h.refreshes += 1; return Promise.resolve(null); },
+          start() {}, stop() {}, applyInterval() {}, getLastSnapshot: () => null, isRefreshing: () => h.inFlight !== null,
+          refreshNow: () => { h.refreshes += 1; return h.inFlight || Promise.resolve(null); },
           forgetProvider: (id) => { h.forgotten.push(id); },
         };
       },
@@ -382,10 +393,13 @@ test('registry: removing an account signs its partition out, deletes only its st
   h.saveAccounts([acct('claude', 'claude_web')]);
   await flush();
 
-  assert.equal(second.logouts, 1, 'the removed claude.ai account is logged out');
+  assert.equal(second.wipes, 1, 'the removed claude.ai account has its whole partition wiped (SSO cookies too)');
+  assert.equal(second.logouts, 0);
   const throwaway = h.created.filter((inst) => inst.kind === 'web' && inst.opts.id === 'claude-3');
   assert.equal(throwaway.length, 1, 'a leftover session is signed out on its own partition');
-  assert.equal(throwaway[0].logouts, 1);
+  assert.equal(throwaway[0].wipes, 1);
+  assert.deepEqual(h.historyForgotten.sort(), ['claude-2', 'claude-3', 'claude-4'], "removed accounts' history series go");
+  assert.deepEqual(h.alertsForgotten.sort(), ['claude-2', 'claude-3', 'claude-4'], "removed accounts' alert latches go");
   assert.equal(h.created.filter((inst) => inst.kind === 'web' && inst.opts.id === 'claude-4').length, 0, 'no partition touched for an account that never signed in');
   assert.equal(h.config.claudeWebSessions, undefined, 'the map goes once it is empty');
   assert.equal(dec(h.config.claudeWebSession), 'sk-one', 'account 1 keeps its session');
@@ -591,7 +605,7 @@ test('login: a sign-in that finishes after its account was removed persists noth
 
   h.saveAccounts([acct('claude')]);
   await flush();
-  assert.equal(inst.logouts, 1, 'removal signs it out');
+  assert.equal(inst.wipes, 1, 'removal wipes its partition');
   release();
   const result = await pending;
   await flush();
@@ -600,7 +614,7 @@ test('login: a sign-in that finishes after its account was removed persists noth
   assert.equal(h.config.claudeWebSessions, undefined, 'no session stored for a removed account');
   assert.equal(h.config.claudeWebSession, undefined, 'and none under account 1 either');
   assert.ok(h.saves.every((patch) => !patch.claudeAccounts || patch.claudeAccounts.every((a) => a.id !== 'claude-2')), 'the account is not written back');
-  assert.equal(inst.logouts, 2, 'the cookie the late login left behind is cleared');
+  assert.equal(inst.wipes, 2, 'the cookie the late login left behind is wiped with the rest of the partition');
 });
 
 test('login: a sign-in that finishes after its account switched source persists nothing', async (t) => {
@@ -802,4 +816,33 @@ test('preload: the claude.ai methods carry an optional accountId; the 1-arg form
   assert.equal(invokes[5].arg.id, 'org-y');
   assert.equal(invokes[5].arg.accountId, undefined);
   assert.deepEqual(invokes[6].arg, { patch: { claudeAccounts: [] } });
+});
+
+test('registry: a fetch still in flight when its account switches login never reports the old login as this account; the new one is fetched at once', async (t) => {
+  const h = await bootFor(t, { accounts: [acct('claude'), acct('claude-2', 'claude_keychain', { configDir: '' })] });
+  const oldWrapper = h.wrapper('claude-2');
+  oldWrapper.getInstance();
+  const oldInstance = h.instancesOf('claude-2')[0];
+  let release;
+  oldInstance.gate = new Promise((r) => { release = r; });
+  oldInstance.next = okSnapshot('claude', 'Claude', { source: 'claude_keychain', identity: { account: 'aaaa', org: 'bbbb', personalOrg: true } });
+  const pending = oldWrapper.fetchSnapshot({}); // the tick in flight
+
+  let endTick;
+  h.inFlight = new Promise((r) => { endTick = r; });
+  const before = h.refreshes;
+  h.saveAccounts([acct('claude'), acct('claude-2', 'claude_keychain', { configDir: '~/.claude-1' })]);
+
+  release();
+  const late = await pending;
+  assert.equal(late.status, 'error', "the old login's ok result is not this account's any more");
+  assert.equal(late.identity, null, 'no identity: dedupe cannot hide the account behind the old login');
+  assert.deepEqual(late.windows, []);
+  assert.equal(late.id, 'claude-2');
+
+  assert.equal(h.refreshes, before + 1, 'the refresh joined the tick in flight …');
+  h.inFlight = null;
+  endTick(null);
+  await flush();
+  assert.equal(h.refreshes, before + 2, '… and a fresh one runs once it settles, for the new folder');
 });
