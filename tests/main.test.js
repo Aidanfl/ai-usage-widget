@@ -123,7 +123,19 @@ async function boot({ accounts = [acct('claude')], settings = {}, config = {}, m
   };
   let becomeReady;
   const readyPromise = new Promise((resolve) => { becomeReady = resolve; });
-  h.becomeReady = async () => { h.ready = true; becomeReady(); await flush(); };
+  // main.js's whenReady callback runs here, so the platform stays 'linux' for it too: on win32 it would start the
+  // 2 s always-on-top interval, which nothing clears and which keeps `node --test` alive forever (the Windows CI hang).
+  h.becomeReady = async () => {
+    const real = Object.getOwnPropertyDescriptor(process, 'platform');
+    Object.defineProperty(process, 'platform', { ...real, value: 'linux' });
+    try {
+      h.ready = true;
+      becomeReady();
+      await flush();
+    } finally {
+      Object.defineProperty(process, 'platform', real);
+    }
+  };
   const electron = {
     app: {
       requestSingleInstanceLock: () => true, setAppUserModelId() {}, quit() {}, on() {}, whenReady: () => readyPromise,

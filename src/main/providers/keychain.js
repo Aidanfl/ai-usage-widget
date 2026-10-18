@@ -64,10 +64,13 @@ function shortHash(text, length) {
   return crypto.createHash('sha256').update(String(text)).digest('hex').slice(0, length);
 }
 
-/** '~', '~/…' and '~\…' expanded the way a shell would before setting CLAUDE_CONFIG_DIR; nothing else changed. */
+/**
+ * '~', '~/…' and '~\…' expanded the way a shell would before setting CLAUDE_CONFIG_DIR: home, the platform's
+ * separator, then the rest exactly as typed (a trailing slash included); nothing else changed.
+ */
 function expandTilde(dir, home) {
   if (dir === '~') return home;
-  if (dir.startsWith('~/') || dir.startsWith('~\\')) return String(home).replace(/[\\/]+$/, '') + dir.slice(1);
+  if (dir.startsWith('~/') || dir.startsWith('~\\')) return String(home).replace(/[\\/]+$/, '') + path.sep + dir.slice(2);
   return dir;
 }
 
