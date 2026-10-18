@@ -48,7 +48,7 @@ const snapshot = {
   fetchedAt: now,
   providers: {
     claude: {
-      id: 'claude', name: 'Claude', status: 'ok', error: null, source: 'claude_code',
+      id: 'claude', name: 'Personal', status: 'ok', error: null, source: 'claude_code',
       plan: 'Max 20x', account: 'demo@example.com', updatedAt: now,
       windows: [
         win('session', 'Current Session', 'session', 34.2, inHours(2.4), 'purple'),
@@ -57,6 +57,26 @@ const snapshot = {
       ],
       extra: { enabled: true, label: 'Extra usage', percent: 12.0 },
       credits: { balance: 42.75, currency: 'USD' },
+    },
+    // Two more Claude accounts (1.1.0): the desktop sends every account, account 1 as `claude`, the others as
+    // claude-2 … claude-6 named by their labels, so a reviewer sees the multi-account dashboard and widgets.
+    'claude-2': {
+      id: 'claude-2', name: 'Work', status: 'ok', error: null, source: 'claude_web',
+      plan: 'Max 5x', account: 'Demo Work', updatedAt: now,
+      windows: [
+        win('session', 'Current Session', 'session', 12.4, inHours(4.1), 'purple'),
+        win('weekly', 'Weekly Limit', 'weekly', 38.9, inHours(102), 'blue'),
+      ],
+      extra: null, credits: null,
+    },
+    'claude-3': {
+      id: 'claude-3', name: 'Side project', status: 'ok', error: null, source: 'claude_web',
+      plan: 'Pro', account: 'Demo Side project', updatedAt: now,
+      windows: [
+        win('session', 'Current Session', 'session', 71.0, inHours(1.2), 'purple'),
+        win('weekly', 'Weekly Limit', 'weekly', 83.6, inHours(30), 'blue'),
+      ],
+      extra: null, credits: null,
     },
     codex: {
       id: 'codex', name: 'Codex', status: 'ok', error: null, source: 'codex_auth_file',
@@ -77,11 +97,14 @@ const snapshot = {
 // The Fable weekly window is deliberately absent from the chart: the app derives its own legend label
 // from the series key and has no name for that one, so it renders as "Claude 7d (claude.weekly_fable)".
 // It still appears in the cards above the chart, where it is labelled properly.
+// Labels in the desktop's own format ('<name> <window label>', history.js buildSeries).
 const series = [
-  { key: 'claude.session', label: 'Claude · Current Session', color: 'purple' },
-  { key: 'claude.weekly', label: 'Claude · Weekly Limit', color: 'blue' },
-  { key: 'codex.primary', label: 'Codex · 5-Hour Limit', color: 'teal' },
-  { key: 'codex.secondary', label: 'Codex · Weekly Limit', color: 'green' },
+  { key: 'claude.session', label: 'Personal Current Session', color: 'purple' },
+  { key: 'claude.weekly', label: 'Personal Weekly Limit', color: 'blue' },
+  { key: 'claude-2.weekly', label: 'Work Weekly Limit', color: 'blue' },
+  { key: 'claude-3.weekly', label: 'Side project Weekly Limit', color: 'blue' },
+  { key: 'codex.primary', label: 'Codex 5-Hour Limit', color: 'teal' },
+  { key: 'codex.secondary', label: 'Codex Weekly Limit', color: 'green' },
 ];
 const samples = [];
 const TOTAL_H = 7 * 24;
@@ -107,6 +130,8 @@ for (let i = TOTAL_H * 2; i >= 0; i--) {            // every 30 min for 7 days
     v: {
       'claude.session': sessionAt(hoursFromStart, 66, 0),
       'claude.weekly': weeklyAt(hoursFromStart, 61.5),
+      'claude-2.weekly': weeklyAt(hoursFromStart, 38.9),
+      'claude-3.weekly': weeklyAt(hoursFromStart, 83.6),
       'codex.primary': sessionAt(hoursFromStart, 41, 2.5),
       'codex.secondary': weeklyAt(hoursFromStart, 47.3),
     },
