@@ -86,45 +86,47 @@ struct UsageWidgetModel {
     }
 
     func rows(for provider: ProviderSnapshot) -> [UsageWidgetRow] {
+        return provider.windowList.map { makeRow($0, of: provider) }
+    }
+
+    fileprivate func makeRow(_ w: UsageWindow, of provider: ProviderSnapshot) -> UsageWidgetRow {
         let name = provider.displayName
         // Four accounts would otherwise all say "CLAUDE 5H"; the short name is what tells them apart
-        // in the 58pt lock-screen label and the small widget's caption.
+        // in the small widget's caption.
         let shortName: String? = isMultiAccount && provider.isClaude ? self.shortName(for: provider) : nil
-        return provider.windowList.map { (w: UsageWindow) -> UsageWidgetRow in
-            let level = Formatting.rowLevel(w, settings: settings)
-            let short: String
-            if w.kind == "weekly_scoped", let scope = w.scope, !scope.isEmpty {
-                short = "\(scope) \(Formatting.shortWindowName(w))".trimmingCharacters(in: .whitespaces).uppercased()
-            } else {
-                let s = Formatting.shortWindowName(w)
-                short = s.isEmpty ? w.displayLabel.uppercased() : s
-            }
-            let reset = w.resetsAtDate
-            let compact: String
-            if let shortName = shortName {
-                // compactLabel with no provider name is just the window part: "5H", "FABLE 7D".
-                compact = "\(shortName) \(Formatting.compactLabel(providerName: "", window: w))"
-            } else {
-                compact = Formatting.compactLabel(providerName: name, window: w)
-            }
-            return UsageWidgetRow(
-                providerId: provider.providerId,
-                providerName: name,
-                window: w,
-                compactLabel: compact,
-                shortLabel: short,
-                level: level,
-                gradient: Theme.barGradient(token: w.colorToken, level: level),
-                color: Theme.barColor(token: w.colorToken, level: level),
-                fraction: Formatting.clampPercent(w.percent) / 100.0,
-                percentText: Formatting.percentText(w.percent),
-                resetsIn: Formatting.resetsIn(resetsAt: reset, percent: w.percent, now: now),
-                resetsAt: Formatting.resetsAt(reset,
-                                              isWeekly: Formatting.isWeeklyWindow(w, now: now),
-                                              timeFormat: settings.timeFormat,
-                                              dateFormat: settings.dateFormat)
-            )
+        let level = Formatting.rowLevel(w, settings: settings)
+        let short: String
+        if w.kind == "weekly_scoped", let scope = w.scope, !scope.isEmpty {
+            short = "\(scope) \(Formatting.shortWindowName(w))".trimmingCharacters(in: .whitespaces).uppercased()
+        } else {
+            let s = Formatting.shortWindowName(w)
+            short = s.isEmpty ? w.displayLabel.uppercased() : s
         }
+        let reset = w.resetsAtDate
+        let compact: String
+        if let shortName = shortName {
+            // compactLabel with no provider name is just the window part: "5H", "FABLE 7D".
+            compact = "\(shortName) \(Formatting.compactLabel(providerName: "", window: w))"
+        } else {
+            compact = Formatting.compactLabel(providerName: name, window: w)
+        }
+        return UsageWidgetRow(
+            providerId: provider.providerId,
+            providerName: name,
+            window: w,
+            compactLabel: compact,
+            shortLabel: short,
+            level: level,
+            gradient: Theme.barGradient(token: w.colorToken, level: level),
+            color: Theme.barColor(token: w.colorToken, level: level),
+            fraction: Formatting.clampPercent(w.percent) / 100.0,
+            percentText: Formatting.percentText(w.percent),
+            resetsIn: Formatting.resetsIn(resetsAt: reset, percent: w.percent, now: now),
+            resetsAt: Formatting.resetsAt(reset,
+                                          isWeekly: Formatting.isWeeklyWindow(w, now: now),
+                                          timeFormat: settings.timeFormat,
+                                          dateFormat: settings.dateFormat)
+        )
     }
 
     var allRows: [UsageWidgetRow] {
@@ -149,20 +151,26 @@ struct UsageWidgetModel {
         return rows.first?.percentText
     }
 
-    /// "Claude 42% · Codex 12%"; with several Claude accounts "C1 22% · C2 81% · Codex 12%", each
-    /// account by its weekly (`accountRow`) — the inline slot truncates the tail, and five full names
-    /// would not get past the second account.
-    var inlineText: String {
-        let parts: [String] = providers.compactMap { p in
-            if isMultiAccount && p.isClaude {
-                guard let row = accountRow(for: p) else { return nil }
-                return "\(shortName(for: p)) \(row.percentText)"
-            }
-            guard let pct = headlinePercent(for: p) else { return nil }
-            return "\(p.displayName) \(pct)"
+    /// The inline widget's pieces: "Claude 42%", "Codex 12%". With several Claude accounts, the accounts in
+    /// `accountsByRoom` order and then the others, each by its plain weekly as it stands now ("C4 4%"), one at a
+    /// limit by when it frees up ("C1 🔒1d 8h"), one that needs a sign-in as "C2 !". The slot cuts the tail, and the
+    /// account to reach for next must not be what it cuts.
+    var inlinePieces: [InlinePiece] {
+        guard isMultiAccount else {
+            return providers.compactMap { p in headlinePercent(for: p).map { InlinePiece(name: p.displayName, value: $0) } }
         }
-        return parts.isEmpty ? "AI Usage — no data" : parts.joined(separator: " · ")
+        let ordered = accountsByRoom + providers.filter { !$0.isClaude }
+        return ordered.compactMap { p in
+            let name = p.isClaude ? shortName(for: p) : p.displayName
+            if !p.hasUsableNumbers { return InlinePiece(name: name, value: "!") }
+            if let hold = holdingRow(for: p), hold.window.resetsAtDate != nil {
+                return InlinePiece(name: name, value: hold.resetsIn, locked: true)
+            }
+            guard let row = plainWeeklyRow(for: p) ?? accountRow(for: p) else { return nil }
+            return InlinePiece(name: name, value: current(row).percentText)
+        }
     }
+
 
     var updatedText: String {
         guard let g = generatedDate else { return "no timestamp" }
@@ -797,6 +805,7 @@ struct LargeRow: View {
 /// One ring, drawn inside its frame: a track in the row's own colour and an arc for its percent.
 /// No row → the bare track.
 struct RingArc: View {
+    @Environment(\.widgetRenderingMode) private var renderingMode
     let row: UsageWidgetRow?
     let lineWidth: CGFloat
     let diameter: CGFloat
@@ -813,11 +822,15 @@ struct RingArc: View {
     }
 
     var body: some View {
-        let color = row?.color ?? Color.primary
+        // The lock screen and a tinted home screen keep only brightness: a blue track at 22% vanishes there, so the
+        // arc goes primary and the track a quarter of it, as the system's own gauges draw.
+        let tinted = renderingMode != .fullColor
+        let color = tinted ? Color.primary : (row?.color ?? Color.primary)
+        let track = tinted ? Color.primary.opacity(0.25) : (row == nil ? Theme.track : color.opacity(0.22))
         ZStack {
             Circle()
                 .inset(by: lineWidth / 2)
-                .stroke(row == nil ? Theme.track : color.opacity(0.22), lineWidth: lineWidth)
+                .stroke(track, lineWidth: lineWidth)
             if shown > 0 {
                 Circle()
                     .inset(by: lineWidth / 2)
@@ -833,6 +846,7 @@ struct RingArc: View {
 /// The weekly as the outer ring with its percent in the middle and, with `showInner`, the session as a
 /// thinner ring inside it: the Activity-rings shape, so several accounts compare at a glance.
 struct RingGauge: View {
+    @Environment(\.widgetRenderingMode) private var renderingMode
     let outer: UsageWidgetRow?
     var inner: UsageWidgetRow? = nil
     var showInner: Bool = false
@@ -875,7 +889,7 @@ struct RingGauge: View {
             VStack(spacing: 0) {
                 Text("\(number)\(sign)")
                     .monospacedDigit()
-                    .foregroundStyle(row.level == .danger ? Theme.dangerText : Color.primary)
+                    .foregroundStyle(row.level == .danger && renderingMode == .fullColor ? Theme.dangerText : Color.primary)
                     .lineLimit(1)
                     .minimumScaleFactor(0.6)
                 if let tag = tag {
@@ -1627,83 +1641,334 @@ struct LargeBlocksView: View {
 }
 
 
+// MARK: - Lock screen plans
+
+extension UsageWidgetModel {
+    /// `row` as it stands at `now`: a window whose reset has passed since the payload was built (a sleeping desktop
+    /// leaves the phone an old one) reads as a new window — 0%, not started — so what the lock screen draws agrees
+    /// with the account `mostRoom` picks, which already counts that limit as reset.
+    func current(_ row: UsageWidgetRow) -> UsageWidgetRow {
+        guard let reset = row.window.resetsAtDate, reset <= now,
+              let provider = providers.first(where: { $0.providerId == row.providerId }) else { return row }
+        var w = row.window
+        w.percent = 0
+        w.resetsAt = nil
+        w.severity = nil
+        w.isActive = false
+        return makeRow(w, of: provider)
+    }
+
+    /// The limit keeping the provider out right now: of its session and plain weekly at a limit, the one that frees
+    /// up last (a limit with no reset time counts as last). nil when it is not at a limit.
+    func holdingRow(for provider: ProviderSnapshot) -> UsageWidgetRow? {
+        return gatingRows(for: provider)
+            .filter { $0.isAtLimit(now: now) }
+            .max { ($0.window.resetsAtDate ?? .distantFuture) < ($1.window.resetsAtDate ?? .distantFuture) }
+    }
+
+    /// At a limit right now: the session or the plain weekly used up, its reset still ahead.
+    func isBlocked(_ provider: ProviderSnapshot) -> Bool {
+        return holdingRow(for: provider) != nil
+    }
+
+    /// Claude accounts in the order to reach for them: `mostRoom` first, then the other open ones by their weekly,
+    /// lowest first, then the ones at a limit, soonest free first, then the ones with nothing to go on; slot order
+    /// breaks ties.
+    /// The pick leads even when its weekly is not the lowest: a session near its limit can rule out the rest.
+    var accountsByRoom: [ProviderSnapshot] {
+        let pick = mostRoom?.providerId
+        let keyed = claudeAccounts.enumerated().map { (index, account) -> (account: ProviderSnapshot, key: (Int, Double, Int)) in
+            guard account.hasUsableNumbers, let row = plainWeeklyRow(for: account) ?? accountRow(for: account) else {
+                return (account, (3, 0, index))
+            }
+            if account.providerId == pick { return (account, (0, 0, index)) }
+            // At a limit: the one that frees up first comes first.
+            if let hold = holdingRow(for: account) {
+                return (account, (2, hold.window.resetsAtDate?.timeIntervalSince(now) ?? .greatestFiniteMagnitude, index))
+            }
+            return (account, (1, row.effectivePercent(now: now), index))
+        }
+        return keyed.sorted { $0.key < $1.key }.map { $0.account }
+    }
+
+    /// The circular gauge: with several accounts, the one with the most room by its weekly (the limit several
+    /// accounts exist to spread), else the first to free up by the limit holding it; with one, Claude's
+    /// headline window. The account's other limit rides inside.
+    var lockGauge: LockGaugePlan? {
+        if isMultiAccount {
+            if let pick = mostRoom, let row = plainWeeklyRow(for: pick) ?? accountRow(for: pick) {
+                return gaugePlan(row, of: pick, caption: shortName(for: pick))
+            }
+            if let next = nextFreed {
+                return gaugePlan(next.row, of: next.provider, caption: shortName(for: next.provider))
+            }
+            // Nothing to recommend: the first account with numbers worth showing, else nothing — the last numbers of
+            // an account that needs a sign-in must not read as a live gauge.
+            guard let open = accountsByRoom.first(where: { $0.hasUsableNumbers }),
+                  let row = plainWeeklyRow(for: open) ?? accountRow(for: open) else { return nil }
+            return gaugePlan(row, of: open, caption: shortName(for: open))
+        }
+        guard let h = headline, let provider = providers.first(where: { $0.providerId == h.providerId }) else { return nil }
+        return gaugePlan(h, of: provider, caption: provider.isClaude ? h.windowTag : provider.displayName.uppercased())
+    }
+
+    /// `row` outside — or, at a limit, the limit that frees up last, so the countdown in the middle is when the
+    /// account is usable again; inside, the session when the outer ring is a longer limit, else the plain weekly.
+    private func gaugePlan(_ row: UsageWidgetRow, of provider: ProviderSnapshot, caption: String) -> LockGaugePlan {
+        let outer = holdingRow(for: provider) ?? row
+        let other = outer.window.kind == "session" ? plainWeeklyRow(for: provider) : sessionRow(for: provider)
+        return LockGaugePlan(outer: current(outer), inner: other.map { current($0) }, caption: caption)
+    }
+}
+
+/// One provider on the inline lock widget: "C4 4%", or "C1 🔒 1d 8h" while it is at a limit.
+struct InlinePiece {
+    let name: String
+    let value: String
+    /// At a limit: `value` is when it frees up, after a lock.
+    var locked: Bool = false
+
+    var text: Text {
+        guard locked else { return Text(verbatim: "\(name) \(value)") }
+        return Text(verbatim: "\(name) ") + Text(Image(systemName: "lock.fill")) + Text(verbatim: value)
+    }
+}
+
+struct LockGaugePlan {
+    let outer: UsageWidgetRow
+    let inner: UsageWidgetRow?
+    /// Under the number: whose limit it is ("C4"), or which ("5H").
+    let caption: String
+}
+
 // MARK: - Lock screen: accessoryRectangular
 
 struct AccessoryRectangularView: View {
     let model: UsageWidgetModel
 
-    /// A label and either a bar or (an account with no windows) the kind of problem in words.
-    private struct Line {
-        let label: String
-        let row: UsageWidgetRow?
-        let note: String?
+    var body: some View {
+        if model.isMultiAccount {
+            AccessoryRingsView(model: model)
+        } else {
+            AccessoryBarsView(model: model)
+        }
+    }
+}
+
+/// Several Claude accounts: which one to reach for, over a ring per provider (its plain weekly, up to five).
+struct AccessoryRingsView: View {
+    let model: UsageWidgetModel
+    static let maxTiles = 5
+
+    var body: some View {
+        let plan = WidgetPlanner.ringTiles(model: model, maxTiles: AccessoryRingsView.maxTiles)
+        let pick = model.mostRoom?.providerId
+        GeometryReader { geo in
+            let count = CGFloat(max(1, plan.tiles.count))
+            let spacing: CGFloat = plan.tiles.count > 3 ? 3 : 6
+            let column = ((geo.size.width - spacing * (count - 1)) / count).rounded(.down)
+            // Header 13 + gap 3 + ring + gap 2 + name 12.
+            let diameter = max(18, min(column, geo.size.height - 30, 40)).rounded(.down)
+            VStack(alignment: .leading, spacing: 3) {
+                LockRingsHeader(model: model, hidden: plan.hidden)
+                HStack(alignment: .top, spacing: spacing) {
+                    ForEach(plan.tiles) { tile in
+                        LockMiniRing(tile: tile, model: model, diameter: diameter, isPick: tile.provider.providerId == pick)
+                            .frame(width: column)
+                    }
+                }
+            }
+            .frame(width: geo.size.width, height: geo.size.height, alignment: .leading)
+        }
+    }
+}
+
+/// "MOST ROOM C4", "NEXT FREE C1 ↻ 1d 8h" or "NO ACCOUNT READY"; then, beside MOST ROOM, how old the numbers
+/// are once they are not fresh, and how many providers had no ring.
+struct LockRingsHeader: View {
+    let model: UsageWidgetModel
+    let hidden: Int
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 4) {
+            if let pick = model.mostRoom {
+                caption("MOST ROOM")
+                name(model.shortName(for: pick))
+            } else if let next = model.nextFreed {
+                caption("NEXT FREE")
+                name(model.shortName(for: next.provider))
+                // The reason this header exists: the name truncates before it does.
+                RingResetLine(row: next.row, now: model.now, size: 10, weight: .semibold)
+                    .fixedSize()
+            } else {
+                caption("NO ACCOUNT READY")
+            }
+            Spacer(minLength: 2)
+            // Only beside MOST ROOM, where it changes the answer: a countdown runs from the reset time, not the
+            // payload's age, and with every account out the rings already say so.
+            if model.mostRoom != nil, model.freshness != .fresh, model.generatedDate != nil {
+                Text(Formatting.relativeAgo(model.generatedDate, now: model.now))
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .layoutPriority(-1)
+            }
+            if hidden > 0 {
+                Text("+\(hidden)")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .monospacedDigit()
+        .lineLimit(1)
+        .frame(height: 13)
     }
 
-    /// Claude session + weekly, then the first Codex row (three thin bars). With several Claude
-    /// accounts: one weekly per account ("C2 7D", up to four), then Codex's first row if a line is left.
-    private var lines: [Line] {
-        if model.isMultiAccount {
-            var out: [Line] = model.claudeAccounts.prefix(4).map { account in
-                if let row = model.accountRow(for: account) {
-                    return Line(label: model.accountTag(for: account, row: row), row: row, note: nil)
-                }
-                return Line(label: model.shortName(for: account), row: nil, note: account.widgetShortNote)
+    private func caption(_ text: String) -> some View {
+        return Text(text)
+            .font(.system(size: 9, weight: .bold))
+            .kerning(0.4)
+            .foregroundStyle(.secondary)
+            .fixedSize()
+    }
+
+    private func name(_ text: String) -> some View {
+        return Text(text)
+            .font(.system(size: 11, weight: .bold))
+            .minimumScaleFactor(0.8)
+    }
+}
+
+/// One provider on the rectangular lock widget: its plain weekly as a ring with the number inside (a lock
+/// while the account is at a limit, "!" when it has nothing to show), its short name under it.
+struct LockMiniRing: View {
+    let tile: RingTilePlan
+    let model: UsageWidgetModel
+    let diameter: CGFloat
+    /// The account `MOST ROOM` names: its name stands out from the others.
+    let isPick: Bool
+
+    /// Nothing to show, or only the last numbers of an account that needs a sign-in.
+    private var unusable: Bool { return tile.note != nil || !tile.provider.hasUsableNumbers }
+    /// The plain weekly, not `tile.outer`: a used-up Fable share does not stop the account, and a ring this
+    /// small has no room for the tag that would say it is not the weekly.
+    private var row: UsageWidgetRow? {
+        guard !unusable else { return nil }
+        return (model.plainWeeklyRow(for: tile.provider) ?? tile.outer).map { model.current($0) }
+    }
+    private var lineWidth: CGFloat { return max(3, (diameter * 0.12).rounded()) }
+    private var hole: CGFloat { return max(0, diameter - 2 * lineWidth - 2) }
+
+    var body: some View {
+        VStack(spacing: 2) {
+            ZStack {
+                RingArc(row: row, lineWidth: lineWidth, diameter: diameter)
+                centre
             }
-            if out.count < 4, let x = model.codex, let first = model.rows(for: x).first {
-                out.append(Line(label: first.compactLabel, row: first, note: nil))
-            }
-            return out
+            .frame(width: diameter, height: diameter)
+            .opacity(unusable ? 0.6 : 1)
+            Text(tile.provider.isClaude ? model.shortName(for: tile.provider) : tile.provider.displayName)
+                .font(.system(size: 10, weight: isPick ? .heavy : .semibold))
+                .foregroundStyle(isPick ? HierarchicalShapeStyle.primary : HierarchicalShapeStyle.secondary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+                .frame(height: 12)
         }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(accessibility)
+    }
+
+    private var accessibility: String {
+        var parts = [tile.provider.displayName]
+        if unusable {
+            parts.append(tile.note ?? tile.provider.widgetShortNote)
+        } else if let hold = model.holdingRow(for: tile.provider) {
+            parts.append(hold.window.resetsAtDate.map { $0 > model.now } == true ? "at a limit, free in \(hold.resetsIn)" : "at a limit")
+        } else if let row = row {
+            parts.append("\(row.window.displayLabel) \(row.percentText)")
+        }
+        if isPick { parts.append("most room") }
+        return parts.joined(separator: ", ")
+    }
+
+    @ViewBuilder private var centre: some View {
+        if unusable {
+            Image(systemName: "exclamationmark")
+                .font(.system(size: hole * 0.5, weight: .bold))
+        } else if model.isBlocked(tile.provider) {
+            Image(systemName: "lock.fill")
+                .font(.system(size: hole * 0.45, weight: .semibold))
+        } else if let row = row {
+            // Five rings across fit the bare number (the ring already says it is a percent); three have room for "%".
+            let bare = hole < 26
+            let size = hole * (bare ? 0.52 : 0.42)
+            let number = Text("\(Int(Formatting.clampPercent(row.window.percent).rounded()))")
+                .font(.system(size: size, weight: .bold, design: .rounded))
+            let sign = Text(bare ? "" : "%")
+                .font(.system(size: size * 0.55, weight: .bold, design: .rounded))
+            Text("\(number)\(sign)")
+                .monospacedDigit()
+                .lineLimit(1)
+                .minimumScaleFactor(0.6)
+                .frame(width: hole)
+        }
+    }
+}
+
+/// One Claude account: Claude's session and weekly, then Codex's first window, as labelled bars.
+struct AccessoryBarsView: View {
+    let model: UsageWidgetModel
+
+    private struct Line {
+        let label: String
+        let row: UsageWidgetRow
+    }
+
+    private var lines: [Line] {
         var out: [UsageWidgetRow] = []
         if let c = model.claude { out.append(contentsOf: model.rows(for: c).prefix(2)) }
         if let x = model.codex, let first = model.rows(for: x).first { out.append(first) }
         if out.isEmpty { out = Array(model.allRows.prefix(3)) }
-        // A lone account named other than "Claude" is labelled the way the multi path labels it ("PERS 5H",
-        // "C3 7D"), so the window half survives the 58pt and the two bars stay told apart.
+        // An account named other than "Claude" is labelled "PERS 5H", so the window half survives the label
+        // column and the two bars stay told apart.
         let claudeTag = model.singleAccountShortName
         let claudeId = model.claude?.providerId
         return out.prefix(3).map { row in
             if let tag = claudeTag, row.providerId == claudeId {
-                return Line(label: "\(tag) \(row.windowTag)", row: row, note: nil)
+                return Line(label: "\(tag) \(row.windowTag)", row: model.current(row))
             }
-            return Line(label: row.compactLabel, row: row, note: nil)
+            return Line(label: row.compactLabel, row: model.current(row))
         }
     }
 
     var body: some View {
         let lines = self.lines
-        // Four lines need the 3pt gap trimmed to 2 to stay inside the ~64pt the smallest phones give.
-        return VStack(alignment: .leading, spacing: lines.count > 3 ? 2 : 3) {
+        VStack(alignment: .leading, spacing: 4) {
             if lines.isEmpty {
                 Text("AI Usage — no data")
-                    .font(.system(size: 11))
+                    .font(.system(size: 12, weight: .semibold))
             }
             ForEach(Array(lines.enumerated()), id: \.offset) { item in
-                HStack(spacing: 5) {
+                HStack(spacing: 6) {
                     Text(item.element.label)
-                        .font(.system(size: 9, weight: .semibold))
+                        .font(.system(size: 11, weight: .semibold))
                         .lineLimit(1)
-                        .frame(width: 58, alignment: .leading)
-                    if let row = item.element.row {
-                        AccessoryBar(fraction: row.fraction)
-                        // "100%" is 31pt at 10pt bold: without the line limit it wrapped to "100" over
-                        // "%", which a full lock screen then clipped to "10...".
-                        Text(row.percentText)
-                            .monospacedDigit()
-                            .font(.system(size: 10, weight: .bold))
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.8)
-                            .frame(width: 30, alignment: .trailing)
-                    } else {
-                        Text(item.element.note ?? "")
-                            .font(.system(size: 9))
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.8)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
+                        .minimumScaleFactor(0.75)
+                        .frame(width: 62, alignment: .leading)
+                    AccessoryBar(fraction: item.element.row.fraction)
+                    // "100%" wrapped to "100" over "%" without the line limit, which a full lock screen then
+                    // clipped to "10...".
+                    Text(item.element.row.percentText)
+                        .monospacedDigit()
+                        .font(.system(size: 12, weight: .bold, design: .rounded))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                        .frame(width: 34, alignment: .trailing)
                 }
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("\(item.element.row.providerName) \(item.element.row.window.displayLabel) \(item.element.row.percentText)")
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
     }
 }
 
@@ -1713,7 +1978,7 @@ struct AccessoryBar: View {
 
     private func fillWidth(total: CGFloat) -> CGFloat {
         let clamped: Double = min(1.0, max(0.0, fraction.isFinite ? fraction : 0.0))
-        let minimum: CGFloat = clamped > 0 ? 4 : 0
+        let minimum: CGFloat = clamped > 0 ? 5 : 0
         return max(minimum, total * CGFloat(clamped))
     }
 
@@ -1728,7 +1993,7 @@ struct AccessoryBar: View {
                     .widgetAccentable()
             }
         }
-        .frame(height: 4)
+        .frame(height: 5)
     }
 }
 
@@ -1738,50 +2003,102 @@ struct AccessoryInlineView: View {
     let model: UsageWidgetModel
 
     var body: some View {
-        Text(model.inlineText)
+        let pieces = model.inlinePieces
+        if pieces.isEmpty {
+            Text("AI Usage — no data")
+        } else {
+            // Whole pieces or none, and a count of the rest: the slot would cut "C1 100%" to "C1 10…", which reads
+            // as 10%.
+            ViewThatFits(in: .horizontal) {
+                ForEach((1...pieces.count).reversed(), id: \.self) { n in
+                    line(pieces, count: n)
+                }
+            }
+        }
+    }
+
+    private func line(_ pieces: [InlinePiece], count: Int) -> Text {
+        var text = pieces[0].text
+        for piece in pieces[1..<count] { text = text + Text(" · ") + piece.text }
+        return count < pieces.count ? text + Text(" +\(pieces.count - count)") : text
     }
 }
 
 // MARK: - Lock screen: accessoryCircular
 
+/// One account's limit as the outer ring with its number in the middle, its other limit as the inner ring,
+/// and whose (or which) it is under the number. At a limit the middle says when it frees up instead.
 struct AccessoryCircularView: View {
     let model: UsageWidgetModel
 
-    /// One account's session says little once there are several: they show the account with the most
-    /// room (its weekly — the limit several accounts exist to spread), else the first to free up.
-    private var headline: UsageWidgetRow? {
-        guard model.isMultiAccount else { return model.headline }
-        if let pick = model.mostRoom, let row = model.plainWeeklyRow(for: pick) ?? model.accountRow(for: pick) { return row }
-        return model.nextFreed?.row ?? model.headline
-    }
-
-    /// "C", or the account's short name ("C1") once there is more than one Claude account.
-    private func label(_ h: UsageWidgetRow) -> String {
-        return model.shortNames[h.providerId] ?? h.providerName.prefix(1).uppercased()
-    }
-
     var body: some View {
-        if let h = headline {
-            Gauge(value: h.fraction, in: 0...1, label: {
-                Text(label(h))
-                    .font(.system(size: 10, weight: .bold))
-                    .minimumScaleFactor(0.6)
-            }, currentValueLabel: {
-                Text("\(Int((h.fraction * 100).rounded()))")
-                    .monospacedDigit()
-                    .font(.system(size: 14, weight: .bold))
-            })
-            .gaugeStyle(.accessoryCircular)
-            .widgetAccentable()
-        } else {
-            Gauge(value: 0, in: 0...1, label: {
-                Text("AI")
-                    .font(.system(size: 10, weight: .bold))
-            }, currentValueLabel: {
-                Text("—")
-            })
-            .gaugeStyle(.accessoryCircular)
+        GeometryReader { geo in
+            let d = min(geo.size.width, geo.size.height)
+            let outerWidth = max(4, (d * 0.085).rounded())
+            let innerWidth = max(3, (outerWidth * 0.7).rounded())
+            let innerDiameter = d - 2 * (outerWidth + 2)
+            let plan = model.lockGauge
+            let showInner = plan?.inner != nil
+            let hole = max(0, (showInner ? innerDiameter - 2 * innerWidth : d - 2 * outerWidth) - 2)
+            ZStack {
+                RingArc(row: plan?.outer, lineWidth: outerWidth, diameter: d)
+                    .frame(width: d, height: d)
+                if showInner {
+                    RingArc(row: plan?.inner, lineWidth: innerWidth, diameter: innerDiameter)
+                        .frame(width: innerDiameter, height: innerDiameter)
+                }
+                centre(plan, hole: hole)
+                    .frame(width: hole)
+            }
+            .frame(width: geo.size.width, height: geo.size.height)
         }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(accessibility)
+    }
+
+    @ViewBuilder private func centre(_ plan: LockGaugePlan?, hole: CGFloat) -> some View {
+        if let plan = plan {
+            let row = plan.outer
+            VStack(spacing: 0) {
+                if row.isAtLimit(now: model.now), let reset = row.window.resetsAtDate, reset > model.now {
+                    // The middle is a circle: a 6-character countdown has to stay inside its chord.
+                    Image(systemName: "lock.fill")
+                        .font(.system(size: hole * 0.18, weight: .semibold))
+                    Text(row.resetsIn)
+                        .font(.system(size: hole * 0.23, weight: .bold, design: .rounded))
+                } else {
+                    let size = hole * 0.4
+                    let number = Text("\(Int(Formatting.clampPercent(row.window.percent).rounded()))")
+                        .font(.system(size: size, weight: .bold, design: .rounded))
+                    let sign = Text("%")
+                        .font(.system(size: size * 0.55, weight: .bold, design: .rounded))
+                    Text("\(number)\(sign)")
+                }
+                Text(plan.caption)
+                    .font(.system(size: max(8, hole * 0.21), weight: .semibold))
+                    .kerning(0.3)
+                    .foregroundStyle(.secondary)
+            }
+            .monospacedDigit()
+            .lineLimit(1)
+            .minimumScaleFactor(0.6)
+        } else {
+            VStack(spacing: 0) {
+                Text("—")
+                    .font(.system(size: hole * 0.4, weight: .semibold, design: .rounded))
+                Text("AI")
+                    .font(.system(size: max(8, hole * 0.21), weight: .semibold))
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var accessibility: String {
+        guard let plan = model.lockGauge else { return "AI Usage, no data" }
+        var parts = [plan.caption, "\(plan.outer.window.displayLabel) \(plan.outer.percentText)"]
+        if plan.outer.isAtLimit(now: model.now) { parts.append("resets in \(plan.outer.resetsIn)") }
+        if let inner = plan.inner { parts.append("\(inner.window.displayLabel) \(inner.sessionValue)") }
+        return parts.joined(separator: ", ")
     }
 }
 
@@ -1804,14 +2121,16 @@ struct UnpairedWidgetView: View {
         case .accessoryRectangular:
             HStack(spacing: 6) {
                 Image(systemName: "qrcode.viewfinder")
-                    .font(.system(size: 16))
+                    .font(.system(size: 18))
                 VStack(alignment: .leading, spacing: 1) {
                     Text("AI Usage")
-                        .font(.system(size: 11, weight: .semibold))
+                        .font(.system(size: 13, weight: .semibold))
                     Text("Pair in the app")
-                        .font(.system(size: 10))
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
                 }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
         default:
             VStack(spacing: 6) {
                 Image(systemName: "qrcode.viewfinder")
@@ -1847,11 +2166,13 @@ struct MessageWidgetView: View {
         case .accessoryRectangular:
             HStack(spacing: 6) {
                 Image(systemName: "icloud.slash")
-                    .font(.system(size: 14))
+                    .font(.system(size: 16))
                 Text(text)
-                    .font(.system(size: 10))
+                    .font(.system(size: 11))
                     .lineLimit(3)
+                    .minimumScaleFactor(0.85)
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
         default:
             VStack(spacing: 6) {
                 Image(systemName: "icloud.slash")

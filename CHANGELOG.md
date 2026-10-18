@@ -44,7 +44,10 @@ never signed out.
   orders them before Codex with Claude's mark, and its home-screen widgets show every account as rings - the weekly
   outside with its percent in the middle, the 5-hour session inside: the small widget four accounts' weeklies, the
   medium every account and Codex side by side, the large a card each plus a "Most room" card naming the account to
-  use next (the lock-screen gauge shows that account too).
+  use next. On the lock screen the round widget shows that account's rings, the rectangular one a ring per account
+  and Codex under "MOST ROOM", with a lock on any account at a limit, and the one-line widget leads with the account
+  that has the most room so the tail it cuts is the least useful. Rings drop their colours there (and on a tinted home
+  screen) for plain white arcs, since those modes keep only brightness.
 - README: "Several Claude accounts" - setting up several Claude Code logins side by side on Windows and macOS, and
   the Keychain item names Claude Code uses for each config folder.
 
