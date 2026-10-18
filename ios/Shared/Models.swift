@@ -54,6 +54,46 @@ enum Models {
     }
 }
 
+// MARK: - Provider ids (desktop 1.1.0+: several Claude accounts)
+
+/// Since desktop 1.1.0 every configured Claude account is its own provider. Account 1 keeps the id `claude`
+/// (so a 1.0.x phone still finds it), accounts 2…6 travel as `claude-2` … `claude-6`, Codex stays `codex`.
+enum ProviderIds {
+    static let claude = "claude"
+    static let codex = "codex"
+
+    /// The Claude account's slot: 1 for `claude`, N for `claude-N`; nil for every other id.
+    ///
+    /// Wider than the desktop's 2…6 on purpose: any `claude-N` with N ≥ 2 and no leading zero counts, so a
+    /// later desktop with more accounts still draws them as Claude on a phone that has not been updated
+    /// (an App Store release lags the desktop by days). Leading zeros are refused so a slot has ONE id.
+    static func claudeSlot(_ id: String) -> Int? {
+        if id == claude { return 1 }
+        let prefix = "claude-"
+        guard id.hasPrefix(prefix) else { return nil }
+        let digits = id.dropFirst(prefix.count)
+        guard let first = digits.first, first != "0", digits.count <= 3,
+              digits.allSatisfy({ $0.isASCII && $0.isNumber }),
+              let slot = Int(digits), slot >= 2 else { return nil }
+        return slot
+    }
+
+    static func isClaude(_ id: String?) -> Bool {
+        guard let id = id else { return false }
+        return claudeSlot(id) != nil
+    }
+
+    /// Display order (the desktop's, ARCHITECTURE.md): Claude accounts by slot, then `codex`, then every
+    /// other id sorted.
+    static func ordered(_ ids: [String]) -> [String] {
+        let claudes: [(id: String, slot: Int)] = ids.compactMap { id in claudeSlot(id).map { (id: id, slot: $0) } }
+        var out: [String] = claudes.sorted { $0.slot < $1.slot }.map { $0.id }
+        if ids.contains(codex) { out.append(codex) }
+        out.append(contentsOf: ids.filter { $0 != codex && claudeSlot($0) == nil }.sorted())
+        return out
+    }
+}
+
 // MARK: - PhonePayload
 
 struct PhonePayload: Codable, Equatable {
@@ -70,8 +110,13 @@ struct PhonePayload: Codable, Equatable {
 
     var generatedDate: Date? { return Models.dateFromMs(generatedAt) }
     var effectiveSettings: EffectiveSettings { return EffectiveSettings(settings) }
-    /// Providers in display order (claude, codex, then anything else); `null` providers are dropped.
+    /// Providers in display order (Claude accounts by slot, codex, then anything else); `null` providers
+    /// are dropped.
     var providers: [ProviderSnapshot] { return snapshot?.orderedProviders ?? [] }
+
+    /// Just the Claude accounts, in slot order. More than one is what switches the widgets to their
+    /// per-account layouts; a desktop with one account sends exactly one (`claude`).
+    var claudeAccounts: [ProviderSnapshot] { return providers.filter { $0.isClaude } }
 
     func provider(_ id: String) -> ProviderSnapshot? {
         return providers.first { $0.providerId == id }
@@ -140,18 +185,14 @@ struct Snapshot: Codable, Equatable {
         case fetchedAt, providers
     }
 
-    static let providerOrder: [String] = ["claude", "codex"]
-
     var fetchedDate: Date? { return Models.dateFromMs(fetchedAt) }
 
-    /// Known providers first, then any other id sorted; `null` entries drop out. Fills a missing `id` from the key.
+    /// Claude accounts by slot, then Codex, then any other id sorted (`ProviderIds.ordered`); `null` entries
+    /// drop out. Fills a missing `id` from the key.
     var orderedProviders: [ProviderSnapshot] {
         guard let providers = providers else { return [] }
-        var ids: [String] = Snapshot.providerOrder.filter { providers.keys.contains($0) }
-        let others: [String] = providers.keys.filter { !Snapshot.providerOrder.contains($0) }.sorted()
-        ids.append(contentsOf: others)
         var out: [ProviderSnapshot] = []
-        for id in ids {
+        for id in ProviderIds.ordered(Array(providers.keys)) {
             guard let maybe = providers[id], var p = maybe else { continue }
             if p.id == nil || p.id == "" { p.id = id }
             out.append(p)
@@ -181,11 +222,11 @@ struct ProviderError: Codable, Equatable {
 }
 
 struct ProviderSnapshot: Codable, Equatable {
-    var id: String?                 // 'claude' | 'codex'
-    var name: String?               // 'Claude' | 'Codex'
+    var id: String?                 // 'claude' | 'claude-2' … 'claude-6' | 'codex'
+    var name: String?               // 'Claude' | 'Claude 2' or the account's label | 'Codex'
     var status: String?             // 'ok' | 'stale' | 'auth_required' | 'error'
     var error: ProviderError?
-    var source: String?             // 'claude_code' | 'claude_web' | 'codex_auth_file'
+    var source: String?             // 'claude_code' | 'claude_keychain' | 'claude_web' | 'codex_auth_file'
     var plan: String?
     var account: String?
     var updatedAt: Double?
@@ -199,6 +240,8 @@ struct ProviderSnapshot: Codable, Equatable {
     }
 
     var providerId: String { return id ?? "" }
+    /// Any Claude account, not just account 1 (`ProviderIds.claudeSlot`).
+    var isClaude: Bool { return ProviderIds.isClaude(id) }
 
     var displayName: String {
         if let n = name, !n.isEmpty { return n }
@@ -372,7 +415,7 @@ extension CodexCredits {
 // MARK: - History (downsampled 7-day chart data)
 
 struct HistorySeries: Codable, Equatable {
-    var key: String?        // 'claude.session'
+    var key: String?        // 'claude.session' / 'claude-2.weekly' (<providerId>.<windowKey>)
     var label: String?      // 'Claude · Current Session'
     var color: String?      // series colour token
 }

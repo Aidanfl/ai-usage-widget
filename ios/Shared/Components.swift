@@ -68,15 +68,16 @@ struct Chip: View {
     }
 }
 
-/// Provider mark: an SF Symbol in the provider hue (no third-party logos).
+/// Provider mark: an SF Symbol in the provider hue (no third-party logos). Every Claude account
+/// (`claude`, `claude-2` …) wears Claude's mark; the widgets tell accounts apart by name.
 struct ProviderMark: View {
     let providerId: String
     var size: CGFloat = 16
 
-    private var symbolName: String {
+    var symbolName: String {
+        if ProviderIds.isClaude(providerId) { return "asterisk" }
         switch providerId {
-        case "claude": return "asterisk"
-        case "codex": return "hexagon"
+        case ProviderIds.codex: return "hexagon"
         default: return "circle.fill"
         }
     }

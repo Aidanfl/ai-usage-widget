@@ -132,10 +132,11 @@ enum Theme {
     static let codexHue = Color(hex: 0x10a37f)
     static let genericHue = Color(hex: 0x8b5cf6)
 
+    /// Every Claude account (`claude`, `claude-2` …) shares Claude's hue, as on the desktop.
     static func providerHue(_ id: String?) -> Color {
+        if ProviderIds.isClaude(id) { return claudeHue }
         switch id ?? "" {
-        case "claude": return claudeHue
-        case "codex": return codexHue
+        case ProviderIds.codex: return codexHue
         default: return genericHue
         }
     }

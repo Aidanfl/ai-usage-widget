@@ -89,17 +89,20 @@ struct PayloadView: View {
 
     private var settings: EffectiveSettings { return payload.effectiveSettings }
     private var providers: [ProviderSnapshot] { return payload.providers }
+    /// With several Claude accounts each Claude card names the login behind it, as the desktop does.
+    private var showsAccounts: Bool { return payload.claudeAccounts.count > 1 }
 
     var body: some View {
         if providers.isEmpty {
-            MessageCard(text: "The last snapshot has no providers — both are turned off in the desktop settings.")
+            MessageCard(text: "The last snapshot has no providers — every one is turned off in the desktop settings.")
         }
         ForEach(providers, id: \.providerId) { provider in
             ProviderCard(provider: provider,
                          settings: settings,
                          now: now,
                          isExpanded: expanded.contains(provider.providerId),
-                         onToggle: { toggle(provider.providerId) })
+                         onToggle: { toggle(provider.providerId) },
+                         showsAccount: showsAccounts && provider.isClaude)
         }
         HistoryChartView(history: payload.history, snapshot: payload.snapshot, settings: settings, now: now)
         DashboardFooter(payload: payload, lastFetched: lastFetched, errorText: errorText, now: now)
@@ -174,13 +177,33 @@ struct ProviderCard: View {
     let now: Date
     let isExpanded: Bool
     let onToggle: () -> Void
+    /// Several Claude accounts: a muted line under the name with the account it is signed in as.
+    var showsAccount: Bool = false
 
     private var status: ProviderStatusInfo { return ProviderStatusInfo(provider: provider, now: now) }
     private var windows: [UsageWindow] { return provider.windowList }
 
+    private var accountLine: String? {
+        guard showsAccount, let account = provider.account?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !account.isEmpty else { return nil }
+        return account
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            header
+            if let account = accountLine {
+                VStack(alignment: .leading, spacing: 2) {
+                    header
+                    Text(account)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .padding(.leading, 24)          // under the name: mark 16 + spacing 8
+                }
+            } else {
+                header
+            }
             if windows.isEmpty && !status.needsAuthRow {
                 Text("No usage windows reported")
                     .font(.caption)
@@ -319,10 +342,14 @@ struct AuthRow: View {
         }
     }
 
+    /// Every desktop since 1.0 has a Sign in button on a claude.ai card's own auth row, and since 1.1.0
+    /// there is one claude.ai sign-in per account — so the hint points at the card, not at Settings.
     private var hint: String {
         switch provider.source ?? "" {
         case "claude_web":
-            return "Sign in again on the desktop widget (Settings ▸ Claude source ▸ Log in)."
+            return "Press Sign in on this account's card in the desktop widget."
+        case "claude_keychain":
+            return "Use this account in Claude Code on the Mac — the widget only reads its Keychain login and never refreshes it."
         case "claude_code":
             return "Run any Claude Code command on the desktop to refresh the token."
         case "codex_auth_file":
