@@ -105,6 +105,15 @@ enum Theme {
         }
     }
 
+    /// Words in a status's colour ("Sign in needed"): the dot hues are too light for 9pt text on white.
+    static func statusText(_ status: ProviderStatus) -> Color {
+        switch status {
+        case .ok: return Color.secondary
+        case .stale: return warnText
+        case .authRequired, .error: return dangerText
+        }
+    }
+
     static func freshnessColor(_ f: Freshness) -> Color {
         switch f {
         case .fresh: return statusOk

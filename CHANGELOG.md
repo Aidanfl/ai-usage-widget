@@ -41,7 +41,10 @@ never signed out.
   two usage pools.
 - **The phone gets every account.** Account 1 still travels as `claude`, the others as `claude-2` ... `claude-6` with
   their labels as names, so the 1.0.x iPhone app lists them in its dashboard without an update. **iPhone app 1.1.0**
-  orders them before Codex with Claude's mark and fits up to four accounts in the home-screen widgets.
+  orders them before Codex with Claude's mark, and its home-screen widgets show every account as rings - the weekly
+  outside with its percent in the middle, the 5-hour session inside: the small widget four accounts' weeklies, the
+  medium every account and Codex side by side, the large a card each plus a "Most room" card naming the account to
+  use next (the lock-screen gauge shows that account too).
 - README: "Several Claude accounts" - setting up several Claude Code logins side by side on Windows and macOS, and
   the Keychain item names Claude Code uses for each config folder.
 

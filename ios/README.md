@@ -5,9 +5,12 @@ usage limits (per-window bars with the same colours, thresholds and "resets in /
 Extra Usage / Credits details and the 7-day history chart.
 
 **Several Claude accounts (1.1.0).** The desktop sends account 1 as `claude` and the others as `claude-2` …
-`claude-6`. Everything orders them by slot ahead of Codex with Claude's mark. The small widget shows one weekly bar per
-Claude account when there is more than one; medium and large fit four accounts plus Codex; the lock-screen families use
-short names (`C2`, or the account's label). A single-account payload renders exactly as in 1.0.x. The history chart
+`claude-6`. Everything orders them by slot ahead of Codex with Claude's mark. With more than one account the home-screen
+widgets switch to rings: the small shows each account's weekly as a ring (up to four); the medium puts every account and
+Codex side by side, the weekly as the outer ring (its percent in the middle) and the 5-hour session as the inner one; the
+large gives each a card with both resets spelled out, plus a "Most room" card naming the account to use next (the
+lock-screen gauge shows that account too). The other lock-screen families use short names (`C2`, or the account's
+label). A single-account payload renders exactly as in 1.0.x. The history chart
 copes with the desktop's re-bucketed history (30–240 min between samples, or none).
 
 The phone **never holds a provider credential**. The desktop widget already reads the Claude Code and Codex
