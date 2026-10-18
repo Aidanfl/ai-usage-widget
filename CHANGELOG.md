@@ -2,6 +2,59 @@
 
 All notable changes to AI Usage Widget. Dates are ISO (YYYY-MM-DD).
 
+## 1.1.0 - 2026-10-17
+
+Several Claude accounts at once - on the widget and on the phone.
+
+### For the PC
+
+What the Windows side needs after pulling this version (the Mac side is already set up and pushes to the phone):
+
+1. `npm ci`, `npm test` (all green), `npm run build`, and install `dist/AI-Usage-Widget-1.1.0-win-Setup.exe` over the
+   old copy (or use the portable exe). Settings carry over: the old Claude card becomes **account 1** and keeps
+   reading `%USERPROFILE%\.claude`.
+2. Settings -> **Claude accounts**:
+   - **Account 1** - source *Claude Code folder*, folder left empty (= `~/.claude`, "Claude 1"). Label it `Claude 1`.
+   - **Add account** - *Claude Code folder*, folder `~/.claude-blender`, label `Claude 2`.
+   - **Add account** - *Claude Code folder*, folder `~/.claude-checker`, label `Claude 3`.
+   - **Add account** - *claude.ai sign-in*, label `Claude 4`, then **Log in** with the account that the Mac's default
+     folder (`~/.claude`, the Mac's "Claude 4" shortcut) is signed in to. No PC folder holds that account, so it needs
+     this sign-in.
+3. Leave **Sync to phone** off on the PC: the phone follows one desktop, and the Mac is the one that has all four.
+
+The three folder accounts follow the same token rules as before, each with its own folder lock: the widget refreshes
+a folder's token only after it has actually lapsed and Claude Code has not, so a Claude Code window on that folder is
+never signed out.
+
+### Added
+
+- **Up to six Claude accounts, one card each.** Settings -> *Claude accounts* replaces the single "Claude source"
+  setting: per account a label, a show/hide toggle and a source - a **Claude Code folder** (the 1.0.x behaviour, any
+  folder), a **claude.ai sign-in** (each account in its own browser partition, so sign-ins never share a cookie), or,
+  on macOS, **Claude Code's Keychain login, read-only** (never refreshed or written; a lapsed token shows "waiting for
+  Claude Code to refresh it"). With more than one account each card shows the account name under its label.
+- **The same account is shown once.** Two entries that resolve to the same account (the account id from
+  `/api/oauth/profile`, or the same personal claude.ai organisation) collapse into the first; the other's settings
+  block says so. Team organisations are never merged on the organisation alone.
+- **The phone gets every account.** Account 1 still travels as `claude`, the others as `claude-2` ... `claude-6` with
+  their labels as names, so the 1.0.x iPhone app lists them in its dashboard without an update. **iPhone app 1.1.0**
+  orders them before Codex with Claude's mark and fits up to four accounts in the home-screen widgets.
+- README: "Several Claude accounts" - setting up several Claude Code logins side by side on Windows and macOS, and
+  the Keychain item names Claude Code uses for each config folder.
+
+### Changed
+
+- **Every Claude account keeps its own request etiquette**: the 60 s floor between real usage requests, the 429
+  back-off, the token-refresh spacing and back-off, the 403 park and the profile / credits caches are per account
+  (they were per process). The Claude Code CLI version is still detected once.
+- Compact mode and the history graph tell accounts apart: compact rows use the account's label or a short name
+  ("C2 FABLE 7D"), and graph lines keep their window colour with a dash pattern per account.
+- The phone payload drops the per-account identity hashes, and its history is re-bucketed (30 -> 60 -> 120 -> 240
+  minutes) when needed to stay under the relay's 256 KB limit: four accounts with seven days of 2-minute samples
+  measured 178,915 characters at 30-minute buckets and 93,853 at 60.
+- Settings keep `claudeSource` / `claudeOrganizationId` as a copy of account 1 so a 1.0.x build reading the same
+  config still works; a 1.0.x config becomes account 1 automatically, keeping its claude.ai sign-in.
+
 ## 1.0.1 - 2026-09-12
 
 ### Fixed

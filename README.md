@@ -42,7 +42,7 @@ On macOS the widget is pinned to every Space and floats above full-screen apps, 
 
 ## What it is
 
-- **One panel, two providers.** A Claude card and a Codex card, each with one row per usage window the API reports. You can hide either provider in Settings.
+- **One panel, several Claude accounts plus Codex.** One card per Claude account (up to six, each signed in its own way) and a Codex card, each with one row per usage window the API reports. You can hide any of them in Settings. See "Several Claude accounts" below.
 - **Claude rows:** Current Session (the 5-hour window), Weekly Limit (7 days), and a separate **Fable Weekly** bar when your account has a model-scoped weekly limit. Other scoped or legacy per-model buckets (Opus, Sonnet, Cowork, OAuth Apps, Design) appear only when the API actually returns them.
 - **Codex rows:** whatever windows your plan has, labelled by their length (5-Hour Limit, Weekly Limit, Daily, Monthly...), plus Code Review and any per-feature "additional" limits the API sends.
 - **Details panels** (the chevron on each card): Claude's extra-usage spend and account credits; Codex's credit balance, "limit reached" flag and per-model availability.
@@ -109,11 +109,55 @@ on a Mac builds the universal `dist/AI-Usage-Widget-1.0.1-mac.dmg` (and a `.zip`
 
 Either way the widget is single-instance: launching it a second time just brings the existing window forward.
 
+## Several Claude accounts
+
+Since 1.1.0 the widget shows up to **six Claude accounts at once**, one card each, and sends all of them to the
+iPhone app. Settings -> *Claude accounts* has one block per account: a show/hide toggle, a label (empty = "Claude",
+or "Claude 2", "Claude 3"... once there is more than one), and where the account's usage comes from:
+
+| Source | What it reads | Best for |
+|---|---|---|
+| **Claude Code folder** | `<folder>\.credentials.json` - the folder you give, or `%USERPROFILE%\.claude` (or `%CLAUDE_CONFIG_DIR%`) when empty. All the rules in "Token auto-refresh" below apply per folder, with each folder's own lock. | **Windows**, where Claude Code keeps its login in that file. |
+| **claude.ai sign-in** | A claude.ai login made inside the widget. Every account gets its own browser partition, so four sign-ins never share a cookie (or a Google / Apple sign-in). | **macOS**, and any account that has no Claude Code folder on this computer. Nothing is ever written to `~/.claude`. |
+| **Claude Code Keychain** (macOS only) | The login Claude Code keeps in the macOS Keychain for a folder, **read-only**: the widget never refreshes or writes it. When the token lapses the card says "waiting for Claude Code to refresh it" until you use that account in Claude Code again. | A secondary option on a Mac whose Claude Code folders are in daily use. |
+
+Each account keeps its own request floor, rate-limit back-off, refresh spacing and profile cache, so a busy or
+rate-limited account never holds another back. Two entries that turn out to be **the same account** (same account
+id from `/api/oauth/profile`, or the same personal claude.ai organisation) are shown once; the second one's settings
+block says "Same account as ... - shown once". Account 1 can be renamed and re-sourced but not removed; its id stays
+`claude`, so the phone app, tray badges, alerts and history from 1.0.x carry on unchanged. A 1.0.x config becomes
+account 1 automatically, keeping its source, claude.ai sign-in and organisation.
+
+### Running several Claude Code logins side by side
+
+Claude Code keeps one login per **config folder**, chosen with the `CLAUDE_CONFIG_DIR` environment variable (default
+`~/.claude`). Give each account its own folder and start Claude Code with that variable set; `/login` inside it signs
+that folder in. Sign the browser in to the matching claude.ai account first (or use a private window), or every folder
+ends up on the same account. Two windows using the same folder share one login.
+
+- **Windows:** a `.cmd` per account, e.g. `set CLAUDE_CONFIG_DIR=%USERPROFILE%\.claude-work` then `claude`. In the
+  widget, add an account with source *Claude Code folder* and the same folder.
+- **macOS:** a `.command` file per account (`chmod +x`), e.g. `export CLAUDE_CONFIG_DIR="$HOME/.claude-work"` then
+  `exec claude`. Leave the variable unset for the default `~/.claude`. In the widget, use *claude.ai sign-in* per
+  account (recommended), or *Claude Code Keychain* with the same folder.
+
+**Where macOS keeps each folder's login** (checked against Claude Code 2.1.302): a generic password in the login
+Keychain, account = your user name, service
+
+- `Claude Code-credentials` for a Claude Code started **without** `CLAUDE_CONFIG_DIR`;
+- `Claude Code-credentials-<first 8 hex of sha256(folder)>` for one started **with** it, where `folder` is the
+  absolute path in Unicode NFC (e.g. `/Users/you/.claude-work`). Setting the variable to `~/.claude` itself also gives
+  the suffixed name, so the widget tries both for that folder.
+
+To see which items exist, list names only: `security dump-keychain | grep "Claude Code-credentials"`. The widget reads
+an item with `/usr/bin/security find-generic-password -s <service> -w` (no Keychain prompt: the item trusts that tool)
+and never logs the output.
+
 ## How it reads your usage
 
 Everything below happens in the Electron main process using Node's built-in `fetch`. The widget has **no server of its own**, sends nothing to third parties, and never logs or displays a token (even JSON parse errors have the file contents stripped out before they reach a log line).
 
-### Claude via Claude Code credentials (default: "Claude Code login (automatic)")
+### Claude via Claude Code credentials (default source: "Claude Code folder")
 
 - **File:** `%USERPROFILE%\.claude\.credentials.json` (or `%CLAUDE_CONFIG_DIR%\.credentials.json` if that variable is set), the `claudeAiOauth` object inside it. It is re-read on **every** refresh, because Claude Code rotates the tokens itself.
 - **Endpoints, all on `https://api.anthropic.com`:**
@@ -153,7 +197,7 @@ If the server rejects the refresh token (`invalid_grant`, 401, 403) the Claude c
 
 ### Alternative: claude.ai browser login
 
-If you would rather not have the widget touch Claude Code's file at all, switch Settings -> *Claude source* to **claude.ai browser login** and press *Log in*. A login window opens at `claude.ai/login` (navigation is restricted to claude.ai, anthropic.com and the Google / Apple / Microsoft sign-in pages). As soon as claude.ai sets its `sessionKey` cookie the window closes. The key is encrypted with Windows' per-user credential encryption (Electron `safeStorage`) and stored in `config.json` under `claudeWebSession`; it is never handed to the UI layer.
+If you would rather not have the widget touch Claude Code's file at all, set the account's source in Settings -> *Claude accounts* to **claude.ai sign-in** and press *Log in*. A login window opens at `claude.ai/login` (navigation is restricted to claude.ai, anthropic.com and the Google / Apple / Microsoft sign-in pages). As soon as claude.ai sets its `sessionKey` cookie the window closes. The window's title names the account it is for. The key is encrypted with the OS's per-user credential encryption (Electron `safeStorage`: DPAPI on Windows, the Keychain on macOS) and stored in `config.json` - under `claudeWebSession` for account 1, under `claudeWebSessions.<id>` for the others; it is never handed to the UI layer.
 
 Usage then comes from `https://claude.ai/api/organizations/<org>/usage`, fetched through a hidden browser window (plain requests get blocked by Cloudflare). The spend endpoints `/overage_spend_limit` and `/prepaid/credits` are only fetched while the Claude details panel is open. If you belong to two or more chat-capable organisations a dropdown appears to pick one (team organisations are preferred by default). *Log out* clears the cookie, the stored key and the cached storage. A dead session shows "claude.ai session expired - log in again in Settings". There is no token refresh in this mode and nothing is ever written to `~/.claude`.
 
@@ -245,17 +289,18 @@ Every key stored under `settings` in `config.json`, with its default (from `SETT
 | `compactMode` | Compact mode | `false` | The 290 px view. Also toggled by the edge chevrons. |
 | `refreshInterval` | Auto-refresh | `'120'` | Seconds between polls, as a string: `'15'`, `'30'`, `'60'`, `'120'`, `'300'`. Independently of this, the Claude usage endpoint is never hit more than once per 60 s and the Codex one more than once per 30 s. |
 | `graphVisible` | Graph button | `false` | Remembers whether the history graph is open. |
-| `expandedOpen` | Card chevrons | `{ claude: false, codex: false }` | Remembers each details panel. Also decides whether the Claude credits / spend endpoints are polled. |
-| `providers` | Providers | `{ claude: true, codex: true }` | Show or hide each provider. A hidden provider is not polled at all. |
-| `claudeSource` | Claude source | `'claude_code'` | `claude_code` (credentials file) or `claude_web` (claude.ai browser login). |
+| `expandedOpen` | Card chevrons | `{ claude: false, codex: false }` | Remembers each details panel, per card id (`claude`, `claude-2`, ..., `codex`). Also decides whether that Claude account's credits / spend endpoints are polled. |
+| `providers` | Account toggles, Providers -> Codex | `{ claude: true, codex: true }` | Show or hide each card, per id. A hidden one is not polled at all. Flags of removed accounts are dropped. |
+| `claudeAccounts` | Claude accounts | one account: `{ id: 'claude', label: '', source: 'claude_code', configDir: '', organizationId: null }` | Up to six `{ id, label, source, configDir, organizationId }`, sorted by slot. `id` is `claude` for account 1 and `claude-2` ... `claude-6` for the others (a new account takes the lowest free slot). `source` is `claude_code`, `claude_web` or `claude_keychain`; `configDir` is the Claude Code folder for the two Claude Code sources (`''` = default; `~` is expanded); `organizationId` is the claude.ai organisation for `claude_web`. |
+| `claudeSource` | (account 1's source) | `'claude_code'` | Kept for 1.0.x: always a copy of account 1's source. Saving it alone changes account 1. |
 | `tokenAutoRefresh` | Token auto-refresh | `true` | Allow the widget to renew expired tokens and write them back to disk. See above. |
 | `trayStats` | Tray stats | `'off'` | `off`, `claude`, `codex`, or `both`. See "Tray badges" (menu-bar text on macOS). |
 | `phoneSyncEnabled` | Phone → Sync to phone | `false` | Push an encrypted copy of every snapshot to the relay so the iPhone widget can show it. See "Phone widget". |
 | `phoneRelayUrl` | Phone → Relay URL | `''` | The `https://` base URL of your relay (`relay/`). |
 | `windowPosition` | (drag the window) | `null` | `{ x, y }`, saved about 300 ms after you stop dragging. Ignored and re-centred if it is off every display. |
-| `claudeOrganizationId` | Claude organisation dropdown | `null` | Only used by the claude.ai source. |
+| `claudeOrganizationId` | (account 1's organisation) | `null` | Kept for 1.0.x: always a copy of account 1's `organizationId`. |
 
-`config.json` also holds `claudeWebSession` (the encrypted claude.ai key, only if you used the browser login) and `phonePairKey` (the encrypted phone-pairing key). Settings changes are applied live; the file is written on every change.
+`config.json` also holds `claudeWebSession` (account 1's encrypted claude.ai key, only if it uses the browser login), `claudeWebSessions` (the other accounts' keys, by id) and `phonePairKey` (the encrypted phone-pairing key). Settings changes are applied live; the file is written on every change.
 
 ## Tray badges
 
@@ -282,6 +327,11 @@ Setup, once:
 1. Deploy the relay: `cd relay && npx wrangler login && npx wrangler kv namespace create SLOTS` (paste the id into `wrangler.toml`) `&& npx wrangler deploy`. You get a `https://aiusage-relay.<you>.workers.dev` URL.
 2. Desktop widget → Settings → **Phone**: paste the relay URL, press *Test*, turn on **Sync to phone**, then **Show pairing code**.
 3. Build the iOS app from `ios/` with Xcode and install it on your iPhone: [`ios/MAC-SETUP.md`](ios/MAC-SETUP.md) is the ordered walkthrough (toolchain, signing, device pairing, the on-phone taps), [`ios/README.md`](ios/README.md) describes the app itself. Then open it, scan the code (or paste the `aiusage://pair?...` string), and add the **AI Usage** widget to your home screen.
+
+**Several Claude accounts:** every visible account goes to the phone (a duplicate is sent once). The app's dashboard
+lists them all in slot order before Codex in any version; the home-screen widgets show more than one Claude account
+from iOS app 1.1.0 (the small widget then shows one weekly bar per account, the lock-screen ones short names such as
+"C2"). Only one desktop can feed a phone, so let the computer that holds all the accounts do the pushing.
 
 The desktop pushes at most once a minute and otherwise every five minutes or whenever a percentage changes; the widget refreshes on iOS's schedule (roughly every 15 minutes) and shows how old the numbers are. If the desktop is off, the phone keeps showing the last snapshot with its age.
 

@@ -4,6 +4,12 @@ A native iPhone app and home-/lock-screen widget that mirror the desktop **AI Us
 usage limits (per-window bars with the same colours, thresholds and "resets in / resets at" wording), the
 Extra Usage / Credits details and the 7-day history chart.
 
+**Several Claude accounts (1.1.0).** The desktop sends account 1 as `claude` and the others as `claude-2` …
+`claude-6`. Everything orders them by slot ahead of Codex with Claude's mark. The small widget shows one weekly bar per
+Claude account when there is more than one; medium and large fit four accounts plus Codex; the lock-screen families use
+short names (`C2`, or the account's label). A single-account payload renders exactly as in 1.0.x. The history chart
+copes with the desktop's re-bucketed history (30–240 min between samples, or none).
+
 The phone **never holds a provider credential**. The desktop widget already reads the Claude Code and Codex
 CLI tokens from disk; it encrypts a small snapshot and pushes it to a relay you host, and this app downloads
 and decrypts it. Re-implementing the provider logins on a phone would breach both providers' terms and is

@@ -60,28 +60,36 @@ Produced by the scheduler after every refresh and pushed to the renderer over IP
 ```js
 Snapshot = {
   fetchedAt: 1788700000000,                 // ms epoch of this refresh
-  providers: {
-    claude: ProviderSnapshot | null,        // null when the provider is disabled in settings
+  providers: {                              // one entry per resolved provider id, in no particular key order
+    claude: ProviderSnapshot | null,        // Claude account 1; null when disabled in settings
+    'claude-2': ProviderSnapshot | null,    // … 'claude-6': further Claude accounts (1.1.0); null when disabled OR when
+                                            //   it is the same account as a lower slot (see `duplicates`)
     codex:  ProviderSnapshot | null,
-  }
+  },
+  duplicates: { [hiddenId]: keptId },       // accounts.dedupeSnapshot: e.g. { 'claude-4': 'claude' }; {} when none
 }
 
 ProviderSnapshot = {
-  id: 'claude' | 'codex',
-  name: 'Claude' | 'Codex',
+  id: 'claude' | 'claude-2' … 'claude-6' | 'codex',
+  name: string,                             // Claude: the account's display name (label, else 'Claude' / 'Claude <slot>')
   status: 'ok' | 'stale' | 'auth_required' | 'error',
   //  ok            fresh data this cycle
   //  stale         this cycle failed but `windows` carry the last good values (main keeps last good per provider)
   //  auth_required no usable credentials (file missing, token expired and refresh disabled/failed, web session dead)
   //  error         other failure and no last-good data
   error: null | { code: string, message: string },   // codes: 'no_credentials','token_expired','refresh_failed','http_401','http_403','http_429','http_5xx','network','parse'
-  source: 'claude_code' | 'claude_web' | 'codex_auth_file',
+  source: 'claude_code' | 'claude_web' | 'claude_keychain' | 'codex_auth_file',
   plan: string | null,                      // friendly plan label, e.g. 'Max 20x', 'Pro', 'Team', 'Plus'
   account: string | null,                   // display name or email (renderer shows it only in settings)
   updatedAt: number,                        // ms epoch of the last successful fetch for this provider
   windows: UsageWindow[],                   // ordered rows to render (see below)
   extra: ExtraUsage | null,                 // Claude extra usage / spend + credits (null if unknown)
   credits: CodexCredits | null,             // Codex credits (null for Claude)
+  identity: null | {                        // Claude only (1.1.0) — what dedupe compares; never sent to the phone
+    account: string|null,                   //   sha256(account uuid).hex[0:16] (Claude Code sources, from /api/oauth/profile)
+    org: string|null,                       //   sha256(organization uuid).hex[0:16]
+    personalOrg: boolean|null,              //   false for team / enterprise organisations (never merged on org alone)
+  },
   raw: object                               // the raw API payload(s) — for debugging only, never rendered
 }
 
@@ -220,19 +228,33 @@ CodexCredits = {
 | `compactMode` | false | |
 | `refreshInterval` | '120' | seconds as string: '15','30','60','120','300' (the Claude provider additionally enforces a 60 s floor, §6) |
 | `graphVisible` | false | |
-| `expandedOpen` | `{claude:false, codex:false}` | per-provider expand panel state |
-| `providers` | `{claude:true, codex:true}` | show/hide provider groups |
-| `claudeSource` | 'claude_code' | 'claude_code' \| 'claude_web' |
+| `expandedOpen` | `{claude:false, codex:false}` | expand panel state per provider id (`claude-N` keys of removed accounts are dropped) |
+| `providers` | `{claude:true, codex:true}` | show/hide per provider id (same clean-up) |
+| `claudeAccounts` | `[{ id:'claude', label:'', source:'claude_code', configDir:'', organizationId:null }]` | 1.1.0. ≥ 1, ≤ 6, sorted by slot, entry 0 is `claude`; ids `claude`, `claude-2` … `claude-6` (new account = lowest free slot). Rules live in the pure `accounts.js` (`sanitizeAccounts`, `migrateLegacyAccounts`, `applyLegacyAccountPatch`): a `claudeAccounts` patch REPLACES the list; a bare `claudeSource` / `claudeOrganizationId` patch edits account 1; a config without the list is migrated from those legacy keys |
+| `claudeSource` | 'claude_code' | always a copy of account 1's source ('claude_code' \| 'claude_web' \| 'claude_keychain'), kept for 1.0.x |
 | `tokenAutoRefresh` | true | allow refreshing Claude Code / Codex tokens when expired (writes files back; see §6) |
 | `trayStats` | 'off' | 'off' \| 'claude' \| 'codex' \| 'both' |
 | `windowPosition` | null | `{x,y}` |
-| `claudeOrganizationId` | null | claude_web only |
+| `claudeOrganizationId` | null | always a copy of account 1's `organizationId`, kept for 1.0.x |
 | `phoneSyncEnabled` | false | phone sync (§14): turning it on without a pair key generates one (`phonePairKey`, safeStorage-encrypted, NOT a setting) and triggers the first push |
 | `phoneRelayUrl` | '' | relay base URL, stored normalized by `sync.validateRelayUrl` (https only, http for localhost/127.0.0.1, no query/fragment/credentials, trailing slash stripped, ≤ 512 chars) or `''` when invalid; a change resets the push state and fills the new relay |
 
 `saveSettings(patch)` merges, persists, applies side effects, and broadcasts `settings-updated` to the renderer.
 
 ## 6. Providers & credentials
+
+**Several Claude accounts (1.1.0).** main.js keeps one wrapper per `claudeAccounts` entry and creates that account's
+provider instance from a factory: `claude.js` `createClaudeCodeProvider({ id, name, configDir, credentialStore:
+'file' | 'keychain' })` or `claude-web.js` `createClaudeWebProvider({ id, name, getOrganizationId })` (`name` may be a
+function, so a relabel needs no new instance). ALL the per-provider state described below (request floor + last result,
+429 park, refresh back-off / spacing / file signature, 403 park, profile and credits caches; for claude.ai the session,
+organisation cache and floor) lives in the instance — per account, never per process; only the detected Claude Code
+CLI version is process-wide. A source or folder change re-creates that account's instance and forgets its last good
+values; a label change keeps both. The wrapper stamps `id` and the current display name on every snapshot.
+`credentialStore: 'keychain'` (macOS, `providers/keychain.js`) reads Claude Code's Keychain item for the folder with
+`/usr/bin/security find-generic-password -s <service> -w` and is READ-ONLY: it never refreshes or writes; a lapsed
+token or a 401 is "waiting for Claude Code to refresh it". Item names: `Claude Code-credentials`, plus
+`-<sha256(NFC(folder)).hex[0:8]>` when Claude Code was started with `CLAUDE_CONFIG_DIR`.
 
 ### Claude via Claude Code credentials (`providers/claude.js`, default)
 Rules from research-claude.md §1.3, §1.8, §1.9, §2.1–2.4, §8.5 (binding):
@@ -285,6 +307,9 @@ Rules from research-claude.md §1.3, §1.8, §1.9, §2.1–2.4, §8.5 (binding):
 - Timeouts 15 s (AbortController; 30 s for the token call). Never log tokens.
 
 ### Claude via claude.ai web session (`providers/claude-web.js`, optional)
+- Per account (1.1.0): its own Electron partition (`persist:claude-web` for account 1, `persist:claude-web-<id>` for the
+  others — every cookie op, hidden fetch, login and logout uses it) and its own safeStorage-encrypted key
+  (`claudeWebSession` for account 1, `claudeWebSessions[<id>]` for the others; removed accounts' keys are deleted).
 - Port of the original: login BrowserWindow (allowed domains list), capture `sessionKey` cookie, `safeStorage`
   encryption, org selection (`capabilities` includes 'chat', prefer team), hidden-window fetch of `/usage`,
   `/overage_spend_limit`, `/prepaid/credits` (extended endpoints only when the Claude expand panel is open or compact
@@ -306,7 +331,9 @@ Rules from research-claude.md §1.3, §1.8, §1.9, §2.1–2.4, §8.5 (binding):
 
 ### Scheduler (`scheduler.js`)
 - One timer (interval from settings). Each tick: `Promise.allSettled` over enabled providers → build `Snapshot`
-  (keeping last-good values for failed providers, marked `stale`) → `history.append(snapshot)` → `tray.update(snapshot)`
+  (keeping last-good values for failed providers, marked `stale`, but with THIS cycle's name) → `dedupe(providers)`
+  (`accounts.dedupeSnapshot`, injected; a throwing dedupe falls back to showing everything) → every resolved id gets an
+  entry (null when disabled or hidden) plus `duplicates` → `history.append(snapshot)` → `tray.update(snapshot)`
   → `alerts.evaluate(snapshot, settings)` → `mainWindow.webContents.send('usage-updated', snapshot)`.
 - Manual refresh (`refresh-now`) runs a tick immediately and restarts the timer. Skip a tick while one is in flight.
   The Claude provider's 60 s polling floor (above) still applies — a manual refresh inside the floor re-emits the
@@ -332,10 +359,12 @@ invoke  get-history {days}                   → { samples:[{t,v}], series:[{key
 invoke  get-app-info                         → { version, platform, acrylicSupported, isPortable,
                                                  background }   // backdrop the CURRENT window was created with:
                                                                 // 'acrylic' | 'acrylic_clear' | 'mica' | 'solid' (renderer keys bg-* off this)
-invoke  claude-web-login                     → { success, error? }          (claude_web source)
-invoke  claude-web-logout                    → true
-invoke  claude-web-orgs                      → [{id,name,isTeam}]
-invoke  claude-web-select-org {id}           → true
+invoke  claude-web-login {accountId}         → { success, error? }          (that account's claude_web source)
+invoke  claude-web-logout {accountId}        → true
+invoke  claude-web-orgs {accountId}          → [{id,name,isTeam}]
+invoke  claude-web-select-org {id, accountId} → true
+                                             // accountId optional ('claude' when absent, so 1.0.x calls work); any
+                                             // other value must name a configured account or the call is refused
 invoke  phone-sync-status                    → { enabled, relayUrl, paired, keyPersisted, lastPushAt, lastError, nextRetryAt, slotId }
 invoke  phone-sync-pairing                   → { pairString, qrDataUrl, slotId, error }   (creates K when absent; never rotates)
 invoke  phone-sync-repair                    → same shape with a NEW K (old slot deleted best-effort)
@@ -349,7 +378,7 @@ send    open-external {url}                  allowlist: claude.ai, anthropic.com
 on      usage-updated (snapshot)
 on      settings-updated (settings)
 on      refresh-requested ()                 (tray menu → renderer shows spinner; main runs tick itself)
-on      claude-web-session-expired ()
+on      claude-web-session-expired ({ accountId })   (per account, on its ok → auth_required edge)
 on      phone-sync-updated (status)          (same shape as phone-sync-status; after every push attempt / pairing change)
 ```
 
@@ -492,8 +521,9 @@ module.exports = { id, name, fetchSnapshot({ settings, fetch, now, log, lastGood
 
 Protocol, wire formats and the desktop push policy are specified in **`docs/PHONE-SYNC.md`** (binding). Summary:
 the desktop derives `slotId` / `writeToken` / `readToken` / `encKey` from a 32-byte pair key `K` (SHA-256 over
-`label ‖ K`), encrypts a `PhonePayload` (the §3 Snapshot minus every `raw`, the three colour settings, and a
-downsampled 7-day history) with AES-256-GCM (AAD = `slotId`) and PUTs the envelope to `<relay>/v1/slots/<slotId>`
+`label ‖ K`), encrypts a `PhonePayload` (the §3 Snapshot minus every `raw` and `identity` and minus `duplicates`, the colour
+settings, and a downsampled 7-day history — re-bucketed 30 → 60 → 120 → 240 min, then dropped, until the payload
+is ≤ `PAYLOAD_BUDGET_CHARS` = 160 000 so the envelope stays under the relay's 256 KB) with AES-256-GCM (AAD = `slotId`) and PUTs the envelope to `<relay>/v1/slots/<slotId>`
 at most every 60 s and normally every 5 min or on a change. `K` is persisted by main.js under the top-level store key
 `phonePairKey` exactly like the claude.ai session (`safeStorage.encryptString(base64(K))` → base64); it never
 reaches the renderer — the renderer only sees the `aiusage://pair?...` string and its QR data URL. The relay

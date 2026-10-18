@@ -91,21 +91,28 @@ PhonePayload = {
   v: 1,
   generatedAt: 1788700000000,           // ms epoch when the desktop built this payload
   source: { app: 'ai-usage-widget', version: '1.0.1', platform: 'win32' | 'darwin' | 'linux', host: 'AIDAN-PC' },
-  snapshot: Snapshot,                   // ARCHITECTURE.md §3, with every ProviderSnapshot.raw REMOVED (debug-only, may
-                                        // carry identifiers). All other fields as-is (status, error, plan, account, windows,
-                                        // extra, credits, updatedAt).
+  snapshot: Snapshot,                   // ARCHITECTURE.md §3, with every ProviderSnapshot.raw and .identity REMOVED (debug /
+                                        // dedupe only, may carry identifiers) and without `duplicates`. All other fields as-is
+                                        // (status, error, plan, account, windows, extra, credits, updatedAt).
+                                        // Several Claude accounts (1.1.0): `providers.claude` is ALWAYS account 1 (so a 1.0.x
+                                        // phone keeps working); accounts 2–6 travel under 'claude-2' … 'claude-6' with
+                                        // `name` = the account's label. A duplicate of a lower slot is null under its id.
   settings: { warnThreshold: 75, dangerThreshold: 90, timeFormat: '12h' | '24h',     // so the phone colours bars
               dateFormat: 'date' | 'date-day' },                                      // and words "resets at" the same way
   history: {                            // downsampled 7-day history for the chart; may be { days: 7, samples: [], series: [] }
     days: 7,
     samples: [ { t: 1788600000000, v: { 'claude.session': 42, 'claude.weekly': 12, 'codex.primary': 3 } } ],
-    series:  [ { key: 'claude.session', label: 'Claude · Current Session', color: 'purple' } ],
+    series:  [ { key: 'claude.session', label: 'Claude Current Session', color: 'purple' } ],   // '<name> <window label>'
   },
 }
 ```
 
 History downsampling (desktop side): bucket samples into 30-minute buckets, keep the **last** sample of each
-bucket, cap at 400 samples (oldest dropped). Typical payload ≈ 25–35 KB before encryption.
+bucket, cap at 400 samples (oldest dropped). Typical payload ≈ 25–50 KB before encryption for one Claude account.
+Several accounts multiply the history keys (`claude-2.session`, …), so when the payload JSON exceeds 160 000 characters
+the history is re-bucketed at 60, then 120, then 240 minutes, and as a last resort sent with `samples: []` (series
+kept) — the snapshot is never dropped. Measured: four accounts + Codex, seven days at a 2-minute cadence = 178 915
+characters at 30-minute buckets → 93 853 at 60. The phone must not assume 30-minute spacing.
 
 ## Desktop behaviour (`src/main/sync.js`)
 
