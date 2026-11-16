@@ -1,8 +1,8 @@
 //
 //  SampleData.swift
 //  AIUsageWidget — a realistic PhonePayload for the widget gallery placeholder
-//  (WidgetKit redacts it automatically while the real data loads), and a four-account payload
-//  for the Xcode previews at the bottom.
+//  (WidgetKit redacts it automatically while the real data loads), and two four-account payloads
+//  (with, and without, a five-hour window) for the Xcode previews at the bottom.
 //
 
 import Foundation
@@ -226,6 +226,48 @@ enum SampleData {
                             settings: PhoneSettings(warnThreshold: 75, dangerThreshold: 90, timeFormat: "12h", dateFormat: nil),
                             history: history)
     }
+
+    // MARK: - Four Claude accounts with no five-hour window + Codex, for the previews
+
+    /// What Claude plans without a session limit send: a weekly and a Fable weekly per account, nothing
+    /// else. One calm account, one whose Fable share is nearly gone, one whose Fable share is used up
+    /// under a calm weekly, one in the red on both; Codex still has its 5-hour window.
+    static var weeklyOnlyPayload: PhonePayload {
+        let now = Date()
+        let nowMs = Models.msFromDate(now)
+        let hour: TimeInterval = 3600
+        let weekSeconds: Double = 604800
+
+        func account(_ id: String, _ name: String, weekly: Double, fable: Double, resetsIn: TimeInterval) -> ProviderSnapshot {
+            return claudeAccount(id, name, account: nil, plan: "Max 20x", updatedAgo: 15_000, windows: [
+                window("weekly", "Weekly Limit", kind: "weekly", percent: weekly, resetsIn: resetsIn,
+                       seconds: weekSeconds, color: "blue", isActive: true, now: now),
+                window("weekly_fable", "Fable Weekly", kind: "weekly_scoped", percent: fable, resetsIn: resetsIn,
+                       seconds: weekSeconds, color: "fuchsia", isActive: false, scope: "Fable", now: now),
+            ], nowMs: nowMs)
+        }
+        let codex = ProviderSnapshot(id: "codex", name: "Codex", status: "ok", error: nil, source: "codex_auth_file",
+                                     plan: "Team", account: nil, updatedAt: nowMs - 40_000, windows: [
+            window("primary", "5-Hour Limit", kind: "session", percent: 2, resetsIn: 4 * hour + 10 * 60,
+                   seconds: 18000, color: "green", now: now),
+            window("secondary", "Weekly Limit", kind: "weekly", percent: 13, resetsIn: 6 * 24 * hour + 14 * hour,
+                   seconds: weekSeconds, color: "teal", now: now),
+        ], extra: nil, credits: nil)
+
+        let providers: [String: ProviderSnapshot?] = [
+            "claude": account("claude", "Claude 1", weekly: 4, fable: 2, resetsIn: 6 * 24 * hour + 3 * hour),
+            "claude-2": account("claude-2", "Claude 2", weekly: 80, fable: 98, resetsIn: 2 * 24 * hour + 9 * hour),
+            "claude-3": account("claude-3", "Claude 3", weekly: 69, fable: 100, resetsIn: 3 * 24 * hour + 5 * hour),
+            "claude-4": account("claude-4", "Claude 4", weekly: 92, fable: 94, resetsIn: 24 * hour + 8 * hour),
+            "codex": codex,
+        ]
+        return PhonePayload(v: 1,
+                            generatedAt: nowMs - 2 * 60_000,
+                            source: PayloadSource(app: "ai-usage-widget", version: "1.1.0", platform: "darwin", host: "MAC"),
+                            snapshot: Snapshot(fetchedAt: nowMs - 20_000, providers: providers),
+                            settings: PhoneSettings(warnThreshold: 75, dangerThreshold: 90, timeFormat: "12h", dateFormat: nil),
+                            history: nil)
+    }
 }
 
 #if DEBUG
@@ -239,6 +281,10 @@ private func sampleEntry(_ payload: PhonePayload) -> UsageEntry {
 #Preview("Lock · 4 accounts", as: .accessoryRectangular) { UsageWidget() } timeline: { sampleEntry(SampleData.multiAccountPayload) }
 #Preview("Inline · 4 accounts", as: .accessoryInline) { UsageWidget() } timeline: { sampleEntry(SampleData.multiAccountPayload) }
 #Preview("Circular · 4 accounts", as: .accessoryCircular) { UsageWidget() } timeline: { sampleEntry(SampleData.multiAccountPayload) }
+#Preview("Small · no 5-hour", as: .systemSmall) { UsageWidget() } timeline: { sampleEntry(SampleData.weeklyOnlyPayload) }
+#Preview("Medium · no 5-hour", as: .systemMedium) { UsageWidget() } timeline: { sampleEntry(SampleData.weeklyOnlyPayload) }
+#Preview("Large · no 5-hour", as: .systemLarge) { UsageWidget() } timeline: { sampleEntry(SampleData.weeklyOnlyPayload) }
+#Preview("Circular · no 5-hour", as: .accessoryCircular) { UsageWidget() } timeline: { sampleEntry(SampleData.weeklyOnlyPayload) }
 #Preview("Small · 1 account", as: .systemSmall) { UsageWidget() } timeline: { sampleEntry(SampleData.payload) }
 #Preview("Medium · 1 account", as: .systemMedium) { UsageWidget() } timeline: { sampleEntry(SampleData.payload) }
 #Preview("Large · 1 account", as: .systemLarge) { UsageWidget() } timeline: { sampleEntry(SampleData.payload) }

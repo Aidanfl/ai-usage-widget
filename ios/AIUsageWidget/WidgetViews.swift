@@ -133,22 +133,25 @@ struct UsageWidgetModel {
         return providers.flatMap { rows(for: $0) }
     }
 
-    /// The row the circular widget headlines: Claude's active window, else Claude's first, else the first
-    /// row. "Claude" is the first Claude account, so a hidden account 1 hands the gauge to account 2.
+    /// The row the circular widget headlines: Claude's lead window (`leadRow`), else the first row.
+    /// "Claude" is the first Claude account, so a hidden account 1 hands the gauge to account 2.
     var headline: UsageWidgetRow? {
-        if let c = claude {
-            let rows = self.rows(for: c)
-            if let active = rows.first(where: { $0.window.isActive == true }) { return active }
-            if let first = rows.first { return first }
-        }
+        if let c = claude, let lead = leadRow(for: c) { return lead }
         return allRows.first
+    }
+
+    /// The one window that speaks for a provider where one is all it gets: its active window, else its
+    /// first. With no five-hour window (`weeklyPair`) the weekly leads whichever window the desktop marks
+    /// active, so a bare "Claude 42%" is never the Fable share read as the weekly.
+    private func leadRow(for provider: ProviderSnapshot) -> UsageWidgetRow? {
+        if let pair = weeklyPair(for: provider) { return pair.outer }
+        let rows = self.rows(for: provider)
+        return rows.first(where: { $0.window.isActive == true }) ?? rows.first
     }
 
     /// Provider's headline percent for the inline text ("Claude 42%").
     private func headlinePercent(for provider: ProviderSnapshot) -> String? {
-        let rows = self.rows(for: provider)
-        if let active = rows.first(where: { $0.window.isActive == true }) { return active.percentText }
-        return rows.first?.percentText
+        return leadRow(for: provider)?.percentText
     }
 
     /// The inline widget's pieces: "Claude 42%", "Codex 12%". With several Claude accounts, the accounts in
@@ -380,6 +383,34 @@ extension UsageWidgetModel {
     func accountRow(for provider: ProviderSnapshot) -> UsageWidgetRow? {
         return weeklyRow(for: provider) ?? keepMostUrgent(rows(for: provider), limit: 1).first
     }
+
+    /// The two rings of a Claude account with NO five-hour window (Claude plans that dropped the session
+    /// limit send only weeklies): its plain weekly outside, as the number to read, and its Fable weekly
+    /// inside. nil for any other provider (Codex keeps `weeklyRow` over its windows), and for an account
+    /// that still has a session or has no plain weekly to lead with.
+    ///
+    /// Fable is the inner ring whenever the account has one, whatever the other limits are doing: the
+    /// rings are the weekly and Fable, and an inner ring that changed meaning as percents crossed would
+    /// read as Fable when it was not. With no Fable limit (a renamed model scope) the most urgent other
+    /// scoped weekly rides inside, named by its scope; with none of those the inner ring is left out.
+    func weeklyPair(for provider: ProviderSnapshot) -> (outer: UsageWidgetRow, inner: UsageWidgetRow?)? {
+        guard provider.isClaude else { return nil }
+        var rest = rows(for: provider)
+        guard !rest.contains(where: { $0.window.kind == "session" }),
+              let index = rest.firstIndex(where: { $0.window.kind == "weekly" }) else { return nil }
+        let weekly = rest.remove(at: index)
+        if let fable = rest.first(where: { $0.window.isFableWeekly }) { return (weekly, fable) }
+        let scoped = rest.filter { $0.window.kind == "weekly_scoped" && !($0.window.scope ?? "").isEmpty }
+        return (weekly, worstFirst(scoped).first)
+    }
+}
+
+extension UsageWindow {
+    /// Claude's Fable weekly: the scoped weekly the desktop keys `weekly_fable` (scope "Fable").
+    var isFableWeekly: Bool {
+        guard kind == "weekly_scoped" else { return false }
+        return (key ?? "").lowercased().contains("fable") || (scope ?? "").lowercased().contains("fable")
+    }
 }
 
 // MARK: - Line budgeting (every family has a hard line count, so decide it once)
@@ -459,13 +490,26 @@ extension ProviderSnapshot {
 /// One provider as a ring in the multi-account home-screen families: its weekly on the outer ring (the
 /// number in the middle), its five-hour session on the inner one. The windows it leaves out (a calm
 /// scoped weekly) carry no "+1": `weeklyRow` already swaps in any of them that is worse than the weekly.
+/// A provider with no five-hour window draws `weeklyPair` instead: the plain weekly outside, the Fable
+/// weekly inside.
 struct RingTilePlan: Identifiable {
     let id: Int
     let provider: ProviderSnapshot
-    /// The weekly (`weeklyRow`), else whatever single window the provider has.
+    /// The weekly (`weeklyRow`, or `weeklyPair`'s plain weekly), else whatever single window the provider has.
     let outer: UsageWidgetRow?
-    /// The session, when the outer ring is not already showing it.
+    /// The session, when the outer ring is not already showing it; with no session, the Fable weekly.
     let inner: UsageWidgetRow?
+    /// Draw the inner ring (empty when `inner` is nil). False only for a Claude account with no five-hour
+    /// window and no second weekly to put inside: its rings are the weekly and Fable, so with no Fable it
+    /// is the weekly alone rather than a dead track.
+    var drawsInner: Bool = true
+
+    /// The inner ring for the small widget, which leaves the session out by design: the second limit of
+    /// a provider with no five-hour window (its Fable weekly), nil for one whose inner ring is a session.
+    var secondLimit: UsageWidgetRow? {
+        guard let inner = inner, inner.window.kind != "session" else { return nil }
+        return inner
+    }
 
     /// "Sign in needed" in place of the numbers when the provider reported no windows at all.
     var note: String? {
@@ -512,7 +556,12 @@ enum WidgetPlanner {
             let longer = model.worstFirst(model.rows(for: provider).filter { $0.window.kind != "session" })
             let outer: UsageWidgetRow?
             let inner: UsageWidgetRow?
-            if let weekly = model.weeklyRow(for: provider) {
+            if let pair = model.weeklyPair(for: provider) {
+                // No five-hour window: the weekly outside, the Fable weekly inside (or the weekly alone).
+                tiles.append(RingTilePlan(id: index, provider: provider, outer: pair.outer, inner: pair.inner,
+                                          drawsInner: pair.inner != nil))
+                continue
+            } else if let weekly = model.weeklyRow(for: provider) {
                 outer = weekly
                 inner = session
             } else if let worst = longer.first {
@@ -588,9 +637,11 @@ extension UsageWidgetRow {
         return Formatting.clampPercent(window.percent)
     }
 
-    /// "idle" for a session that has not started, else "45%".
-    var sessionValue: String {
-        if window.resetsAtDate == nil && Formatting.clampPercent(window.percent) == 0 { return "idle" }
+    /// A ring in a word: "idle" for a window that has not started (no reset time, 0%), else "45%". A scoped
+    /// weekly is never "idle": "fable idle" under a ring reads as a state of Fable, so an untouched one is
+    /// "fable 0%". Every other kind keeps "idle", as before scoped weeklies could be an inner ring.
+    var innerValue: String {
+        if window.kind != "weekly_scoped", window.resetsAtDate == nil, Formatting.clampPercent(window.percent) == 0 { return "idle" }
         return percentText
     }
 }
@@ -843,8 +894,9 @@ struct RingArc: View {
     }
 }
 
-/// The weekly as the outer ring with its percent in the middle and, with `showInner`, the session as a
-/// thinner ring inside it: the Activity-rings shape, so several accounts compare at a glance.
+/// The weekly as the outer ring with its percent in the middle and, with `showInner`, the session (or,
+/// for an account with no five-hour window, its Fable weekly) as a thinner ring inside it: the
+/// Activity-rings shape, so several accounts compare at a glance.
 struct RingGauge: View {
     @Environment(\.widgetRenderingMode) private var renderingMode
     let outer: UsageWidgetRow?
@@ -918,9 +970,9 @@ extension UsageWidgetRow {
         return window.displayLabel.uppercased()
     }
 
-    /// "5h idle" / "5h 45%": the inner ring in words, under a medium ring.
-    var sessionCaption: String {
-        return "\(windowTag.lowercased()) \(sessionValue)"
+    /// "5h idle" / "5h 45%" / "fable 98%": the inner ring in words, under a medium ring.
+    var innerCaption: String {
+        return "\(windowTag.lowercased()) \(innerValue)"
     }
 }
 
@@ -948,7 +1000,7 @@ struct RingResetLine: View {
 }
 
 /// One column of the multi-account medium: the rings, the provider's name, when the weekly resets and
-/// what the session is doing.
+/// what the inner ring is doing (the session, or the Fable weekly of an account with no session).
 struct RingTile: View {
     let tile: RingTilePlan
     let model: UsageWidgetModel
@@ -959,7 +1011,7 @@ struct RingTile: View {
 
     var body: some View {
         VStack(spacing: 3) {
-            RingGauge(outer: tile.outer, inner: tile.inner, showInner: true, diameter: diameter, tag: tile.outerTag)
+            RingGauge(outer: tile.outer, inner: tile.inner, showInner: tile.drawsInner, diameter: diameter, tag: tile.outerTag)
                 .opacity(tile.note == nil ? 1 : 0.5)
             HStack(spacing: 3) {
                 // Middle, so "Claude Blender 2" keeps the number that tells it from "Claude Blender 3".
@@ -985,12 +1037,15 @@ struct RingTile: View {
                         RingResetLine(row: outer, now: model.now)
                     }
                     if let inner = tile.inner {
-                        Text(inner.sessionCaption)
-                            .monospacedDigit()
-                            .font(.system(size: 9, weight: .medium))
-                            .foregroundStyle(inner.level == .danger ? Theme.dangerText : Color.secondary)
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.8)
+                        if compactName && inner.window.kind != "session" {
+                            // "fable 100%" is wider than a six- or seven-across column (54pt of a 44pt one),
+                            // so the name and the number take a line each: the reset line's, which a
+                            // compact column does not show.
+                            caption(inner.windowTag.lowercased(), of: inner)
+                            caption(inner.innerValue, of: inner)
+                        } else {
+                            caption(inner.innerCaption, of: inner)
+                        }
                     }
                 }
             }
@@ -999,11 +1054,20 @@ struct RingTile: View {
         .accessibilityLabel(RingTile.accessibility(tile))
     }
 
+    private func caption(_ text: String, of inner: UsageWidgetRow) -> some View {
+        return Text(text)
+            .monospacedDigit()
+            .font(.system(size: 9, weight: .medium))
+            .foregroundStyle(inner.level == .danger ? Theme.dangerText : Color.secondary)
+            .lineLimit(1)
+            .minimumScaleFactor(0.8)
+    }
+
     static func accessibility(_ tile: RingTilePlan) -> String {
         var parts = [tile.provider.displayName]
         if let note = tile.note { parts.append(note) }
         if let outer = tile.outer { parts.append("\(outer.window.displayLabel) \(outer.percentText), resets in \(outer.resetsIn)") }
-        if let inner = tile.inner { parts.append("\(inner.window.displayLabel) \(inner.sessionValue)") }
+        if let inner = tile.inner { parts.append("\(inner.window.displayLabel) \(inner.innerValue)") }
         return parts.joined(separator: ", ")
     }
 }
@@ -1018,7 +1082,7 @@ struct CardStat: View {
     /// ring or the reset for the outer one; the dots' colours already say which ring is which.
     var compact: Bool = false
 
-    private var isIdle: Bool { return row.sessionValue == "idle" }
+    private var isIdle: Bool { return row.innerValue == "idle" }
 
     var body: some View {
         if compact {
@@ -1027,7 +1091,7 @@ struct CardStat: View {
                     .fill(row.color)
                     .frame(width: 5, height: 5)
                 if showPercent {
-                    Text("\(row.windowTag) \(row.sessionValue)")
+                    Text("\(row.windowTag) \(row.innerValue)")
                         .monospacedDigit()
                         .font(.system(size: 10, weight: .semibold))
                         .foregroundStyle(row.level == .danger ? Theme.dangerText : Color.primary)
@@ -1100,7 +1164,7 @@ struct AccountCard: View {
                 Spacer(minLength: 0)
             }
             HStack(alignment: .center, spacing: 8) {
-                RingGauge(outer: tile.outer, inner: tile.inner, showInner: true, diameter: diameter)
+                RingGauge(outer: tile.outer, inner: tile.inner, showInner: tile.drawsInner, diameter: diameter)
                     .opacity(tile.note == nil ? 1 : 0.5)
                 VStack(alignment: .leading, spacing: 6) {
                     if let note = tile.note {
@@ -1140,7 +1204,12 @@ struct MostRoomCard: View {
     private func detail(_ account: ProviderSnapshot) -> String {
         var parts: [String] = []
         if let weekly = model.plainWeeklyRow(for: account) { parts.append("\(weekly.percentText) \(weekly.ringLabel.lowercased())") }
-        if let session = model.sessionRow(for: account) { parts.append(session.sessionCaption) }
+        // The inner ring in words: the session, or the Fable weekly of an account with no session.
+        if let session = model.sessionRow(for: account) {
+            parts.append(session.innerCaption)
+        } else if let second = model.weeklyPair(for: account)?.inner {
+            parts.append(second.innerCaption)
+        }
         return parts.joined(separator: " · ")
     }
 
@@ -1341,6 +1410,8 @@ struct SmallRowsView: View {
 /// The multi-account small: a weekly ring per provider, two by two — the Claude accounts first, Codex
 /// only if a cell is left over (so "+N" counts accounts only) — under a "WEEKLY" caption with the freshness dot. The session is left
 /// out by design: the weekly is the limit several accounts exist to spread, and medium / large show both.
+/// An account with no five-hour window gets its Fable weekly as an inner ring (`RingTilePlan.secondLimit`),
+/// and the caption then names both rings, outside in: "WEEKLY · FABLE".
 struct SmallRingsView: View {
     let model: UsageWidgetModel
 
@@ -1354,29 +1425,38 @@ struct SmallRingsView: View {
             Array(plan.tiles[$0..<min($0 + 2, plan.tiles.count)])
         }
         let hiddenAccounts = model.claudeAccounts.count - plan.tiles.filter { $0.provider.isClaude }.count
+        // What the inner rings are, when they are all the same limit: one caption cannot name two.
+        let innerTags = Set(plan.tiles.compactMap { $0.secondLimit?.windowTag })
+        let innerName: String? = innerTags.count == 1 ? innerTags.first : nil
+        let age = Formatting.relativeAgo(model.generatedDate, now: model.now)
         return GeometryReader { geo in
             let rowCount = CGFloat(max(1, rows.count))
             let cellHeight = (geo.size.height - SmallRingsView.headerHeight - (rowCount - 1) * SmallRingsView.rowGap) / rowCount
             let diameter = max(24, min(rows.count > 1 ? 46 : 56, cellHeight - 15, geo.size.width / 2 - 10))
             VStack(spacing: 0) {
                 HStack(spacing: 4) {
-                    Text("WEEKLY")
+                    Text(innerName.map { "WEEKLY · \($0)" } ?? "WEEKLY")
                         .font(.system(size: 8.5, weight: .semibold))
-                        .kerning(0.6)
+                        .kerning(innerName == nil ? 0.6 : 0.3)
                         .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
                     if hiddenAccounts > 0 {
                         Text("+\(hiddenAccounts)")
                             .monospacedDigit()
                             .font(.system(size: 8.5, weight: .bold))
                             .foregroundStyle(.tertiary)
+                            .fixedSize()
                     }
                     Spacer(minLength: 2)
                     StatusDot(color: Theme.freshnessColor(model.freshness), size: 5)
-                    Text(Formatting.relativeAgo(model.generatedDate, now: model.now))
+                    // The longer caption takes the room "ago" had; the dot beside it already says this is an age.
+                    Text(innerName != nil && age.hasSuffix(" ago") ? String(age.dropLast(4)) : age)
                         .monospacedDigit()
                         .font(.system(size: 8.5))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
+                        .fixedSize()
                 }
                 .frame(height: SmallRingsView.headerHeight, alignment: .top)
                 Spacer(minLength: 0)
@@ -1397,7 +1477,8 @@ struct SmallRingsView: View {
 
     private func cell(_ tile: RingTilePlan, diameter: CGFloat) -> some View {
         VStack(spacing: 2) {
-            RingGauge(outer: tile.outer, diameter: diameter, tag: tile.outerTag)
+            RingGauge(outer: tile.outer, inner: tile.secondLimit, showInner: tile.secondLimit != nil,
+                      diameter: diameter, tag: tile.outerTag)
                 .opacity(tile.note == nil ? 1 : 0.5)
             HStack(spacing: 2) {
                 Text(tile.provider.displayName)
@@ -1422,8 +1503,9 @@ struct SmallRingsView: View {
 // folded from two lines onto one, which is the entire 236pt -> 126pt saving.
 //
 // Several Claude accounts do not fit that shape: five 20pt headers alone are 100 of the 111pt.
-// So each provider becomes one column (`RingTile`): weekly and session rings, the name, when the
-// weekly resets and what the session is doing — four accounts and Codex side by side.
+// So each provider becomes one column (`RingTile`): weekly and session rings (weekly and Fable for an
+// account with no five-hour window), the name, when the weekly resets and what the inner ring is
+// doing — four accounts and Codex side by side.
 
 struct MediumWidgetView: View {
     let model: UsageWidgetModel
@@ -1714,9 +1796,20 @@ extension UsageWidgetModel {
 
     /// `row` outside — or, at a limit, the limit that frees up last, so the countdown in the middle is when the
     /// account is usable again; inside, the session when the outer ring is a longer limit, else the plain weekly.
+    /// An account with no five-hour window (`weeklyPair`) has its Fable weekly inside the weekly.
     private func gaugePlan(_ row: UsageWidgetRow, of provider: ProviderSnapshot, caption: String) -> LockGaugePlan {
         let outer = holdingRow(for: provider) ?? row
-        let other = outer.window.kind == "session" ? plainWeeklyRow(for: provider) : sessionRow(for: provider)
+        let other: UsageWidgetRow?
+        if outer.window.kind == "session" {
+            other = plainWeeklyRow(for: provider)
+        } else if let session = sessionRow(for: provider) {
+            other = session
+        } else if let pair = weeklyPair(for: provider) {
+            // Whichever of the pair the outer ring is not already showing.
+            other = pair.outer.window.key == outer.window.key ? pair.inner : pair.outer
+        } else {
+            other = nil
+        }
         return LockGaugePlan(outer: current(outer), inner: other.map { current($0) }, caption: caption)
     }
 }
@@ -2097,7 +2190,7 @@ struct AccessoryCircularView: View {
         guard let plan = model.lockGauge else { return "AI Usage, no data" }
         var parts = [plan.caption, "\(plan.outer.window.displayLabel) \(plan.outer.percentText)"]
         if plan.outer.isAtLimit(now: model.now) { parts.append("resets in \(plan.outer.resetsIn)") }
-        if let inner = plan.inner { parts.append("\(inner.window.displayLabel) \(inner.sessionValue)") }
+        if let inner = plan.inner { parts.append("\(inner.window.displayLabel) \(inner.innerValue)") }
         return parts.joined(separator: ", ")
     }
 }

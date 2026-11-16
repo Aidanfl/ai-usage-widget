@@ -2,6 +2,18 @@
 
 All notable changes to AI Usage Widget. Dates are ISO (YYYY-MM-DD).
 
+## iPhone 1.1.0 (build 6) - 2026-11-16
+
+- **Widgets: weekly and Fable rings for an account with no 5-hour limit.** Claude plans that dropped the session
+  limit send only a weekly and a Fable weekly, which left every ring pair with a dead inner ring and let the outer
+  one flip between the weekly and the Fable share. Such an account now always draws its weekly as the outer ring
+  (the number in the middle) and its Fable weekly as the inner one: in the medium and large widgets, in the small
+  one (captioned "WEEKLY · FABLE") and in the round lock-screen widget. Fable stays the inner ring whatever any
+  other limit is doing, and an account with a weekly but no Fable limit draws the weekly alone, with no empty
+  track. "Most room" reads "4% weekly · fable 2%", and the one-line lock-screen widget leads with the weekly rather
+  than whichever window the desktop marks active. An account that still has a 5-hour window, Codex, and every
+  single-account bar layout render exactly as before.
+
 ## 1.1.0 - 2026-10-17
 
 Several Claude accounts at once - on the widget and on the phone.

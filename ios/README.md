@@ -11,7 +11,10 @@ Codex side by side, the weekly as the outer ring (its percent in the middle) and
 large gives each a card with both resets spelled out, plus a "Most room" card naming the account to use next. On the
 lock screen the round widget is that account's rings, the rectangular one a ring per account and Codex under "MOST
 ROOM C4" (a lock while an account is at a limit), and the one-line widget lists the accounts most room first, under
-short names (`C2`, or the account's label). A single-account payload renders as in 1.0.x, with larger lock-screen
+short names (`C2`, or the account's label). **An account with no 5-hour window** (Claude plans that dropped the
+session limit send only weeklies) draws its weekly as the outer ring, still the number in the middle, and its Fable
+weekly as the inner one, in the small widget too (captioned "WEEKLY · FABLE"); the weekly leads even when the Fable
+share is the worse of the two. A single-account payload renders as in 1.0.x, with larger lock-screen
 text. The history chart
 copes with the desktop's re-bucketed history (30–240 min between samples, or none).
 
